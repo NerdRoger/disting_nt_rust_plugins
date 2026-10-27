@@ -69,15 +69,18 @@ pushes and pull requests do not trigger builds. Each plugin's workflow also
 supports manual runs from the Actions tab.
 
 Both entry workflows call `.github/workflows/rust-plugins.yml`, which checks out
-the pinned API submodule, builds the devcontainer with GitHub Actions layer
-caching, checks formatting, builds the selected plugin and runs the test suite.
+the pinned API submodule, builds the devcontainer with a shared GitHub Container
+Registry (GHCR) layer cache, checks formatting, builds the selected plugin and
+runs the test suite. Both plugins and version tags use the same cache; the first
+build populates it, and later builds reuse unchanged layers.
 Dockerfile changes invalidate the affected cached layers on the next build.
 
 Tagged builds create a GitHub Release named from the tag (for example,
 `window-comparator v0.1.0`) with the selected plugin `.o` attached. Manual runs
 on a branch upload an Actions artifact without creating a release. Build
-artifacts are retained for 30 days. No custom secrets or container registry
-setup are needed; the workflows use the built-in token to create releases.
+artifacts are retained for 30 days. The workflows use the built-in token with
+`contents: write` for releases and `packages: write` for the GHCR cache. No custom
+secrets are needed; the cache package is created automatically.
 
 ## Migration
 
