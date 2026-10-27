@@ -1,0 +1,9 @@
+[package]
+name = "distingnt-sys"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+links = "distingnt_sys"
+
+[lib]
+path = "src/lib.rs"

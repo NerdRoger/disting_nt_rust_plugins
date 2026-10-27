@@ -1,0 +1,4 @@
+{
+  "name": "Disting NT Rust Plugins",
+  "build": { "dockerfile": "Dockerfile" }
+}

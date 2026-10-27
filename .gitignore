@@ -1,0 +1,22 @@
+# Cargo build directories and packaged plugins
+target/
+/plugins/
+
+# Compiled Rust/native intermediates, including ad-hoc tool output
+*.o
+*.a
+*.rlib
+*.rmeta
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Editor backups and OS metadata
+*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

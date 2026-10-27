@@ -1,0 +1,13 @@
+[package]
+name = "distingnt-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+distingnt-sys = { path = "../distingnt-sys" }
+
+[features]
+host-test = []
+
+[lib]
+path = "src/lib.rs"

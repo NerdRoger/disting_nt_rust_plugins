@@ -1,0 +1,18 @@
+name: Rust Monosynth Build
+
+on:
+  push:
+    tags:
+      - 'monosynth/v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/rust-plugins.yml
+    with:
+      plugin_name: Rust Monosynth
+      artifact_file: rusttest.o
+      artifact_base_name: rust-monosynth

@@ -1,0 +1,15 @@
+[package]
+name = "window-comparator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+distingnt-api = { path = "../distingnt-api" }
+
+[lib]
+path = "src/window_comparator.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dev-dependencies]
+distingnt-api = { path = "../distingnt-api", features = ["host-test"] }
+distingnt-sys = { path = "../distingnt-sys" }

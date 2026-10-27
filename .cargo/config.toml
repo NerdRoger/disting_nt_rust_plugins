@@ -1,0 +1,6 @@
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "target-cpu=cortex-m7",
+    "-C", "force-unwind-tables=no",
+]
