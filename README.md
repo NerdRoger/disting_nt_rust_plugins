@@ -6,6 +6,7 @@ in `NerdRoger/disting_nt_plugins`. Production plugins depend only on the safe AP
 - `distingnt-sys`: faithful C++ header bindings, native ABI bridges and packaging.
 - `distingnt-api`: safe Rust registration, host adapters and callback interfaces.
 - `window-comparator`: safe Rust Window Comparator plugin.
+- `wavesmith`: live segmented oscillator with 2–32 curved sections and an always-visible help footer; see [controls and prototype notes](wavesmith/README.md).
 - `monosynth`: Rust port of [Expert Sleepers' C++ monosynth example](https://github.com/expertsleepersltd/distingNT_API/blob/main/examples/monosynth.cpp), created as a Rust learning experiment.
 - `distingNT_API`: independent upstream Git submodule, pinned to `1780254aebc3c73b96c351a7b12c325d1f983402`.
 - `tools`: ABI, layering and loader validation.
@@ -29,7 +30,7 @@ make test
 cargo fmt --all -- --check
 ```
 
-Build outputs are `plugins/rust-window-comparator.o` and `plugins/rusttest.o`
+Build outputs are `plugins/wavesmith.o`, `plugins/rust-window-comparator.o` and `plugins/rusttest.o`
 (the monosynth). Cargo intermediates live in ignored `target/`.
 The plugins require API-v14-capable firmware.
 

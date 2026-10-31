@@ -3,7 +3,7 @@ from pathlib import Path
 import tomllib
 
 root = Path(__file__).resolve().parents[1]
-for plugin in ("monosynth", "window-comparator"):
+for plugin in ("monosynth", "window-comparator", "wavesmith"):
     manifest = tomllib.loads((root / plugin / "Cargo.toml").read_text())
     dependencies = manifest["dependencies"]
     assert "distingnt-api" in dependencies, plugin

@@ -22,6 +22,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavesmith"
+version = "0.1.0"
+dependencies = [
+ "distingnt-api",
+ "distingnt-sys",
+]
+
+[[package]]
 name = "window-comparator"
 version = "0.1.0"
 dependencies = [

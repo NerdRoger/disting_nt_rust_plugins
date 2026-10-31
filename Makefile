@@ -3,7 +3,13 @@ RUST_TARGET := thumbv7em-none-eabihf
 API_SOURCES := $(wildcard distingnt-api/src/*.rs distingnt-api/src/api/*.rs distingnt-sys/src/*.rs distingnt-sys/shims/*.cpp distingnt-sys/tools/*.py distingNT_API/include/distingnt/*.h) distingnt-api/Cargo.toml distingnt-sys/Cargo.toml
 .DELETE_ON_ERROR:
 
-all: $(OUTPUT) plugins/rust-window-comparator.o
+all: $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o
+
+plugins/wavesmith.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml wavesmith/Cargo.toml $(wildcard wavesmith/src/*.rs) distingnt-sys/build.rs $(API_SOURCES)
+	@mkdir -p $(dir $@)
+	cargo build --manifest-path Cargo.toml -p wavesmith --target $(RUST_TARGET) --profile plugin
+	python3 distingnt-sys/tools/link_plugin.py target/$(RUST_TARGET)/plugin/libwavesmith.a $@ --dram-callees
+	python3 tools/check_plugin.py $@
 
 plugins/rust-window-comparator.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml window-comparator/Cargo.toml $(wildcard window-comparator/src/*.rs) distingnt-sys/build.rs $(API_SOURCES)
 	@mkdir -p $(dir $@)
@@ -18,7 +24,7 @@ $(OUTPUT): Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml distingn
 	python3 tools/check_plugin.py $@
 
 clean:
-	rm -f $(OUTPUT) plugins/rust-window-comparator.o
+	rm -f $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o
 	rm -rf target
 
 .PHONY: all clean
@@ -33,6 +39,7 @@ test:
 	./target/window-cpp-reference > target/window-cpp-reference.txt
 	cargo test -p window-comparator --lib -- --include-ignored
 	cargo test -p monosynth --lib
+	cargo test -p wavesmith --lib
 	cargo test -p distingnt-sys --lib
 	cargo test -p distingnt-api --lib
 	cargo test -p distingnt-api --doc
