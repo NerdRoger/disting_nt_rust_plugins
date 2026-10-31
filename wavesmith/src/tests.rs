@@ -244,7 +244,9 @@ fn table_specification_controls_real_allocations_for_every_supported_count() {
             instance.change(PITCH, 105);
             for smoothing in [0, 100] {
                 instance.change(SMOOTHING, smoothing);
-                for _ in 0..40 {
+                // At 20 tables and 32 segments the split rebuild takes 60
+                // callbacks, plus the five-millisecond publication fade.
+                for _ in 0..80 {
                     instance.render(&mut samples);
                 }
                 assert!(samples.iter().all(|v| v.is_finite()));

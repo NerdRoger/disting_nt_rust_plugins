@@ -13,13 +13,16 @@ const TABLES_PER_BANK: usize = LEVELS + 1;
 // Pack two real-valued tables into each block's real/imaginary lanes.
 #[cfg(test)]
 const BANK_BLOCKS: usize = TABLES_PER_BANK;
-const TABLES_PER_STEP: usize = 4;
+// One paired inverse FFT per callback, producing at most two audio tables.
+const TABLES_PER_STEP: usize = 2;
+const TABLE_PAIR_STEPS: usize = 4;
+const HARMONICS_PER_STEP: usize = 4;
 pub const MAX_SEGMENTS: usize = 32;
 #[cfg(test)]
 const TWIDDLES: usize = BANK_BLOCKS + 2;
 
 #[cfg(test)]
-const BUILD_STEPS: usize = LEVELS.div_ceil(TABLES_PER_STEP) + 2;
+const BUILD_STEPS: usize = LEVELS.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS + 3;
 
 #[derive(Clone, Copy)]
 struct TableLayout {
@@ -148,26 +151,57 @@ fn fold(mut value: f32) -> f32 {
     value
 }
 
-// Add a harmonic without allocating another table or doing a second FFT.
+// The FFT needs only the first half-cycle. Recover the remaining phases by
+// symmetry, so harmonic synthesis can reuse those values without a new buffer.
 fn add_harmonic(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], k: usize, a: f32, b: f32) {
-    let step = twiddles[k & (SIZE - 1)];
-    let (mut cosine, mut sinusoid) = (1.0, 0.0);
+    let mut phase = 0;
     for value in data {
-        value.re += a * cosine + b * sinusoid;
-        let next = cosine * step.re + sinusoid * step.im;
-        sinusoid = sinusoid * step.re - cosine * step.im;
-        cosine = next;
+        let basis = twiddles[phase & (SIZE / 2 - 1)];
+        let correction = a * basis.re - b * basis.im;
+        value.re += if phase < SIZE / 2 {
+            correction
+        } else {
+            -correction
+        };
+        phase = (phase + k) & (SIZE - 1);
+    }
+}
+
+// Cache the boundary analysis basis once per specification. Two independent
+// blocks hold up to 16 harmonics x 32 boundaries, without a large State/stack.
+fn prepare_boundary_basis(n: usize, basis: &mut [Block; 2]) {
+    let n = n.clamp(2, MAX_SEGMENTS);
+    for k in 1..=n / 2 {
+        let angle = core::f32::consts::TAU * k as f32 / n as f32;
+        let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
+        let (mut cosine, mut sinusoid) = (1.0, 0.0);
+        for i in 0..n {
+            let index = (k - 1) * n + i;
+            basis[(index / SIZE) & 1].data[index & (SIZE - 1)] = Complex {
+                re: cosine,
+                im: sinusoid,
+            };
+            let next = cosine * wc - sinusoid * ws;
+            sinusoid = sinusoid * wc + cosine * ws;
+            cosine = next;
+        }
     }
 }
 
 /// Explicit smoothing retains shared boundaries, including the seam. This is
 /// independent of oscillator pitch. The final anti-alias filter follows this.
-fn anchor_boundaries(wave: &Wave, data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE]) {
+fn anchor_boundary_step(
+    wave: &Wave,
+    data: &mut [Complex; SIZE],
+    twiddles: &[Complex; SIZE],
+    basis: &[Block; 2],
+    errors: &mut [Complex; SIZE],
+    step: usize,
+) {
     let n = wave.count.clamp(2, MAX_SEGMENTS);
-    // A second projection compensates for linear table lookup between grid
-    // samples when the segment count does not divide SIZE (e.g. 7 or 31).
-    for _ in 0..2 {
-        let mut errors = [0.0; MAX_SEGMENTS];
+    if step == 0 {
+        // The source spectrum is no longer needed after the smoothing IFFT.
+        // Borrow it to retain errors across callbacks without another buffer.
         for (i, error) in errors.iter_mut().take(n).enumerate() {
             let position = i as f32 * SIZE as f32 / n as f32;
             let index = position as usize & (SIZE - 1);
@@ -175,30 +209,40 @@ fn anchor_boundaries(wave: &Wave, data: &mut [Complex; SIZE], twiddles: &[Comple
             let actual =
                 data[index].re + (data[(index + 1) & (SIZE - 1)].re - data[index].re) * fraction;
             let target = wave.boundary_level(i);
-            *error = target - actual;
+            error.re = target - actual;
         }
-        let dc = errors.iter().take(n).sum::<f32>() / n as f32;
+        let dc = errors.iter().take(n).map(|error| error.re).sum::<f32>() / n as f32;
         for value in data.iter_mut() {
             value.re += dc;
         }
-        for k in 1..=n / 2 {
-            let angle = core::f32::consts::TAU * k as f32 / n as f32;
-            let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
-            let (mut cosine, mut sinusoid) = (1.0, 0.0);
+    } else {
+        let first = 1 + (step - 1) * HARMONICS_PER_STEP;
+        for k in first..(first + HARMONICS_PER_STEP).min(n / 2 + 1) {
             let (mut a, mut b) = (0.0, 0.0);
-            for &error in errors.iter().take(n) {
-                a += error * cosine;
-                b += error * sinusoid;
-                let next = cosine * wc - sinusoid * ws;
-                sinusoid = sinusoid * wc + cosine * ws;
-                cosine = next;
+            for (i, error) in errors.iter().take(n).enumerate() {
+                let index = (k - 1) * n + i;
+                let weight = basis[(index / SIZE) & 1].data[index & (SIZE - 1)];
+                a += error.re * weight.re;
+                b += error.re * weight.im;
             }
             let scale = if n % 2 == 0 && k == n / 2 { 1.0 } else { 2.0 } / n as f32;
             add_harmonic(data, twiddles, k, a * scale, b * scale);
         }
     }
-    // Projection roundoff only; no waveform-wide translation or normalization.
-    data[0].re = wave.boundary_level(0);
+}
+
+fn correction_steps(count: usize) -> usize {
+    1 + (count.clamp(2, MAX_SEGMENTS) / 2).div_ceil(HARMONICS_PER_STEP)
+}
+
+fn audio_table_stage(wave: &Wave) -> usize {
+    if wave.smoothing > 0 {
+        // Sampling, source FFT halves, filter, inverse FFT halves, correction,
+        // preview storage, corrected FFT halves, and spectrum copy.
+        10 + 2 * correction_steps(wave.count)
+    } else {
+        3
+    }
 }
 
 pub fn default_level(node: usize, count: usize) -> i16 {
@@ -252,7 +296,10 @@ fn sine(mut x: f32) -> f32 {
             + q * (1.0 / 120.0 + q * (-1.0 / 5040.0 + q * (1.0 / 362880.0 - q / 39916800.0)))))
 }
 
+#[cfg(test)]
 fn fft(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool) {
+    #[cfg(test)]
+    tests::count_fft(inverse);
     for i in 0..SIZE {
         let j = (i.reverse_bits() >> (usize::BITS - 8)) & (SIZE - 1);
         if i < j {
@@ -290,6 +337,57 @@ fn fft(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool) {
     }
 }
 
+// Each callback performs four of the eight radix-2 stages. Reordering belongs
+// to the first half; inverse normalization belongs to the second. No other
+// build work may touch this buffer between these two calls.
+fn fft_half(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool, second: bool) {
+    #[cfg(test)]
+    {
+        tests::count_fft_half();
+        if second {
+            tests::count_fft(inverse);
+        }
+    }
+    if !second {
+        for i in 0..SIZE {
+            let j = (i.reverse_bits() >> (usize::BITS - 8)) & (SIZE - 1);
+            if i < j {
+                data.swap(i, j);
+            }
+        }
+    }
+    let mut width = if second { 32 } else { 2 };
+    let limit = if second { SIZE } else { 16 };
+    while width <= limit {
+        let half = width / 2;
+        for base in (0..SIZE).step_by(width) {
+            for k in 0..half {
+                let mut w = twiddles[(k * SIZE / width) & (SIZE / 2 - 1)];
+                if inverse {
+                    w.im = -w.im;
+                }
+                let a = data[(base + k) & (SIZE - 1)];
+                let b = data[(base + k + half) & (SIZE - 1)].mul(w);
+                data[(base + k) & (SIZE - 1)] = Complex {
+                    re: a.re + b.re,
+                    im: a.im + b.im,
+                };
+                data[(base + k + half) & (SIZE - 1)] = Complex {
+                    re: a.re - b.re,
+                    im: a.im - b.im,
+                };
+            }
+        }
+        width *= 2;
+    }
+    if inverse && second {
+        for value in data {
+            value.re /= SIZE as f32;
+            value.im /= SIZE as f32;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Block {
     data: [Complex; SIZE],
@@ -305,19 +403,25 @@ impl Block {
 // large buffers outside State avoids large temporary return values on the
 // firmware stack. Each table uses one real or imaginary lane in a packed block.
 pub const fn blocks(tables: usize) -> usize {
-    tables + 4
+    tables + 6
 }
 #[cfg(test)]
 const BLOCKS: usize = blocks(DEFAULT_TABLES);
 pub type Memory = [Block];
 
-fn store_table(banks: &mut [Block], index: usize, source: &[Complex; SIZE]) -> Option<()> {
+fn store_table(
+    banks: &mut [Block],
+    index: usize,
+    source: &[Complex; SIZE],
+    imaginary: bool,
+) -> Option<()> {
     let destination = banks.get_mut(index / 2)?;
     for (to, from) in destination.data.iter_mut().zip(source) {
+        let value = if imaginary { from.im } else { from.re };
         if index & 1 == 0 {
-            to.re = from.re;
+            to.re = value;
         } else {
-            to.im = from.re;
+            to.im = value;
         }
     }
     Some(())
@@ -333,6 +437,7 @@ pub struct Engine {
     stage: usize,
     dirty: bool,
     initialized: bool,
+    basis_count: usize,
     fade: usize,
     fade_length: usize,
     phase: u32,
@@ -360,6 +465,7 @@ impl Engine {
             stage: 0,
             dirty: true,
             initialized: false,
+            basis_count: 0,
             fade: 0,
             fade_length: (sample_rate as usize / 200).max(1),
             phase: 0,
@@ -396,7 +502,10 @@ impl Engine {
             return;
         }
         let (banks, workspace) = memory.split_at_mut(tables_per_bank);
-        let [spectrum, scratch, twiddles] = workspace else {
+        let [spectrum, scratch, twiddles, basis @ ..] = workspace else {
+            return;
+        };
+        let Ok(basis) = <&mut [Block; 2]>::try_from(basis) else {
             return;
         };
         if !self.initialized {
@@ -407,77 +516,152 @@ impl Engine {
                     im: -sine(angle),
                 };
             }
+            // The unused half of the twiddle buffer holds the fixed smoothing
+            // response for harmonics 0..=128, packed into real/imaginary lanes.
+            for harmonic in 0..=SIZE / 2 {
+                let ratio = harmonic as f32 / 4.0;
+                let gain = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
+                let slot = &mut twiddles.data[SIZE / 2 + harmonic / 2];
+                if harmonic & 1 == 0 {
+                    slot.re = gain;
+                } else {
+                    slot.im = gain;
+                }
+            }
             self.initialized = true;
         }
-        if self.stage == 0 {
-            for (i, value) in spectrum.data.iter_mut().enumerate() {
-                *value = Complex {
-                    re: self.building.sample(i as f32 / SIZE as f32),
-                    im: 0.0,
-                };
-            }
-            fft(&mut spectrum.data, &twiddles.data, false);
-            self.stage = 1;
-            return;
+        if self.basis_count != self.building.count {
+            prepare_boundary_basis(self.building.count, basis);
+            self.basis_count = self.building.count;
         }
-        if self.stage == 1 {
-            if self.building.smoothing > 0 {
-                let smoothing = self.building.smoothing as f32 * 0.01;
-                for (k, value) in scratch.data.iter_mut().enumerate() {
-                    let harmonic = k.min(SIZE - k);
-                    let ratio = harmonic as f32 / 4.0;
-                    let filtered_gain = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
-                    let gain = 1.0 + smoothing * (filtered_gain - 1.0);
+        if self.stage <= 2 {
+            if self.stage == 0 {
+                for (i, value) in spectrum.data.iter_mut().enumerate() {
                     *value = Complex {
-                        re: spectrum.data[k].re * gain,
-                        im: spectrum.data[k].im * gain,
+                        re: self.building.sample(i as f32 / SIZE as f32),
+                        im: 0.0,
                     };
                 }
-                fft(&mut scratch.data, &twiddles.data, true);
-                anchor_boundaries(&self.building, &mut scratch.data, &twiddles.data);
-                // Retain the creative shape for the editor before any playback
-                // harmonic cutoff. Publish it together with the audio tables.
+            } else {
+                fft_half(&mut spectrum.data, &twiddles.data, false, self.stage == 2);
+            }
+            self.stage += 1;
+            return;
+        }
+        let audio_stage = audio_table_stage(&self.building);
+        if self.stage < audio_stage {
+            let correction_end = 6 + 2 * correction_steps(self.building.count);
+            match self.stage {
+                3 => {
+                    let smoothing = self.building.smoothing as f32 * 0.01;
+                    for (k, value) in scratch.data.iter_mut().enumerate() {
+                        let harmonic = k.min(SIZE - k);
+                        let slot = twiddles.data[SIZE / 2 + harmonic / 2];
+                        let filtered_gain = if harmonic & 1 == 0 { slot.re } else { slot.im };
+                        let gain = 1.0 + smoothing * (filtered_gain - 1.0);
+                        *value = Complex {
+                            re: spectrum.data[k].re * gain,
+                            im: spectrum.data[k].im * gain,
+                        };
+                    }
+                }
+                4 | 5 => fft_half(&mut scratch.data, &twiddles.data, true, self.stage == 5),
+                stage if stage < correction_end => {
+                    let step = (stage - 6) % correction_steps(self.building.count);
+                    anchor_boundary_step(
+                        &self.building,
+                        &mut scratch.data,
+                        &twiddles.data,
+                        basis,
+                        &mut spectrum.data,
+                        step,
+                    );
+                    if stage + 1 == correction_end {
+                        scratch.data[0].re = self.building.boundary_level(0);
+                    }
+                }
+                stage if stage == correction_end => {
+                    // Save the preview before transforming its buffer.
+                    if store_table(
+                        banks,
+                        (1 - self.active) * tables_per_bank + self.layout.count,
+                        &scratch.data,
+                        false,
+                    )
+                    .is_none()
+                    {
+                        return;
+                    }
+                }
+                stage if stage <= correction_end + 2 => {
+                    fft_half(
+                        &mut scratch.data,
+                        &twiddles.data,
+                        false,
+                        stage == correction_end + 2,
+                    );
+                }
+                _ => spectrum.data.copy_from_slice(&scratch.data),
+            }
+            self.stage += 1;
+            return;
+        }
+        // Each pair gets four dedicated calls: prepare, FFT half 1, FFT half 2,
+        // store. Never expose an unfinished pair to playback or the display.
+        let pair_step = (self.stage - audio_stage) % TABLE_PAIR_STEPS;
+        let level = (self.stage - audio_stage) / TABLE_PAIR_STEPS * TABLES_PER_STEP;
+        let has_second = level + 1 < self.layout.count;
+        match pair_step {
+            0 => {
+                let cutoff = self.layout.cutoff(level);
+                let second_cutoff = self.layout.cutoff(level + 1);
+                for (k, value) in scratch.data.iter_mut().enumerate() {
+                    let harmonic = k.min(SIZE - k);
+                    let first =
+                        if self.layout.count == 1 || (harmonic <= cutoff && harmonic < SIZE / 2) {
+                            spectrum.data[k]
+                        } else {
+                            Complex::default()
+                        };
+                    let second = if has_second && harmonic <= second_cutoff && harmonic < SIZE / 2 {
+                        spectrum.data[k]
+                    } else {
+                        Complex::default()
+                    };
+                    // IFFT(A + iB) = a + ib for two real time-domain signals.
+                    *value = Complex {
+                        re: first.re - second.im,
+                        im: first.im + second.re,
+                    };
+                }
+            }
+            1 | 2 => fft_half(&mut scratch.data, &twiddles.data, true, pair_step == 2),
+            _ => {
                 if store_table(
                     banks,
-                    (1 - self.active) * tables_per_bank + self.layout.count,
+                    (1 - self.active) * tables_per_bank + level,
                     &scratch.data,
+                    false,
                 )
                 .is_none()
                 {
                     return;
                 }
-                // Re-enter the frequency domain after anchoring. Never anchor
-                // the band-limited tables: doing so would restore unsafe harmonics.
-                fft(&mut scratch.data, &twiddles.data, false);
-                spectrum.data.copy_from_slice(&scratch.data);
-            }
-            self.stage = 2;
-            return;
-        }
-        let first_level = (self.stage - 2) * TABLES_PER_STEP;
-        for level in first_level..(first_level + TABLES_PER_STEP).min(self.layout.count) {
-            let cutoff = self.layout.cutoff(level);
-            for (k, value) in scratch.data.iter_mut().enumerate() {
-                let harmonic = k.min(SIZE - k);
-                *value = if self.layout.count == 1 || (harmonic <= cutoff && harmonic < SIZE / 2) {
-                    spectrum.data[k]
-                } else {
-                    Complex::default()
-                };
-            }
-            fft(&mut scratch.data, &twiddles.data, true);
-            if store_table(
-                banks,
-                (1 - self.active) * tables_per_bank + level,
-                &scratch.data,
-            )
-            .is_none()
-            {
-                return;
+                if has_second
+                    && store_table(
+                        banks,
+                        (1 - self.active) * tables_per_bank + level + 1,
+                        &scratch.data,
+                        true,
+                    )
+                    .is_none()
+                {
+                    return;
+                }
             }
         }
         self.stage += 1;
-        if first_level + TABLES_PER_STEP >= self.layout.count {
+        if pair_step == 3 && level + TABLES_PER_STEP >= self.layout.count {
             self.publish();
         }
     }

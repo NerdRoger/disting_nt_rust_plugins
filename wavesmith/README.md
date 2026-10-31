@@ -112,6 +112,11 @@ DC. One-table mode instead retains the entire sampled cycle, including the
 table's Nyquist bin, with no pitch-dependent cutoff or table crossfade.
 Two banks permit live edits, so memory holds twice the specified number of audio
 tables, plus two creative-smoothing display tables.
+Audio tables are generated in pairs: one complex inverse FFT produces two real
+waveforms, extracted from its real and imaginary components. Odd table counts
+use a final unpaired transform. This reduces table-generation inverse FFTs from
+N to ceil(N/2), reusing the existing scratch buffer. Source sampling, creative
+Smoothing, boundary anchoring, update cadence and edit crossfades are unchanged.
 With at least two tables, playback selects adjacent tables using a binary search and blends between
 them only when the richer table's highest harmonic is between 47% and 49% of the
 audio sample rate (22.56–23.52 kHz at 48 kHz). The richest table is fully removed
@@ -145,19 +150,37 @@ retain the drawn source shape.
 
 A five-millisecond crossfade prevents abrupt edit clicks without resetting phase.
 That short transition also applies when enabling or disabling smoothing. A table
-set takes two setup callbacks plus one callback per group of up to four tables:
-three callbacks at 1 table, four at the default 6, and seven at 20. At 64 frames
-and 48 kHz, the default takes about 5.3 ms,
-followed by the fade. Continuous edits are coalesced without restarting an
+set without smoothing takes three source callbacks (sample, FFT half 1, FFT
+half 2) plus four callbacks per pair of tables: seven callbacks at 1 table,
+fifteen at the default 6, and 43 at 20. Every forward and inverse FFT runs in
+two dedicated callbacks, each performing four of its eight radix-2 stages.
+Reordering belongs to the first half; inverse normalization to the second.
+Sampling, filtering, preview storage, spectrum copying, and table storage run
+separately from the FFT halves. Each of the two boundary-correction passes takes one
+callback to measure errors and apply DC, followed by callbacks that each apply
+up to four harmonics. With six tables, a smoothed build takes 26 callbacks at
+eight segments, or 32 at 32 segments. At 64 frames and 48 kHz, those are
+about 34.7 ms and 42.7 ms, versus 20 ms without smoothing, followed by the fade.
+This reduces work per callback without adding buffers or changing the correction.
+Continuous edits are coalesced without restarting an
 unfinished build. The old complete table set plays until the new set is ready.
 Startup is silent during the first build, then fades in. This is interactive
 control-rate editing; it is not an audio-rate waveform modulation engine.
 
 Audio/preview tables and build buffers occupy separately constructed SRAM blocks
-with a buffer footprint of (2 × tables + 8) KiB: 10 KiB at 1 table, 20 KiB at 6,
-and 48 KiB at 20, excluding the small instance state and parameter metadata.
-Two real-valued tables are packed into each block. Up to four inverse FFTs per
-build callback bound the table-generation work. This keeps
+with a buffer footprint of (2 × tables + 12) KiB: 14 KiB at 1 table, 24 KiB at 6,
+and 52 KiB at 20, excluding the small instance state and parameter metadata.
+Two additional blocks cache the boundary-correction analysis weights once at
+startup for the selected segment count. Harmonic correction reuses the FFT's
+half-cycle lookup instead of regenerating sine/cosine recurrences on every edit.
+The fixed smoothing filter response fits in the unused half of the FFT lookup
+buffer. Smoothing still applies both boundary-correction passes with the same
+correction order; these caches do not depend on the current shape or Smooth value.
+Two real-valued tables are packed into each block. Each table pair takes four
+callbacks: prepare the paired spectrum, inverse FFT half 1, inverse FFT half 2,
+and store the pair. Each build callback performs at most half an FFT, retaining
+paired table generation without adding buffers.
+This keeps
 large temporaries off the firmware stack. No memory allocation or locks occur
 during audio rendering. There is no automatic whole-wave shift or normalization.
 Smoothed shapes can ring beyond their requested levels; ±5 V at full Level is

@@ -1,4 +1,29 @@
 use super::*;
+extern crate std;
+use std::cell::Cell;
+
+std::thread_local! {
+    static FFT_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static FFT_HALVES: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn count_fft_half() {
+    FFT_HALVES.with(|counter| counter.set(counter.get() + 1));
+}
+
+fn build_calls(wave: &Wave, tables: usize) -> usize {
+    audio_table_stage(wave) + tables.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS
+}
+
+pub(super) fn count_fft(inverse: bool) {
+    FFT_COUNTS.with(|counter| {
+        let (forward, backward) = counter.get();
+        counter.set((
+            forward + usize::from(!inverse),
+            backward + usize::from(inverse),
+        ));
+    });
+}
 
 fn read_table(engine: &Engine, memory: &Memory, index: usize) -> [Complex; SIZE] {
     let mut table = [Complex::default(); SIZE];
@@ -6,6 +31,104 @@ fn read_table(engine: &Engine, memory: &Memory, index: usize) -> [Complex; SIZE]
         sample.re = engine.lookup(memory, index, (i as u32) << 24);
     }
     table
+}
+
+// Independent reference retaining the original per-rebuild recurrences.
+fn reference_anchor(wave: &Wave, data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE]) {
+    let n = wave.count;
+    for _ in 0..2 {
+        let mut errors = [0.0; MAX_SEGMENTS];
+        for (i, error) in errors.iter_mut().take(n).enumerate() {
+            let position = i as f32 * SIZE as f32 / n as f32;
+            let index = position as usize & (SIZE - 1);
+            let fraction = position - index as f32;
+            let actual =
+                data[index].re + (data[(index + 1) & (SIZE - 1)].re - data[index].re) * fraction;
+            *error = wave.boundary_level(i) - actual;
+        }
+        let dc = errors.iter().take(n).sum::<f32>() / n as f32;
+        for value in data.iter_mut() {
+            value.re += dc;
+        }
+        for k in 1..=n / 2 {
+            let angle = core::f32::consts::TAU * k as f32 / n as f32;
+            let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
+            let (mut cosine, mut sinusoid) = (1.0, 0.0);
+            let (mut a, mut b) = (0.0, 0.0);
+            for &error in errors.iter().take(n) {
+                a += error * cosine;
+                b += error * sinusoid;
+                let next = cosine * wc - sinusoid * ws;
+                sinusoid = sinusoid * wc + cosine * ws;
+                cosine = next;
+            }
+            let scale = if n % 2 == 0 && k == n / 2 { 1.0 } else { 2.0 } / n as f32;
+            let step = twiddles[k];
+            let (mut cosine, mut sinusoid) = (1.0, 0.0);
+            for value in data.iter_mut() {
+                value.re += (a * scale) * cosine + (b * scale) * sinusoid;
+                let next = cosine * step.re + sinusoid * step.im;
+                sinusoid = sinusoid * step.re - cosine * step.im;
+                cosine = next;
+            }
+        }
+    }
+    data[0].re = wave.boundary_level(0);
+}
+
+#[test]
+fn cached_smoothing_matches_original_for_every_segment_count() {
+    for n in 2..=MAX_SEGMENTS {
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut engine = Engine::new(n, 48000);
+        finish_build(&mut engine, &mut memory, Wave::new(n), 440.0);
+        let cached = [memory[BANK_BLOCKS + 3], memory[BANK_BLOCKS + 4]];
+        for seed in 0..8 {
+            let mut wave = Wave::new(n);
+            for i in 0..n {
+                wave.boundaries[i] = ((i * 73 + seed * 43) % 201) as i16 - 100;
+                wave.curves[i] = ((i * 31 + seed * 67) % 201) as i16 - 100;
+            }
+            for smoothing in [1, 25, 50, 100] {
+                wave.smoothing = smoothing;
+                let mut reference = [Complex::default(); SIZE];
+                for (i, value) in reference.iter_mut().enumerate() {
+                    value.re = wave.sample(i as f32 / SIZE as f32);
+                }
+                fft(&mut reference, &memory[TWIDDLES].data, false);
+                for (k, value) in reference.iter_mut().enumerate() {
+                    let harmonic = k.min(SIZE - k);
+                    let ratio = harmonic as f32 / 4.0;
+                    let filtered = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
+                    let slot = memory[TWIDDLES].data[SIZE / 2 + harmonic / 2];
+                    assert_eq!(filtered, if harmonic & 1 == 0 { slot.re } else { slot.im });
+                    let gain = 1.0 + smoothing as f32 * 0.01 * (filtered - 1.0);
+                    value.re *= gain;
+                    value.im *= gain;
+                }
+                fft(&mut reference, &memory[TWIDDLES].data, true);
+                reference_anchor(&wave, &mut reference, &memory[TWIDDLES].data);
+                finish_build(&mut engine, &mut memory, wave, 440.0);
+                let preview =
+                    read_table(&engine, &memory, engine.active * TABLES_PER_BANK + LEVELS);
+                for (i, (actual, expected)) in preview.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (actual.re - expected.re).abs() < 0.0001,
+                        "segments {n}, seed {seed}, smoothing {smoothing}, sample {i}: {} vs {}",
+                        actual.re,
+                        expected.re
+                    );
+                }
+                assert_eq!(engine.basis_count, n);
+                for (stored, initial) in memory[BANK_BLOCKS + 3..].iter().zip(&cached) {
+                    for (a, b) in stored.data.iter().zip(&initial.data) {
+                        assert_eq!(a.re, b.re);
+                        assert_eq!(a.im, b.im);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn rendered_harmonic_gain(increment: f32, harmonic: usize) -> f32 {
@@ -21,7 +144,11 @@ fn rendered_harmonic_gain(increment: f32, harmonic: usize) -> f32 {
 
 fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency: f32) {
     engine.request(wave);
-    for _ in 0..BUILD_STEPS + 8 {
+    // Allow an in-flight older shape, the requested build, and both fades.
+    let longest_build = 10
+        + 2 * correction_steps(MAX_SEGMENTS)
+        + engine.layout.count.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS;
+    for _ in 0..2 * longest_build + 12 {
         engine.advance(memory);
         for _ in 0..64 {
             assert!(engine.tick(memory, frequency, 48000.0, 1.0).is_finite());
@@ -29,6 +156,163 @@ fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency:
     }
     assert_eq!(engine.waves[engine.active], wave);
     assert_eq!(engine.fade, 0);
+}
+
+#[test]
+fn split_fft_matches_unsplit_transform_exactly_in_both_directions() {
+    let mut engine = Engine::new(32, 48000);
+    let mut memory = [Block::ZERO; BLOCKS];
+    engine.advance(&mut memory);
+    let twiddles = &memory[TWIDDLES].data;
+    for inverse in [false, true] {
+        for seed in 0..8 {
+            let mut expected = [Complex::default(); SIZE];
+            for (i, value) in expected.iter_mut().enumerate() {
+                *value = Complex {
+                    re: ((i * 73 + seed * 43) % 257) as f32 / 128.0 - 1.0,
+                    im: ((i * 31 + seed * 67) % 257) as f32 / 128.0 - 1.0,
+                };
+            }
+            let mut actual = expected;
+            fft(&mut expected, twiddles, inverse);
+            fft_half(&mut actual, twiddles, inverse, false);
+            assert!(actual
+                .iter()
+                .zip(&expected)
+                .any(|(a, b)| a.re != b.re || a.im != b.im));
+            fft_half(&mut actual, twiddles, inverse, true);
+            for (a, b) in actual.iter().zip(&expected) {
+                assert_eq!(a.re.to_bits(), b.re.to_bits());
+                assert_eq!(a.im.to_bits(), b.im.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts() {
+    for tables in 1..=MAX_TABLES {
+        for n in [2, 7, 32] {
+            for smoothing in [0, 50, 100] {
+                let mut storage = [Block::ZERO; blocks(MAX_TABLES)];
+                let memory = &mut storage[..blocks(tables)];
+                let mut engine = Engine::with_tables(n, 48000, tables);
+                let mut wave = Wave::new(n);
+                wave.smoothing = smoothing;
+                for i in 0..n {
+                    wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
+                    wave.curves[i] = (i * 31 % 201) as i16 - 100;
+                }
+                // Exercise both physical bank alignments. With an even table
+                // count, the second bank begins in an imaginary storage lane.
+                for generation in 0..2 {
+                    wave.boundaries[1] += generation;
+                    let old = read_table(&engine, memory, engine.active * (tables + 1));
+                    engine.request(wave);
+                    FFT_COUNTS.with(|counter| counter.set((0, 0)));
+                    let audio_stage = audio_table_stage(&wave);
+                    for callback in 0..build_calls(&wave, tables) {
+                        let before = FFT_COUNTS.with(|counter| counter.get());
+                        let halves_before = FFT_HALVES.with(|counter| counter.get());
+                        engine.advance(memory);
+                        let after = FFT_COUNTS.with(|counter| counter.get());
+                        let halves = FFT_HALVES.with(|counter| counter.get()) - halves_before;
+                        let fft_callback = callback == 1
+                            || callback == 2
+                            || (smoothing > 0
+                                && (callback == 4
+                                    || callback == 5
+                                    || callback == audio_stage - 3
+                                    || callback == audio_stage - 2))
+                            || (callback >= audio_stage
+                                && matches!((callback - audio_stage) % TABLE_PAIR_STEPS, 1 | 2));
+                        assert_eq!(halves, usize::from(fft_callback));
+                        assert!((after.0 - before.0) + (after.1 - before.1) <= 1);
+                        let inverses = FFT_COUNTS.with(|counter| counter.get().1);
+                        let before_smoothing = usize::from(smoothing > 0 && callback >= 5);
+                        let audio_inverses =
+                            (callback + 2).saturating_sub(audio_stage) / TABLE_PAIR_STEPS;
+                        assert_eq!(inverses, before_smoothing + audio_inverses);
+                    }
+                    assert_eq!(engine.fade, engine.fade_length);
+                    assert_eq!(engine.waves[1 - engine.active], wave);
+                    let old_after_build = read_table(&engine, memory, engine.active * (tables + 1));
+                    for (before, after) in old.iter().zip(&old_after_build) {
+                        assert_eq!(before.re, after.re);
+                    }
+                    let (forward, inverse) = FFT_COUNTS.with(|counter| counter.get());
+                    assert_eq!(forward, 1 + usize::from(smoothing > 0));
+                    assert_eq!(inverse, tables.div_ceil(2) + usize::from(smoothing > 0));
+                    // Independently reproduce the previous one-IFFT-per-table
+                    // path from the same source spectrum, then compare samples.
+                    let source = memory[tables + 1].data;
+                    for level in 0..tables {
+                        let mut reference = [Complex::default(); SIZE];
+                        let limit = engine.layout.cutoff(level);
+                        for (k, sample) in reference.iter_mut().enumerate() {
+                            if tables == 1 || (k.min(SIZE - k) <= limit && k != SIZE / 2) {
+                                *sample = source[k];
+                            }
+                        }
+                        fft(&mut reference, &memory[tables + 3].data, true);
+                        let actual =
+                            read_table(&engine, memory, (1 - engine.active) * (tables + 1) + level);
+                        for (i, (actual, expected)) in actual.iter().zip(&reference).enumerate() {
+                            assert!((actual.re - expected.re).abs() < 0.00001,
+                                "tables {tables}, segments {n}, smoothing {smoothing}, generation {generation}, level {level}, sample {i}");
+                        }
+                    }
+                    for _ in 0..240 {
+                        engine.tick(memory, 220.0, 48000.0, 1.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
+    for n in [2, 8, 31, 32] {
+        for smoothing in [1, 100] {
+            let mut engine = Engine::new(n, 48000);
+            let mut memory = [Block::ZERO; BLOCKS];
+            let mut wave = Wave::new(n);
+            wave.smoothing = smoothing;
+            finish_build(&mut engine, &mut memory, wave, 440.0);
+            let old_bank = engine.active;
+            let old = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
+            wave.boundaries[0] = 70;
+            wave.curves[0] = -80;
+            let snapshot = wave;
+            engine.request(snapshot);
+            let callbacks = build_calls(&snapshot, LEVELS);
+            for callback in 0..callbacks {
+                engine.advance(&mut memory);
+                assert_eq!(engine.active, old_bank);
+                assert_eq!(engine.building, snapshot);
+                assert_eq!(engine.fade > 0, callback + 1 == callbacks);
+                let current = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
+                for (a, b) in current.iter().zip(&old) {
+                    assert_eq!(a.re, b.re);
+                }
+                // Latest requests must not overwrite partial smoothing scratch
+                // or restart the build; they belong to the following build.
+                wave.boundaries[0] = -(callback as i16);
+                wave.smoothing = if callback & 1 == 0 { 0 } else { 50 };
+                engine.request(wave);
+                if callback + 1 < callbacks {
+                    for _ in 0..64 {
+                        engine.tick(&memory, 440.0, 48000.0, 1.0);
+                    }
+                }
+            }
+            assert_eq!(engine.waves[1 - old_bank], snapshot);
+            assert!(engine.dirty);
+            finish_build(&mut engine, &mut memory, wave, 440.0);
+            assert_eq!(engine.waves[engine.active], wave);
+        }
+    }
 }
 
 #[test]
@@ -321,7 +605,7 @@ fn all_table_counts_build_complete_banks_and_single_table_bypasses_filtering() {
         for smoothing in [0, 100] {
             wave.smoothing = smoothing;
             engine.request(wave);
-            for _ in 0..32 {
+            for _ in 0..build_calls(&wave, tables) + 8 {
                 engine.advance(memory);
                 for _ in 0..64 {
                     assert!(engine.tick(memory, 2800.0, 48000.0, 1.0).is_finite());
@@ -555,7 +839,11 @@ fn rebuild_crossfade_starts_at_old_wave_and_continuous_edits_do_not_starve() {
             assert!(engine.tick(&memory, 2800.0, 48000.0, 1.0).is_finite());
         }
     }
-    assert!(engine.waves[engine.active].boundaries[4] > 70);
+    // The audible bank may be one completed generation behind the pending
+    // generation. Bound the lag by two build/fade cycles, rather than the old
+    // fixed threshold that assumed a much shorter callback schedule.
+    let max_lag = 2 * (BUILD_STEPS + engine.fade_length.div_ceil(64));
+    assert!(engine.waves[engine.active].boundaries[4] >= wave.boundaries[4] - max_lag as i16);
     assert_ne!(engine.phase, phase);
     finish_build(&mut engine, &mut memory, wave, 2800.0);
 }
