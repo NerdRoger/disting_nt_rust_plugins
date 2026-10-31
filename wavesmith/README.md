@@ -1,9 +1,16 @@
 # Wavesmith prototype
 
 A free-running oscillator built from 2–32 equal-width curved segments. Select the
-segment count in the algorithm's setup specifications when adding Wavesmith.
-The NT allocates parameter layouts at construction: changing the count requires
-replacing/recreating the instance. Shape edits work while audio plays.
+segment count and Anti-alias tables in the algorithm's setup specifications.
+Anti-alias tables accepts 1–20, default 6. The NT allocates parameter layouts and
+buffers at construction; use its respecification workflow to change these counts.
+Shape edits work while audio plays.
+
+One table disables automatic pitch-dependent anti-alias filtering and plays the
+full-detail sampled cycle at every pitch; aliasing is expected for sharp shapes
+at higher pitches. Creative Smoothing still works. With 2–20 tables, filtering
+remains active and higher counts provide finer changes in harmonic content.
+Only the chosen count is allocated, rather than reserving the maximum.
 
 ## Controls
 
@@ -44,17 +51,19 @@ The footer is always visible at y=50–63, matching Window Comparator's reserved
 area. The custom display contains global values, the graph and help footer. The draw
 callback returns true to suppress the NT's standard parameter line, since the
 waveform editor uses the pots and encoders in this view.
-A single bright, antialiased graph shows the shape used for playback,
-including optional smoothing and brief edit crossfades. The display uses the NT's
+The bright, antialiased trace shows the defined shape with optional creative
+smoothing and brief edit crossfades. A dim audio trace (brightness 4) is drawn
+behind it for development, showing pitch-dependent harmonic filtering and the
+audio edit crossfade, before output Level scaling. The bright trace is always
+drawn last so it stays in front wherever the traces meet. The display uses the NT's
 native antialiased float-coordinate drawing API; this does not filter the audio.
 The grid uses solid lines at the lowest nonzero brightness (1) in Segment mode.
 Globals mode hides the vertical segment dividers but retains the horizontal zero axis.
 Full-brightness boundary handles in Segment mode mark both
-ends of the selected segment above the curve. There is no separate unsmoothed
-reference trace. At Smooth = 0, playback
-evaluates the drawn segments directly at every audio sample: there is no harmonic
-limit, sampled-wave approximation, or automatic anti-alias filtering. Applying
-Smooth changes the displayed curve while preserving its shared boundary levels.
+ends of the selected segment above the curves. The bright trace is independent
+of pitch and the audio path's automatic
+anti-alias filtering. At Smooth = 0 it evaluates the exact drawn curves; above
+zero it reads a separate creative-smoothing table, preserving the boundary levels.
 
 ## Parameters and routing
 
@@ -82,9 +91,30 @@ stored by the NT host with the preset; editor selection is temporary.
 
 ## Rendering
 
-At zero smoothing, the oscillator evaluates the exact segment/curve formula at
-its current phase. Raising pitch only changes phase speed; it does not change the
-waveform. Sharp shapes can alias, as expected from direct digital playback.
+Every waveform edit builds the specified number of 256-sample audio tables.
+At the default six, harmonic limits remain 127, 32, 8, 4, 2, and 1. For counts
+above one, limits are distinct and nested: increasing the count adds another
+intermediate limit without removing those already present. The most detailed
+table retains up to 127 harmonics and the simplest retains the fundamental and
+DC. One-table mode instead retains the entire sampled cycle, including the
+table's Nyquist bin, with no pitch-dependent cutoff or table crossfade.
+Two banks permit live edits, so memory holds twice the specified number of audio
+tables, plus two creative-smoothing display tables.
+With at least two tables, playback selects adjacent tables using a binary search and blends between
+them only when the richer table's highest harmonic is between 47% and 49% of the
+audio sample rate (22.56–23.52 kHz at 48 kHz). The richest table is fully removed
+before any of its harmonics exceeds that limit. This narrow, late crossfade
+retains more detail than the original broad octave crossfade, though larger
+bands of still-safe harmonics can disappear as tables change compared with the
+eight-table bank, particularly at low and middle pitches. At the default six
+tables, around F7 the eighth harmonic
+is retained fully. Pitch changes reuse the bank without rebuilding it.
+Steady playback uses at most two table lookups per waveform sample, with four
+during a brief waveform-edit crossfade. There is no per-sample harmonic synthesis.
+Low notes retain more detail; high notes become smoother and may become quieter
+if most of the drawn shape's energy was in the removed harmonics. This reduces
+aliasing substantially, but finite source sampling and linear table interpolation
+still leave some residual error; it is not a guarantee of completely alias-free audio.
 
 When Smooth is above zero, a 256-sample FFT applies the requested smoothing.
 The control proportionally blends the original shape toward the fully smoothed
@@ -92,18 +122,30 @@ shape, spreading the change across its full travel instead of sweeping a filter
 cutoff that becomes ineffective early. Maximum smoothing is unchanged.
 Boundary constraints still limit how
 smooth a shape with strongly alternating boundary levels can become.
-There is no additional harmonic cutoff or pitch-dependent filtering. Shared
-boundaries and the shared seam remain anchored (within 0.1% table interpolation
-tolerance). The audio and bright trace both read that same smoothed table.
+Creative smoothing still anchors the source's shared boundaries, including the
+seam, before the anti-alias filter. The final filtered tables deliberately do not
+restore those anchors, which would reintroduce out-of-band harmonics. Both ends
+of playback remain periodic and meet at the same value. The bright editor trace
+uses the shape before the final anti-alias filter, so raising pitch changes the
+audio without changing the drawing. Audio and display share the brief edit
+crossfade. Boundary parameters, randomization, modulation targets and presets
+retain the drawn source shape.
 
 A five-millisecond crossfade prevents abrupt edit clicks without resetting phase.
-That short transition also applies when enabling or disabling smoothing. Direct
-edits need no table build; smoothed edits take two audio callbacks to prepare
-(about 2.7 ms at a 64-frame/48 kHz block), followed by the fade. Continuous edits
-are coalesced without restarting an unfinished build. The initial waveform plays
-directly, with a short gain fade-in. This is interactive control-rate editing.
+That short transition also applies when enabling or disabling smoothing. A table
+set takes two setup callbacks plus one callback per group of up to four tables:
+three callbacks at 1 table, four at the default 6, and seven at 20. At 64 frames
+and 48 kHz, the default takes about 5.3 ms,
+followed by the fade. Continuous edits are coalesced without restarting an
+unfinished build. The old complete table set plays until the new set is ready.
+Startup is silent during the first build, then fades in. This is interactive
+control-rate editing; it is not an audio-rate waveform modulation engine.
 
-Smoothing buffers occupy separately constructed SRAM blocks (about 10 KB), keeping
+Audio/preview tables and build buffers occupy separately constructed SRAM blocks
+with a buffer footprint of (2 × tables + 8) KiB: 10 KiB at 1 table, 20 KiB at 6,
+and 48 KiB at 20, excluding the small instance state and parameter metadata.
+Two real-valued tables are packed into each block. Up to four inverse FFTs per
+build callback bound the table-generation work. This keeps
 large temporaries off the firmware stack. No memory allocation or locks occur
 during audio rendering. There is no automatic whole-wave shift or normalization.
 Smoothed shapes can ring beyond their requested levels; ±5 V at full Level is

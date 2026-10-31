@@ -30,6 +30,11 @@ fn count(specs: &[i32]) -> Option<usize> {
     (2..=32).contains(&value).then_some(value)
 }
 
+fn table_count(specs: &[i32]) -> Option<usize> {
+    let value = usize::try_from(*specs.get(1)?).ok()?;
+    (1..=dsp::MAX_TABLES).contains(&value).then_some(value)
+}
+
 const fn boundary_parameter(boundary: usize) -> usize {
     GLOBALS + boundary - 1
 }
@@ -179,13 +184,22 @@ impl Plugin for Wavesmith {
     const NAME: &'static CStr = c"Wavesmith";
     const DESCRIPTION: &'static CStr = c"Sculpt a live oscillator from curved segments";
     const TAGS: u32 = TAG_INSTRUMENT;
-    const SPECIFICATIONS: &'static [Specification] = &[Specification {
-        name: c"Segments",
-        min: 2,
-        max: 32,
-        default: 8,
-        kind: TYPE_GENERIC,
-    }];
+    const SPECIFICATIONS: &'static [Specification] = &[
+        Specification {
+            name: c"Segments",
+            min: 2,
+            max: 32,
+            default: 8,
+            kind: TYPE_GENERIC,
+        },
+        Specification {
+            name: c"Anti-alias tables",
+            min: 1,
+            max: dsp::MAX_TABLES as i32,
+            default: dsp::DEFAULT_TABLES as i32,
+            kind: TYPE_GENERIC,
+        },
+    ];
     const CUSTOM_UI: u32 = POT_L | POT_C | POT_R | ENCODER_L | ENCODER_R | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
 
@@ -195,7 +209,7 @@ impl Plugin for Wavesmith {
             parameters: GLOBALS + n * 2 + 1,
             pages: 3,
             page_indices: GLOBALS + n * 2 + 2,
-            voices: dsp::BLOCKS,
+            voices: dsp::blocks(table_count(specs)?),
         })
     }
 
@@ -205,7 +219,7 @@ impl Plugin for Wavesmith {
             return None;
         }
         Some(State {
-            engine: dsp::Engine::new(n, rate),
+            engine: dsp::Engine::with_tables(n, rate, table_count(specs)?),
             count: n,
             sample_rate: rate as f32,
             ui: ui::UiState::new(),
@@ -344,9 +358,7 @@ impl Plugin for Wavesmith {
         };
         let processing = context.processing();
         let state = processing.state;
-        let Ok(memory) = <&mut dsp::Memory>::try_from(processing.voices) else {
-            return;
-        };
+        let memory = processing.voices;
         state.engine.request(wave);
         state.engine.advance(memory);
         for sample in output {

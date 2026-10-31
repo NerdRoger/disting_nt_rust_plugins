@@ -41,7 +41,12 @@ struct Instance {
 
 impl Instance {
     fn new(n: i32) -> Self {
+        Self::with_tables(n, dsp::DEFAULT_TABLES as i32)
+    }
+
+    fn with_tables(n: i32, tables: i32) -> Self {
         unsafe {
+            let specs = [n, tables];
             let f = factory();
             let mut req = NtAlgorithmRequirements {
                 num_parameters: 0,
@@ -50,12 +55,17 @@ impl Instance {
                 dtc: 0,
                 itc: 0,
             };
-            f.calculate_requirements.unwrap()(&mut req, &n);
+            f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
             assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 1);
-            assert!(req.sram < 40_000);
+            assert!(
+                req.sram
+                    < (dsp::blocks(tables as usize) * core::mem::size_of::<dsp::Block>() + 8000)
+                        as u32
+            );
             assert!(core::mem::size_of::<State>() < 1024);
             let alignment =
-                distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&[n]).unwrap();
+                distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
+                    .unwrap();
             let layout = Layout::from_size_align(req.sram as usize, alignment).unwrap();
             let memory = alloc_zeroed(layout);
             assert!(!memory.is_null());
@@ -67,7 +77,7 @@ impl Instance {
                     itc: ptr::null_mut(),
                 },
                 &req,
-                &n,
+                specs.as_ptr(),
             );
             assert!(!base.is_null());
             let values: Vec<_> = (0..req.num_parameters as usize)
@@ -212,9 +222,52 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
         }
     }
     for n in [0, 1, 33, -1] {
-        assert!(Wavesmith::configuration(&[n]).is_none());
+        assert!(Wavesmith::configuration(&[n, 6]).is_none());
     }
     assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_14);
+}
+
+#[test]
+fn table_specification_controls_real_allocations_for_every_supported_count() {
+    let mut previous_size = 0;
+    for tables in 1..=20 {
+        for segments in [2, 32] {
+            let mut instance = Instance::with_tables(segments, tables);
+            assert_eq!(
+                Wavesmith::configuration(&[segments, tables])
+                    .unwrap()
+                    .voices,
+                dsp::blocks(tables as usize)
+            );
+            assert_eq!(unsafe { factory() }.num_specifications, 2);
+            let mut samples = [0.0; LAST_BUS * 64];
+            instance.change(PITCH, 105);
+            for smoothing in [0, 100] {
+                instance.change(SMOOTHING, smoothing);
+                for _ in 0..40 {
+                    instance.render(&mut samples);
+                }
+                assert!(samples.iter().all(|v| v.is_finite()));
+                assert!(samples.iter().any(|v| v.abs() > 0.001));
+                instance.draw();
+            }
+            if segments == 32 {
+                if tables > 1 {
+                    assert_eq!(
+                        instance.layout.size() - previous_size,
+                        core::mem::size_of::<dsp::Block>()
+                    );
+                }
+                previous_size = instance.layout.size();
+            }
+        }
+    }
+    for tables in [-1, 0, 21] {
+        assert!(Wavesmith::configuration(&[8, tables]).is_none());
+        assert!(Wavesmith::create(&[8, tables], 48000).is_none());
+    }
+    assert!(Wavesmith::configuration(&[8]).is_none());
+    assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 6);
 }
 
 #[test]
@@ -287,11 +340,11 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
                     instance.render(&mut samples);
                 }
                 instance.draw();
-                let target = 28.0 - level as f32 * 0.13;
                 TRACE_LINES.with(|lines| {
                     let lines = lines.borrow();
-                    assert!((lines.first().unwrap().1 - target).abs() < 0.001);
-                    assert!((lines.last().unwrap().3 - target).abs() < 0.001);
+                    for trace in lines.chunks_exact(255) {
+                        assert_eq!(trace.first().unwrap().1, trace.last().unwrap().3);
+                    }
                 });
             }
         }
@@ -395,21 +448,22 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
 }
 
 #[test]
-fn only_the_bright_playback_trace_is_drawn_with_or_without_smoothing() {
+fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing() {
     let mut instance = Instance::new(7);
     instance.change(curve_parameter(7, 2), 100);
     let mut samples = [0.0; LAST_BUS * 64];
     let mut original = None;
     for smoothing in [0, 75, 0] {
         instance.change(SMOOTHING, smoothing);
-        for _ in 0..16 {
+        for _ in 0..40 {
             instance.render(&mut samples);
         }
         instance.draw();
         TRACE_LINES.with(|lines| {
             let lines = lines.borrow();
-            assert_eq!(lines.len(), 255);
-            assert!(lines.iter().all(|line| line.4 == 15.0));
+            assert_eq!(lines.len(), 510);
+            assert!(lines[..255].iter().all(|line| line.4 == 4.0));
+            assert!(lines[255..].iter().all(|line| line.4 == 15.0));
             assert!(lines
                 .iter()
                 .any(|line| line.1 != line.1 as i32 as f32 || line.3 != line.3 as i32 as f32));
@@ -429,6 +483,33 @@ fn only_the_bright_playback_trace_is_drawn_with_or_without_smoothing() {
 }
 
 #[test]
+fn high_pitch_changes_only_the_dim_audio_overlay() {
+    let mut instance = Instance::new(32);
+    instance.change(curve_parameter(32, 0), 100);
+    let mut samples = [0.0; LAST_BUS * 64];
+    for _ in 0..40 {
+        instance.render(&mut samples);
+    }
+    instance.draw();
+    let low = TRACE_LINES.with(|lines| lines.borrow().clone());
+    instance.change(PITCH, 105);
+    for _ in 0..40 {
+        instance.render(&mut samples);
+    }
+    instance.draw();
+    TRACE_LINES.with(|lines| {
+        let lines = lines.borrow();
+        assert_eq!(&lines[255..], &low[255..]);
+        assert_ne!(&lines[..255], &low[..255]);
+        assert!(lines[..255]
+            .iter()
+            .zip(&lines[255..])
+            .any(|(audio, source)| (audio.1 - source.1).abs() > 0.1
+                || (audio.3 - source.3).abs() > 0.1));
+    });
+}
+
+#[test]
 fn drawn_endpoint_handles_do_not_move_with_curve_or_smoothing() {
     let mut instance = Instance::new(8);
     instance.event([0.5; 3], [1, 0]);
@@ -439,7 +520,7 @@ fn drawn_endpoint_handles_do_not_move_with_curve_or_smoothing() {
             instance.change(segment_parameter(1, 2), curve);
             instance.change(SMOOTHING, smoothing);
             let mut samples = [0.0; LAST_BUS * 64];
-            for _ in 0..16 {
+            for _ in 0..40 {
                 instance.render(&mut samples);
             }
             instance.draw();
@@ -529,7 +610,12 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         assert!(!shapes.iter().any(|s| s.0 == SHAPE_RECTANGLE && s.2 == 14));
     });
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15, 15]));
-    TRACE_LINES.with(|lines| assert!(lines.borrow().iter().all(|line| line.4 == 15.0)));
+    TRACE_LINES.with(|lines| {
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 510);
+        assert!(lines[..255].iter().all(|line| line.4 == 4.0));
+        assert!(lines[255..].iter().all(|line| line.4 == 15.0));
+    });
     GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1]));
     SHAPES.with(|shapes| {
         let shapes = shapes.borrow();
@@ -600,7 +686,12 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         assert_eq!(shapes.iter().filter(|s| s.0 == SHAPE_BOX).count(), 2);
     });
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[4, 4, 4]));
-    TRACE_LINES.with(|lines| assert!(lines.borrow().iter().all(|line| line.4 == 15.0)));
+    TRACE_LINES.with(|lines| {
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 510);
+        assert!(lines[..255].iter().all(|line| line.4 == 4.0));
+        assert!(lines[255..].iter().all(|line| line.4 == 15.0));
+    });
     GRID_COLORS.with(|colors| assert_eq!(colors.borrow().len(), 8));
     instance.change(segment_parameter(2, 0), -50);
     instance.change(segment_parameter(2, 2), -50);

@@ -188,9 +188,7 @@ fn number(canvas: &mut Canvas<'_>, x: i32, prefix: &[u8], value: i16, color: i32
 
 pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     let state = context.state();
-    let Ok(memory) = <&dsp::Memory>::try_from(context.voices()) else {
-        return;
-    };
+    let memory = context.voices();
     let selected = state.ui.selected;
     // Expose the validated nonzero divisor to the optimizer so it does not
     // retain a precompiled non-PIC divide-by-zero panic helper.
@@ -238,23 +236,33 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     }
     // The float-coordinate API antialiases the display line. Retain fractional
     // heights instead of quantizing the curve before handing it to the host.
-    for i in 0..n {
-        let x0 = (i * 255 / n) as i32;
-        let x1 = ((i + 1) * 255 / n) as i32;
-        let y =
-            |t| (28.0 - state.engine.display_segment_sample(memory, i, t) * 13.0).clamp(14.0, 42.0);
-        let mut previous = y(0.0);
-        for x in x0 + 1..=x1 {
-            let current = y((x - x0) as f32 / (x1 - x0) as f32);
-            canvas.shape_f(
-                Shape::Line,
-                (x - 1) as f32,
-                previous,
-                x as f32,
-                current,
-                15.0,
-            );
-            previous = current;
+    // Complete the dim audio pass first so the bright editor trace is always
+    // in front, even when traces intersect across neighboring segments.
+    for audio in [true, false] {
+        for i in 0..n {
+            let x0 = (i * 255 / n) as i32;
+            let x1 = ((i + 1) * 255 / n) as i32;
+            let y = |t| {
+                let value = if audio {
+                    state.engine.audio_segment_sample(memory, i, t)
+                } else {
+                    state.engine.display_segment_sample(memory, i, t)
+                };
+                (28.0 - value * 13.0).clamp(14.0, 42.0)
+            };
+            let mut previous = y(0.0);
+            for x in x0 + 1..=x1 {
+                let current = y((x - x0) as f32 / (x1 - x0) as f32);
+                canvas.shape_f(
+                    Shape::Line,
+                    (x - 1) as f32,
+                    previous,
+                    x as f32,
+                    current,
+                    if audio { 4.0 } else { 15.0 },
+                );
+                previous = current;
+            }
         }
     }
     // Full-brightness boundary handles are drawn last so the antialiased
