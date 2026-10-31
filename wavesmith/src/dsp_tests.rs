@@ -32,25 +32,71 @@ fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency:
 }
 
 #[test]
-fn curve_is_monotonic_bounded_and_moves_continuously_through_linear() {
+fn curve_bows_past_segment_endpoints_and_folds_only_at_global_limits() {
     let mut wave = Wave::new(3);
-    wave.boundaries[1] = -100;
-    wave.boundaries[2] = 100;
-    for curve in -100..=100 {
+    wave.boundaries[1] = 20;
+    wave.boundaries[2] = 40;
+    wave.curves[1] = 0;
+    assert!((wave.segment_sample(1, 0.5) - 0.3).abs() < 0.000001);
+    wave.curves[1] = 10;
+    // +70% exceeds both endpoints but stays below +100%: no reflection yet.
+    assert!((wave.segment_sample(1, 0.5) - 0.7).abs() < 0.000001);
+    wave.curves[1] = 30;
+    // Unfolded +150% reflects at +100%, returning +50%, not at +40%.
+    assert!((wave.segment_sample(1, 0.5) - 0.5).abs() < 0.000001);
+    wave.boundaries[1] = -20;
+    wave.boundaries[2] = -40;
+    wave.curves[1] = -30;
+    assert!((wave.segment_sample(1, 0.5) + 0.5).abs() < 0.000001);
+    wave.boundaries[1] = 0;
+    wave.boundaries[2] = 0;
+    // Equal endpoints can now form a hump and multiple reflected lobes.
+    for (curve, midpoint) in [
+        (10, 0.4),
+        (-10, -0.4),
+        (25, 1.0),
+        (50, 0.0),
+        (75, -1.0),
+        (100, 0.0),
+    ] {
         wave.curves[1] = curve;
-        let mut previous = -1.0;
-        for i in 0..100 {
-            let value = wave.segment_sample(1, i as f32 / 100.0);
-            assert!(value >= previous - 0.00001 && value <= 1.0);
-            previous = value;
+        assert!((wave.segment_sample(1, 0.5) - midpoint).abs() < 0.000001);
+    }
+}
+
+#[test]
+fn folded_curves_preserve_endpoints_range_and_continuity() {
+    let mut wave = Wave::new(3);
+    for start in [-100, -40, 0, 45, 100] {
+        for end in [-100, -40, 0, 45, 100] {
+            wave.boundaries[1] = start;
+            wave.boundaries[2] = end;
+            let mut previous_curve = [0.0; 129];
+            for curve in -100..=100 {
+                wave.curves[1] = curve;
+                assert_eq!(wave.segment_sample(1, 0.0), wave.boundary_level(1));
+                assert_eq!(wave.segment_sample(1, 1.0), wave.boundary_level(2));
+                let mut previous_sample = wave.segment_sample(1, 0.0);
+                for (i, last) in previous_curve.iter_mut().enumerate() {
+                    let value = wave.segment_sample(1, i as f32 / 128.0);
+                    assert!((-1.000001..=1.000001).contains(&value));
+                    // The unfolded slope is at most 18; reflection preserves
+                    // continuity and cannot increase this per-step bound.
+                    assert!((value - previous_sample).abs() <= 18.0 / 128.0 + 0.00001);
+                    if curve > -100 {
+                        assert!((value - *last).abs() <= 0.04001);
+                    }
+                    if curve == 0 {
+                        let expected = wave.boundary_level(1)
+                            + (wave.boundary_level(2) - wave.boundary_level(1)) * i as f32 / 128.0;
+                        assert!((value - expected).abs() < 0.000001);
+                    }
+                    *last = value;
+                    previous_sample = value;
+                }
+            }
         }
     }
-    wave.curves[1] = 0;
-    assert_eq!(wave.segment_sample(1, 0.5), 0.0);
-    wave.curves[1] = -1;
-    assert!(wave.segment_sample(1, 0.5) > 0.0);
-    wave.curves[1] = 1;
-    assert!(wave.segment_sample(1, 0.5) < 0.0);
 }
 
 #[test]

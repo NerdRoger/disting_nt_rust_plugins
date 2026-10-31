@@ -18,7 +18,9 @@ Only the chosen count is allocated, rather than reserving the maximum.
 - Right encoder press: toggle Segment / Globals editing modes.
 - Segment mode (initial): left pot edits the selected segment's starting boundary
   level, centre pot edits its curve, right pot edits its ending boundary level.
-  Levels and curves range from −100% to +100%; curve 0 is linear.
+  Levels and curves range from −100% to +100%; curve 0 is linear. Positive Curve
+  bows upward and negative Curve bows downward. Stronger bows reflect at the
+  whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
 - Globals mode: left pot edits Randomize (0/1), centre pot edits Level (0–100%),
   right pot edits Smoothing (0–100%). Turn Randomize up to trigger a new shape,
   down to rearm it, then up for another variation. Pitch remains on the Oscillator page.
@@ -45,7 +47,10 @@ Segment 3 and the left pot on Segment 4 both edit Boundary 03. The beginning and
 end of the complete waveform share Boundary 00, editable from either endpoint.
 It defaults to zero but can be set anywhere from −100% to +100%; both ends always
 meet at that value when the waveform repeats.
-Equal start/end levels produce a flat segment regardless of curve.
+Equal start/end levels produce a flat segment only at Curve 0; nonzero Curve can
+create humps and folded lobes between equal endpoints. The curve is quadratic
+Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curve
+±100. Both endpoints remain exact. Folding is continuous reflection, not clipping.
 
 The footer is always visible at y=50–63, matching Window Comparator's reserved
 area. The custom display contains global values, the graph and help footer. The draw
@@ -90,6 +95,13 @@ dedicated segment modulation routing is deferred. Ordinary parameter values are
 stored by the NT host with the preset; editor selection is temporary.
 
 ## Rendering
+
+Segment evaluation first bows and folds the source shape. Creative Smoothing
+and its boundary anchoring follow folding; audio anti-alias filtering follows
+Smoothing. The bright trace shows the folded source with Smoothing, and the dim
+trace shows its filtered audio version. The existing Curve parameter names,
+indices and ranges are unchanged, but nonzero values now describe this bow/fold
+model rather than the earlier rational easing; old shapes are not converted.
 
 Every waveform edit builds the specified number of 256-sample audio tables.
 At the default six, harmonic limits remain 127, 32, 8, 4, 2, and 1. For counts

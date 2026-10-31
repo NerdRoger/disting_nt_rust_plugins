@@ -116,14 +116,6 @@ impl Wave {
     /// boundaries share the editable seam value stored at boundary zero.
     pub fn segment_sample(&self, index: usize, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
-        // Rational easing is continuous in curve, monotonic, bounded, and
-        // exactly linear at zero. +/-100 bends by a factor of sixteen.
-        let bend = self.curves[index.min(MAX_SEGMENTS - 1)].clamp(-100, 100) as f32 * 0.01;
-        let weight = if bend >= 0.0 {
-            t / (1.0 + 15.0 * bend * (1.0 - t))
-        } else {
-            1.0 - (1.0 - t) / (1.0 - 15.0 * bend * t)
-        };
         let start = self.boundary_level(index);
         let end = self.boundary_level(index + 1);
         // Return the stored anchors exactly, avoiding interpolation roundoff
@@ -134,8 +126,26 @@ impl Wave {
         if t == 1.0 {
             return end;
         }
-        start + (end - start) * weight
+        // Quadratic Bezier: the control point moves above/below the midpoint.
+        // The bow is zero at both boundaries and reaches +/-4 at the midpoint
+        // at Curve +/-100. Fold only at the whole waveform's +/-1 rails.
+        let bend = self.curves[index.min(MAX_SEGMENTS - 1)].clamp(-100, 100) as f32 * 0.01;
+        let value = start + (end - start) * t + 16.0 * bend * t * (1.0 - t);
+        fold(value)
     }
+}
+
+// The anchored curve can reach at most +/-5. Two reflections are sufficient;
+// no remainder, clipping, allocation, or unbounded loop is needed.
+fn fold(mut value: f32) -> f32 {
+    for _ in 0..2 {
+        if value > 1.0 {
+            value = 2.0 - value;
+        } else if value < -1.0 {
+            value = -2.0 - value;
+        }
+    }
+    value
 }
 
 // Add a harmonic without allocating another table or doing a second FFT.
