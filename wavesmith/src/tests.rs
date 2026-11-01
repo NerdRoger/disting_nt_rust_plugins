@@ -111,6 +111,10 @@ impl Instance {
     fn event(&mut self, pots: [f32; 3], encoders: [i8; 2]) {
         self.event_buttons(pots, encoders, 0, 0);
     }
+    fn click_right(&mut self, pots: [f32; 3]) {
+        self.event_buttons(pots, [0, 0], ENCODER_BUTTON_R, 0);
+        self.event_buttons(pots, [0, 0], 0, ENCODER_BUTTON_R);
+    }
     fn event_buttons(
         &mut self,
         pots: [f32; 3],
@@ -790,8 +794,8 @@ fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
         SHAPES.with(|shapes| {
             let shapes = shapes.borrow();
             assert!(shapes.contains(&(SHAPE_RECTANGLE, left, 14, right, 42)));
-            assert!(shapes.contains(&(SHAPE_RECTANGLE, 94, 14, 95, 42)));
-            assert!(shapes.contains(&(SHAPE_RECTANGLE, 93, 14, 96, 42)));
+            assert!(!shapes.contains(&(SHAPE_RECTANGLE, 94, 14, 95, 42)));
+            assert!(!shapes.contains(&(SHAPE_RECTANGLE, 93, 14, 96, 42)));
             for i in 1..8 {
                 let x = (wave.boundary_position(i) * 255.0) as i32;
                 for y in (14..=42).step_by(3) {
@@ -811,6 +815,220 @@ fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
                     .any(|line| line.2 == x && (line.3 - y).abs() < 0.01));
             }
         });
+        instance.click_right([0.5; 3]);
+        instance.draw();
+        SHAPES.with(|shapes| {
+            let shapes = shapes.borrow();
+            assert!(shapes.contains(&(SHAPE_RECTANGLE, 94, 14, 95, 42)));
+            assert!(shapes.contains(&(SHAPE_RECTANGLE, 93, 14, 96, 42)));
+            assert!(!shapes.iter().any(|shape| shape.0 == SHAPE_BOX));
+        });
+        instance.click_right([0.5; 3]);
+        instance.draw();
+        SHAPES.with(|shapes| {
+            assert!(!shapes
+                .borrow()
+                .iter()
+                .any(|shape| shape.0 == SHAPE_RECTANGLE && shape.2 == 14));
+        });
+        instance.click_right([0.5; 3]);
+    }
+}
+
+#[test]
+fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment() {
+    let mut instance = Instance::new(8);
+    instance.event([0.8; 3], [2, 0]);
+    instance.change(PITCH, 57);
+    instance.change(FINE, -25);
+    instance.change(LEVEL, 35);
+    instance.change(centroid_parameter(8), 94);
+    instance.change(strength_parameter(8), -68);
+    instance.change(SMOOTHING, 43);
+    let before = instance.values.clone();
+    instance.click_right([0.8; 3]);
+    instance.click_right([0.8; 3]);
+    assert_eq!(instance.values, before);
+    instance.draw();
+    TEXT.with(|text| {
+        let text = text.borrow();
+        for expected in ["Pitch A3", "Fine -25", "Level 35"] {
+            assert!(text
+                .iter()
+                .any(|(_, y, value)| *y == 10 && value == expected));
+        }
+        for expected in ["L: Pitch", "C: Fine", "R: Level", "R click: Segment"] {
+            assert!(text
+                .iter()
+                .any(|(_, y, value)| *y >= 57 && value == expected));
+        }
+    });
+    HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15; 3]));
+    SHAPES.with(|shapes| {
+        let shapes = shapes.borrow();
+        assert!(shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 12)));
+        assert!(!shapes.iter().any(|shape| shape.0 == SHAPE_BOX));
+        assert!(!shapes
+            .iter()
+            .any(|shape| shape.0 == SHAPE_RECTANGLE && shape.2 == 14));
+    });
+    for step in 1..=40 {
+        instance.event([0.8 + step as f32 * 0.005; 3], [0, 0]);
+    }
+    assert_eq!(
+        (
+            instance.values[PITCH],
+            instance.values[FINE],
+            instance.values[LEVEL]
+        ),
+        (127, 100, 100)
+    );
+    for step in (0..200).rev() {
+        instance.event([step as f32 * 0.005; 3], [0, 0]);
+    }
+    assert_eq!(
+        (
+            instance.values[PITCH],
+            instance.values[FINE],
+            instance.values[LEVEL]
+        ),
+        (0, -100, 0)
+    );
+    for step in 1..=100 {
+        instance.event([step as f32 * 0.0002; 3], [0, 0]);
+    }
+    assert!(
+        instance.values[PITCH] > 0 && instance.values[FINE] > -100 && instance.values[LEVEL] > 0
+    );
+    for parameter in 0..before.len() {
+        if ![PITCH, FINE, LEVEL].contains(&parameter) {
+            assert_eq!(instance.values[parameter], before[parameter]);
+        }
+    }
+    let before_switch = instance.values.clone();
+    instance.click_right([0.5; 3]);
+    assert_eq!(instance.values, before_switch);
+    instance.draw();
+    HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15; 3]));
+    TEXT.with(|text| {
+        assert!(text
+            .borrow()
+            .iter()
+            .any(|(_, _, value)| value == "R click: Warp"))
+    });
+    SHAPES.with(|shapes| {
+        assert_eq!(
+            shapes
+                .borrow()
+                .iter()
+                .filter(|shape| shape.0 == SHAPE_BOX)
+                .count(),
+            2
+        )
+    });
+}
+
+#[test]
+fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
+    for n in 2..=32 {
+        let mut instance = Instance::new(n);
+        let n = n as usize;
+        for segment in 0..n {
+            instance.change(curve_parameter(n, segment), segment as i16 * 3 - 50);
+        }
+        instance.event([0.5; 3], [0, 0]);
+        let before = instance.values.clone();
+        let mut selected = 0i32;
+        for delta in [-1i8, 1, 127, -128, 1, -1] {
+            selected = (selected + delta as i32).rem_euclid(n as i32);
+            instance.event([0.508; 3], [delta, 0]);
+            assert_eq!(instance.values, before);
+            instance.draw();
+            let expected = std::format!("Curve {}", before[curve_parameter(n, selected as usize)]);
+            TEXT.with(|text| {
+                assert!(text
+                    .borrow()
+                    .iter()
+                    .any(|(_, y, value)| *y == 10 && value == &expected))
+            });
+        }
+        instance.event([0.508, 0.517, 0.508], [0, 0]);
+        let edited = curve_parameter(n, selected as usize);
+        assert!(instance.values[edited] > before[edited]);
+        for p in 0..before.len() {
+            if p != edited {
+                assert_eq!(instance.values[p], before[p]);
+            }
+        }
+    }
+}
+
+#[test]
+fn segment_header_shows_selected_left_curve_and_right_values_with_background() {
+    for n in [2, 7, 32] {
+        let mut instance = Instance::new(n);
+        let n = n as usize;
+        let mut previous = 0;
+        for selected in [0, n / 2, n - 1] {
+            instance.event([0.5; 3], [(selected - previous) as i8, 0]);
+            previous = selected;
+            instance.change(editor_parameter(n, selected, 0).unwrap(), -100);
+            instance.change(curve_parameter(n, selected), -37);
+            instance.change(editor_parameter(n, selected, 1).unwrap(), 100);
+            instance.draw();
+            TEXT.with(|text| {
+                for (x, expected) in [(2, "Left -100"), (102, "Curve -37"), (190, "Right 100")] {
+                    assert!(text
+                        .borrow()
+                        .iter()
+                        .any(|(tx, y, value)| *tx == x && *y == 10 && value == expected));
+                }
+            });
+            SHAPES.with(|shapes| {
+                assert!(shapes.borrow().contains(&(SHAPE_RECTANGLE, 0, 0, 255, 12)))
+            });
+            HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15; 3]));
+        }
+    }
+}
+
+#[test]
+fn tuning_pitch_header_uses_nt_note_names_and_octaves() {
+    let mut instance = Instance::new(8);
+    instance.event([0.5; 3], [0, 0]);
+    instance.click_right([0.5; 3]);
+    instance.click_right([0.5; 3]);
+    for (note, expected) in [
+        (0, "Pitch C-1"),
+        (1, "Pitch C#-1"),
+        (11, "Pitch B-1"),
+        (12, "Pitch C0"),
+        (36, "Pitch C2"),
+        (37, "Pitch C#2"),
+        (38, "Pitch D2"),
+        (39, "Pitch D#2"),
+        (40, "Pitch E2"),
+        (41, "Pitch F2"),
+        (42, "Pitch F#2"),
+        (43, "Pitch G2"),
+        (44, "Pitch G#2"),
+        (45, "Pitch A2"),
+        (46, "Pitch A#2"),
+        (47, "Pitch B2"),
+        (48, "Pitch C3"),
+        (57, "Pitch A3"),
+        (69, "Pitch A4"),
+        (127, "Pitch G9"),
+    ] {
+        instance.change(PITCH, note);
+        instance.draw();
+        TEXT.with(|text| {
+            assert!(text
+                .borrow()
+                .iter()
+                .any(|(x, y, value)| *x == 2 && *y == 10 && value == expected))
+        });
+        assert_eq!(instance.values[PITCH], note);
     }
 }
 
@@ -863,12 +1081,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         );
     });
     TEXT.with(|text| {
-        for expected in [
-            "L: Warp Pos",
-            "C: Warp Amt",
-            "R: Smooth",
-            "R click: Segment",
-        ] {
+        for expected in ["L: Warp Pos", "C: Warp Amt", "R: Smooth", "R click: Pitch"] {
             assert!(text
                 .borrow()
                 .iter()
@@ -914,26 +1127,24 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     });
     // Changing modes alongside pot movement re-primes pickup without edits.
     instance.change(strength_parameter(8), 0);
+    // Visit Tuning, then click again to return to Segment mode.
+    instance.event_buttons([0.5; 3], [0, 0], ENCODER_BUTTON_R, 0);
+    instance.event_buttons([0.5; 3], [0, 0], 0, ENCODER_BUTTON_R);
     let before_switch = instance.values.clone();
     instance.event_buttons([0.5; 3], [0, 0], ENCODER_BUTTON_R, 0);
     assert_eq!(instance.values, before_switch);
     instance.event_buttons([0.5; 3], [0, 0], 0, ENCODER_BUTTON_R);
     instance.draw();
-    TEXT.with(|text| {
-        assert!(text
-            .borrow()
-            .iter()
-            .any(|(_, _, s)| s == "R click: Globals"))
-    });
+    TEXT.with(|text| assert!(text.borrow().iter().any(|(_, _, s)| s == "R click: Warp")));
     SHAPES.with(|shapes| {
         let shapes = shapes.borrow();
         assert!(!shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 7)));
-        assert!(!shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 12)));
+        assert!(shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 12)));
         // Segment 3 remains selected after returning from Globals mode.
         assert!(shapes.contains(&(SHAPE_RECTANGLE, 63, 14, 95, 42)));
         assert_eq!(shapes.iter().filter(|s| s.0 == SHAPE_BOX).count(), 2);
     });
-    HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[4, 4, 4]));
+    HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15, 15]));
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
         assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
@@ -982,20 +1193,18 @@ fn editor_selection_relative_pots_and_permanent_footer() {
             "C: Curve",
             "R: End",
             "Enc L: Segment",
-            "R click: Globals",
+            "R click: Warp",
         ] {
             assert!(text.iter().any(|(_, y, s)| *y >= 57 && s == expected));
         }
         assert_eq!(text.len(), 8);
-        for expected in ["Warp Pos 128", "Warp Amt 0", "Smooth 0"] {
-            assert!(text.iter().any(|(_, y, s)| *y == 10 && s == expected));
+        for (x, prefix, field) in [(2, "Left", 0), (102, "Curve", 2), (190, "Right", 1)] {
+            let value = instance.values[editor_parameter(32, 31, field).unwrap()];
+            let expected = std::format!("{prefix} {value}");
+            assert!(text
+                .iter()
+                .any(|(tx, y, s)| *tx == x && *y == 10 && s == &expected));
         }
-        assert!(text
-            .iter()
-            .any(|(x, y, s)| *x == 102 && *y == 10 && s == "Warp Amt 0"));
-        assert!(text
-            .iter()
-            .any(|(x, y, s)| *x == 198 && *y == 10 && s == "Smooth 0"));
     });
     SHAPES.with(|shapes| {
         let shapes = shapes.borrow();

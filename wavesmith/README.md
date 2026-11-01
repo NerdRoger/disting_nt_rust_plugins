@@ -14,24 +14,33 @@ Only the chosen count is allocated, rather than reserving the maximum.
 
 ## Controls
 
-- Left encoder: select segment.
-- Right encoder press: toggle Segment / Globals editing modes.
+- Left encoder: select segment. In Segment mode, selection wraps from the last
+  segment to the first and from the first to the last, including larger turns.
+- Right encoder press: cycle Segment → Warp → Tuning → Segment.
 - Segment mode (initial): left pot edits the selected segment's starting boundary
   level, centre pot edits its curve, right pot edits its ending boundary level.
   Levels and curves range from −100% to +100%; curve 0 is linear. Positive Curve
   bows upward and negative Curve bows downward. Stronger bows reflect at the
   whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
-- Globals mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
+- Warp mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
   (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
   and Pitch remain available on the Oscillator parameter page.
-- Right encoder rotation is unused. Left encoder selects the segment in either mode.
+- Tuning mode: left pot edits Pitch (MIDI note 0–127), centre pot edits Fine tune
+  (−100 to +100 cents), right pot edits Level (0–100%). The top row displays
+  these three values instead of the warp controls. Pitch is displayed as a note
+  name and octave matching the NT (36 = C2, 37 = C#2), while its stored value
+  remains a MIDI note number.
+- Right encoder rotation is unused. Left encoder selects the segment in all modes.
 
-The top row labels are Warp Pos, Warp Amt and Smooth in regular-sized text. The
+The top row follows the current pot assignments: Left / Curve / Right in Segment
+mode, Warp Pos / Warp Amt / Smooth in Warp mode, and Pitch / Fine / Level in
+Tuning mode. Segment values read the selected segment's shared boundary parameters
+and curve parameter, including the shared seam. All labels use regular-sized text. The
 graph occupies y=14–42 with its zero axis at y=28, leaving the help footer fixed.
-Globals
-mode draws this header at full brightness (15) over a dim background (2), and hides the segment selection
-and boundary handles. The waveform stays at full brightness in both modes to
-preserve its antialiasing range. Segment mode dims the header (4) and restores the selected
+All three modes draw their header at full brightness (15) over a dim background
+bar (2). Warp and Tuning modes hide the segment selection and boundary handles.
+The waveform stays at full brightness in all modes to preserve its antialiasing
+range. Segment mode restores the selected
 segment's shading and handles. The help
 footer shows the current pot assignments and the mode a right-encoder click will
 select. Switching modes preserves the selected segment and parameter values;
@@ -53,7 +62,7 @@ remain fixed and boundaries retain their order, level, and curve identity. A
 monotone rational map limits the effective attraction/repulsion to 95% internally
 at full control travel, preventing zero-width segments. Warp Position can sit at either
 edge. A four-pixel black strip with a centered two-pixel full-brightness core
-marks it in both editing modes, drawn over the waveform and clamped on screen
+marks it only in Warp mode, drawn over the waveform and clamped on screen
 at either edge. Grid dividers,
 selection shading and endpoint handles follow the redistributed boundaries.
 Zero Warp Amount retains the original equal-width geometry.
@@ -86,7 +95,7 @@ behind it for development, showing pitch-dependent harmonic filtering and the
 audio edit crossfade, before output Level scaling. The bright trace is always
 drawn last so it stays in front wherever the traces meet. The display uses the NT's
 native antialiased float-coordinate drawing API; this does not filter the audio.
-Both modes show the vertical segment dividers as one-pixel dots spaced three
+All three modes show the vertical segment dividers as one-pixel dots spaced three
 pixels apart, at brightness 1 (the lowest nonzero level). The horizontal zero
 axis stays solid at brightness 1, and the thicker warp position marker stays solid.
 This keeps warp position/strength changes visible with less prominent dividers.

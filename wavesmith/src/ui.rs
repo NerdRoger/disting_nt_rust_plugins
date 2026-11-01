@@ -3,10 +3,27 @@
 use super::*;
 use distingnt_api::api::drawing::{Alignment, Shape, TextSize};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditMode {
+    Segment,
+    Warp,
+    Tuning,
+}
+
+impl EditMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Segment => Self::Warp,
+            Self::Warp => Self::Tuning,
+            Self::Tuning => Self::Segment,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct UiState {
     pub selected: usize,
-    pub globals: bool,
+    pub mode: EditMode,
     previous: [f32; 3],
     residual: [f32; 3],
     last_written: [i16; 3],
@@ -17,7 +34,7 @@ impl UiState {
     pub const fn new() -> Self {
         Self {
             selected: 0,
-            globals: false,
+            mode: EditMode::Segment,
             previous: [0.5; 3],
             residual: [0.0; 3],
             last_written: [0; 3],
@@ -63,11 +80,15 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
     let changed_selection = data.encoders[0] != 0;
     {
         let state = context.state_mut();
-        state.ui.selected = (state.ui.selected as i32 + data.encoders[0] as i32)
-            .max(0)
-            .min(state.count as i32 - 1) as usize;
+        let count = state.count.clamp(2, dsp::MAX_SEGMENTS) as i32;
+        let selection = state.ui.selected as i32 + data.encoders[0] as i32;
+        state.ui.selected = if state.ui.mode == EditMode::Segment {
+            selection.rem_euclid(count) as usize
+        } else {
+            selection.max(0).min(count - 1) as usize
+        };
         if changed_mode {
-            state.ui.globals = !state.ui.globals;
+            state.ui.mode = state.ui.mode.next();
         }
         if changed_selection || changed_mode {
             state.ui.residual = [0.0; 3];
@@ -82,9 +103,9 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
     .enumerate()
     {
         let selected = context.state().ui.selected;
-        let globals = context.state().ui.globals;
-        let (parameter, min, max) = if globals {
-            match pot {
+        let mode = context.state().ui.mode;
+        let (parameter, min, max) = match mode {
+            EditMode::Warp => match pot {
                 0 => (
                     Some(centroid_parameter(context.state().count)),
                     0,
@@ -92,13 +113,17 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 ),
                 1 => (Some(strength_parameter(context.state().count)), -100, 100),
                 _ => (Some(SMOOTHING), 0, 100),
-            }
-        } else {
-            (
+            },
+            EditMode::Tuning => match pot {
+                0 => (Some(PITCH), 0, 127),
+                1 => (Some(FINE), -100, 100),
+                _ => (Some(LEVEL), 0, 100),
+            },
+            EditMode::Segment => (
                 editor_parameter(context.state().count, selected, field),
                 -100,
                 100,
-            )
+            ),
         };
         let locked = parameter.is_none();
         let value = parameter
@@ -190,6 +215,26 @@ fn number(canvas: &mut Canvas<'_>, x: i32, prefix: &[u8], value: i16, color: i32
     );
 }
 
+fn pitch_note(canvas: &mut Canvas<'_>, x: i32, value: i16, color: i32) {
+    // Match the NT's MIDI octave convention: 36 = C2, 37 = C#2.
+    let note = value.clamp(0, 127) as usize;
+    let names: [&[u8]; 12] = [
+        b"Pitch C",
+        b"Pitch C#",
+        b"Pitch D",
+        b"Pitch D#",
+        b"Pitch E",
+        b"Pitch F",
+        b"Pitch F#",
+        b"Pitch G",
+        b"Pitch G#",
+        b"Pitch A",
+        b"Pitch A#",
+        b"Pitch B",
+    ];
+    number(canvas, x, names[note % 12], (note / 12) as i16 - 1, color);
+}
+
 pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     let state = context.state();
     let memory = context.voices();
@@ -200,36 +245,51 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     let parameters = context.read_parameters();
     let source = read_wave(n, |index| parameters.value(index));
     canvas.shape(Shape::Rectangle, 0, 0, 255, 63, 0);
-    if state.ui.globals {
-        canvas.shape(Shape::Rectangle, 0, 0, 255, 12, 2);
+    canvas.shape(Shape::Rectangle, 0, 0, 255, 12, 2);
+    let header_color = 15;
+    let header: [(i32, &[u8], usize, i16); 3] = match state.ui.mode {
+        EditMode::Segment => [
+            (
+                2,
+                b"Left ",
+                editor_parameter(n, selected, 0).unwrap_or(seam_parameter(n)),
+                0,
+            ),
+            (102, b"Curve ", curve_parameter(n, selected), 0),
+            (
+                190,
+                b"Right ",
+                editor_parameter(n, selected, 1).unwrap_or(seam_parameter(n)),
+                0,
+            ),
+        ],
+        EditMode::Tuning => [
+            (2, b"Pitch ", PITCH, 57),
+            (102, b"Fine ", FINE, 0),
+            (198, b"Level ", LEVEL, 50),
+        ],
+        EditMode::Warp => [
+            (
+                2,
+                b"Warp Pos ",
+                centroid_parameter(n),
+                dsp::CENTROID_DEFAULT,
+            ),
+            (102, b"Warp Amt ", strength_parameter(n), 0),
+            (198, b"Smooth ", SMOOTHING, 0),
+        ],
+    };
+    for (x, prefix, parameter, default) in header {
+        let value = parameters.value(parameter).unwrap_or(default);
+        if parameter == PITCH {
+            pitch_note(&mut canvas, x, value, header_color);
+        } else {
+            number(&mut canvas, x, prefix, value, header_color);
+        }
     }
-    let header_color = if state.ui.globals { 15 } else { 4 };
-    number(
-        &mut canvas,
-        2,
-        b"Warp Pos ",
-        parameters
-            .value(centroid_parameter(n))
-            .unwrap_or(dsp::CENTROID_DEFAULT),
-        header_color,
-    );
-    number(
-        &mut canvas,
-        102,
-        b"Warp Amt ",
-        parameters.value(strength_parameter(n)).unwrap_or(0),
-        header_color,
-    );
-    number(
-        &mut canvas,
-        198,
-        b"Smooth ",
-        parameters.value(SMOOTHING).unwrap_or(0),
-        header_color,
-    );
     let left = (source.boundary_position(selected) * 255.0) as i32;
     let right = (source.boundary_position(selected + 1) * 255.0) as i32;
-    if !state.ui.globals {
+    if state.ui.mode == EditMode::Segment {
         canvas.shape(Shape::Rectangle, left, 14, right, 42, 1);
     }
     // Keep the dim grid visible while adjusting centroid/strength in either mode.
@@ -291,24 +351,26 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
             );
         }
     }
-    // Draw over the traces so the full-brightness core and black margins
-    // remain visible. Keep the complete four-pixel marker on screen at either edge.
-    let center = source.centroid.clamp(0, dsp::CENTROID_MAX) as i32;
-    let marker_left = (center - 1).clamp(0, 252);
-    canvas.shape(Shape::Rectangle, marker_left, 14, marker_left + 3, 42, 0);
-    canvas.shape(
-        Shape::Rectangle,
-        marker_left + 1,
-        14,
-        marker_left + 2,
-        42,
-        15,
-    );
+    if state.ui.mode == EditMode::Warp {
+        // Draw over the traces so the full-brightness core and black margins
+        // remain visible. Keep the complete four-pixel marker on screen at either edge.
+        let center = source.centroid.clamp(0, dsp::CENTROID_MAX) as i32;
+        let marker_left = (center - 1).clamp(0, 252);
+        canvas.shape(Shape::Rectangle, marker_left, 14, marker_left + 3, 42, 0);
+        canvas.shape(
+            Shape::Rectangle,
+            marker_left + 1,
+            14,
+            marker_left + 2,
+            42,
+            15,
+        );
+    }
     // Full-brightness boundary handles are drawn last so the antialiased
     // playback line cannot dim their outlines. Their anchor values stay fixed.
     for (x, t) in [(left, 0.0), (right, 1.0)]
         .into_iter()
-        .filter(|_| !state.ui.globals)
+        .filter(|_| state.ui.mode == EditMode::Segment)
     {
         let y = (28.0 - source.segment_sample(selected, t) * 13.0) as i32;
         canvas.shape(
@@ -323,24 +385,23 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     // Match the comparator's permanent footer reservation and separator.
     canvas.shape(Shape::Rectangle, 0, 50, 255, 63, 0);
     canvas.shape(Shape::Line, 0, 50, 255, 50, 15);
-    if state.ui.globals {
-        text(&mut canvas, 2, 57, c"L: Warp Pos");
-        text(&mut canvas, 91, 57, c"C: Warp Amt");
-        text(&mut canvas, 193, 57, c"R: Smooth");
-    } else {
-        text(&mut canvas, 2, 57, c"L: Start");
-        text(&mut canvas, 91, 57, c"C: Curve");
-        text(&mut canvas, 193, 57, c"R: End");
+    let help = match state.ui.mode {
+        EditMode::Segment => [c"L: Start", c"C: Curve", c"R: End"],
+        EditMode::Warp => [c"L: Warp Pos", c"C: Warp Amt", c"R: Smooth"],
+        EditMode::Tuning => [c"L: Pitch", c"C: Fine", c"R: Level"],
+    };
+    for (x, label) in [2, 91, 193].into_iter().zip(help) {
+        text(&mut canvas, x, 57, label);
     }
     text(&mut canvas, 2, 64, c"Enc L: Segment");
     text(
         &mut canvas,
         139,
         64,
-        if state.ui.globals {
-            c"R click: Segment"
-        } else {
-            c"R click: Globals"
+        match state.ui.mode {
+            EditMode::Segment => c"R click: Warp",
+            EditMode::Warp => c"R click: Pitch",
+            EditMode::Tuning => c"R click: Segment",
         },
     );
 }
