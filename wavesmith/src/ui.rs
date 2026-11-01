@@ -85,8 +85,12 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
         let globals = context.state().ui.globals;
         let (parameter, min, max) = if globals {
             match pot {
-                0 => (Some(randomize_parameter(context.state().count)), 0, 1),
-                1 => (Some(LEVEL), 0, 100),
+                0 => (
+                    Some(centroid_parameter(context.state().count)),
+                    0,
+                    dsp::CENTROID_MAX,
+                ),
+                1 => (Some(strength_parameter(context.state().count)), -100, 100),
                 _ => (Some(SMOOTHING), 0, 100),
             }
         } else {
@@ -203,15 +207,17 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     number(
         &mut canvas,
         2,
-        b"Randomize ",
-        parameters.value(randomize_parameter(n)).unwrap_or(0),
+        b"Warp Pos ",
+        parameters
+            .value(centroid_parameter(n))
+            .unwrap_or(dsp::CENTROID_DEFAULT),
         header_color,
     );
     number(
         &mut canvas,
-        106,
-        b"Level ",
-        parameters.value(LEVEL).unwrap_or(50),
+        102,
+        b"Warp Amt ",
+        parameters.value(strength_parameter(n)).unwrap_or(0),
         header_color,
     );
     number(
@@ -221,17 +227,17 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
         parameters.value(SMOOTHING).unwrap_or(0),
         header_color,
     );
-    let left = (selected * 255 / n) as i32;
-    let right = ((selected + 1) * 255 / n) as i32;
+    let left = (source.boundary_position(selected) * 255.0) as i32;
+    let right = (source.boundary_position(selected + 1) * 255.0) as i32;
     if !state.ui.globals {
         canvas.shape(Shape::Rectangle, left, 14, right, 42, 1);
     }
-    // Keep the zero axis visible in both modes; segment dividers only in edit mode.
+    // Keep the dim grid visible while adjusting centroid/strength in either mode.
     canvas.shape(Shape::Line, 0, 28, 255, 28, 1);
-    if !state.ui.globals {
-        for i in 1..n {
-            let x = (i * 255 / n) as i32;
-            canvas.shape(Shape::Line, x, 14, x, 42, 1);
+    for i in 1..n {
+        let x = (source.boundary_position(i) * 255.0) as i32;
+        for y in (14..=42).step_by(3) {
+            canvas.shape(Shape::Point, x, y, x, y, 1);
         }
     }
     // The float-coordinate API antialiases the display line. Retain fractional
@@ -239,32 +245,65 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     // Complete the dim audio pass first so the bright editor trace is always
     // in front, even when traces intersect across neighboring segments.
     for audio in [true, false] {
-        for i in 0..n {
-            let x0 = (i * 255 / n) as i32;
-            let x1 = ((i + 1) * 255 / n) as i32;
-            let y = |t| {
-                let value = if audio {
-                    state.engine.audio_segment_sample(memory, i, t)
+        let y = |phase: f32| {
+            let value = if audio {
+                let phase = if phase >= 1.0 {
+                    0
                 } else {
-                    state.engine.display_segment_sample(memory, i, t)
+                    (phase * 4_294_967_296.0) as u32
                 };
-                (28.0 - value * 13.0).clamp(14.0, 42.0)
+                state.engine.display_sample(memory, phase)
+            } else {
+                state.engine.editor_phase_sample(memory, phase)
             };
-            let mut previous = y(0.0);
-            for x in x0 + 1..=x1 {
-                let current = y((x - x0) as f32 / (x1 - x0) as f32);
+            (28.0 - value * 13.0).clamp(14.0, 42.0)
+        };
+        for segment in 0..n {
+            let start = source.boundary_position(segment);
+            let end = source.boundary_position(segment + 1);
+            let mut previous_x = start * 255.0;
+            let end_x = end * 255.0;
+            let mut previous_y = y(start);
+            let mut pixel = previous_x as usize + 1;
+            while (pixel as f32) < end_x {
+                let current = y(pixel as f32 / 255.0);
                 canvas.shape_f(
                     Shape::Line,
-                    (x - 1) as f32,
-                    previous,
-                    x as f32,
+                    previous_x,
+                    previous_y,
+                    pixel as f32,
                     current,
                     if audio { 4.0 } else { 15.0 },
                 );
-                previous = current;
+                previous_x = pixel as f32;
+                previous_y = current;
+                pixel += 1;
             }
+            // Keep a vertex at each exact boundary, even for segments narrower
+            // than one display pixel. Both passes use identical phase geometry.
+            canvas.shape_f(
+                Shape::Line,
+                previous_x,
+                previous_y,
+                end_x,
+                y(end),
+                if audio { 4.0 } else { 15.0 },
+            );
         }
     }
+    // Draw over the traces so the full-brightness core and black margins
+    // remain visible. Keep the complete four-pixel marker on screen at either edge.
+    let center = source.centroid.clamp(0, dsp::CENTROID_MAX) as i32;
+    let marker_left = (center - 1).clamp(0, 252);
+    canvas.shape(Shape::Rectangle, marker_left, 14, marker_left + 3, 42, 0);
+    canvas.shape(
+        Shape::Rectangle,
+        marker_left + 1,
+        14,
+        marker_left + 2,
+        42,
+        15,
+    );
     // Full-brightness boundary handles are drawn last so the antialiased
     // playback line cannot dim their outlines. Their anchor values stay fixed.
     for (x, t) in [(left, 0.0), (right, 1.0)]
@@ -285,8 +324,8 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     canvas.shape(Shape::Rectangle, 0, 50, 255, 63, 0);
     canvas.shape(Shape::Line, 0, 50, 255, 50, 15);
     if state.ui.globals {
-        text(&mut canvas, 2, 57, c"L: Randomize");
-        text(&mut canvas, 91, 57, c"C: Level");
+        text(&mut canvas, 2, 57, c"L: Warp Pos");
+        text(&mut canvas, 91, 57, c"C: Warp Amt");
         text(&mut canvas, 193, 57, c"R: Smooth");
     } else {
         text(&mut canvas, 2, 57, c"L: Start");

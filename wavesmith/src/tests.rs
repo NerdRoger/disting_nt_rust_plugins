@@ -56,7 +56,7 @@ impl Instance {
                 itc: 0,
             };
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
-            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 1);
+            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 3);
             assert!(
                 req.sram
                     < (dsp::blocks(tables as usize) * core::mem::size_of::<dsp::Block>() + 8000)
@@ -219,6 +219,21 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
             assert_eq!(references[seam_parameter(n as usize)], 2);
             assert_eq!(references[randomize_parameter(n as usize)], 1);
+            for (index, name, minimum, maximum, default) in [
+                (
+                    centroid_parameter(n as usize),
+                    c"Warp Position",
+                    0,
+                    255,
+                    128,
+                ),
+                (strength_parameter(n as usize), c"Warp Amount", -100, 100, 0),
+            ] {
+                assert_eq!(references[index], 1);
+                let d = *(*instance.base).parameters.add(index);
+                assert_eq!(CStr::from_ptr(d.name), name);
+                assert_eq!((d.min, d.max, d.default), (minimum, maximum, default));
+            }
         }
     }
     for n in [0, 1, 33, -1] {
@@ -244,7 +259,7 @@ fn table_specification_controls_real_allocations_for_every_supported_count() {
             instance.change(PITCH, 105);
             for smoothing in [0, 100] {
                 instance.change(SMOOTHING, smoothing);
-                // At 20 tables and 32 segments the split rebuild takes 60
+                // At 20 tables and 32 segments the split rebuild takes 64
                 // callbacks, plus the five-millisecond publication fade.
                 for _ in 0..80 {
                     instance.render(&mut samples);
@@ -279,9 +294,13 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
         let n = n as usize;
         let trigger = randomize_parameter(n);
         instance.change(SMOOTHING, 43);
+        instance.change(centroid_parameter(n), 37);
+        instance.change(strength_parameter(n), -68);
         let before = instance.values.clone();
         instance.change(trigger, 1);
         let first = instance.values.clone();
+        assert_eq!(first[centroid_parameter(n)], 37);
+        assert_eq!(first[strength_parameter(n)], -68);
         assert_ne!(
             &first[GLOBALS..seam_parameter(n)],
             &before[GLOBALS..seam_parameter(n)]
@@ -310,7 +329,7 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
             );
         }
         let mut samples = [0.0; LAST_BUS * 64];
-        for _ in 0..32 {
+        for _ in 0..48 {
             instance.render(&mut samples);
         }
         assert!(samples.iter().all(|v| v.is_finite()));
@@ -338,13 +357,13 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
             for smoothing in [0, 100] {
                 instance.change(SMOOTHING, smoothing);
                 let mut samples = [0.0; LAST_BUS * 64];
-                for _ in 0..32 {
+                for _ in 0..64 {
                     instance.render(&mut samples);
                 }
                 instance.draw();
                 TRACE_LINES.with(|lines| {
                     let lines = lines.borrow();
-                    for trace in lines.chunks_exact(255) {
+                    for trace in lines.chunks_exact(lines.len() / 2) {
                         assert_eq!(trace.first().unwrap().1, trace.last().unwrap().3);
                     }
                 });
@@ -417,7 +436,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
     instance.change(OUTPUT, 64);
     instance.change(OUTPUT_MODE, 1);
     let mut samples = [0.0; LAST_BUS * 64];
-    for _ in 0..40 {
+    for _ in 0..64 {
         instance.render(&mut samples);
     }
     assert!(samples[..63 * 64].iter().all(|&v| v == 0.0));
@@ -430,7 +449,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
     assert_eq!(segment_parameter(2, 1), segment_parameter(3, 0));
     instance.change(segment_parameter(3, 2), 80);
     instance.change(SMOOTHING, 80);
-    for _ in 0..40 {
+    for _ in 0..64 {
         instance.render(&mut samples);
     }
     assert_ne!(before, samples[63 * 64..]);
@@ -457,15 +476,15 @@ fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing
     let mut original = None;
     for smoothing in [0, 75, 0] {
         instance.change(SMOOTHING, smoothing);
-        for _ in 0..40 {
+        for _ in 0..64 {
             instance.render(&mut samples);
         }
         instance.draw();
         TRACE_LINES.with(|lines| {
             let lines = lines.borrow();
-            assert_eq!(lines.len(), 510);
-            assert!(lines[..255].iter().all(|line| line.4 == 4.0));
-            assert!(lines[255..].iter().all(|line| line.4 == 15.0));
+            assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
+            assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
+            assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
             assert!(lines
                 .iter()
                 .any(|line| line.1 != line.1 as i32 as f32 || line.3 != line.3 as i32 as f32));
@@ -476,8 +495,8 @@ fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing
             }
         });
         GRID_COLORS.with(|colors| {
-            // Solid grid lines use the lowest nonzero brightness.
-            assert_eq!(colors.borrow().len(), 7);
+            // Six dotted dividers and the solid axis stay at minimum brightness.
+            assert_eq!(colors.borrow().len(), 61);
             assert!(colors.borrow().iter().all(|&color| color == 1));
         });
         MARKER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15]));
@@ -489,23 +508,23 @@ fn high_pitch_changes_only_the_dim_audio_overlay() {
     let mut instance = Instance::new(32);
     instance.change(curve_parameter(32, 0), 100);
     let mut samples = [0.0; LAST_BUS * 64];
-    for _ in 0..40 {
+    for _ in 0..64 {
         instance.render(&mut samples);
     }
     instance.draw();
     let low = TRACE_LINES.with(|lines| lines.borrow().clone());
     instance.change(PITCH, 105);
-    for _ in 0..40 {
+    for _ in 0..64 {
         instance.render(&mut samples);
     }
     instance.draw();
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert_eq!(&lines[255..], &low[255..]);
-        assert_ne!(&lines[..255], &low[..255]);
-        assert!(lines[..255]
+        assert_eq!(&lines[lines.len() / 2..], &low[low.len() / 2..]);
+        assert_ne!(&lines[..lines.len() / 2], &low[..low.len() / 2]);
+        assert!(lines[..lines.len() / 2]
             .iter()
-            .zip(&lines[255..])
+            .zip(&lines[lines.len() / 2..])
             .any(|(audio, source)| (audio.1 - source.1).abs() > 0.1
                 || (audio.3 - source.3).abs() > 0.1));
     });
@@ -522,7 +541,7 @@ fn drawn_endpoint_handles_do_not_move_with_curve_or_smoothing() {
             instance.change(segment_parameter(1, 2), curve);
             instance.change(SMOOTHING, smoothing);
             let mut samples = [0.0; LAST_BUS * 64];
-            for _ in 0..40 {
+            for _ in 0..64 {
                 instance.render(&mut samples);
             }
             instance.draw();
@@ -536,7 +555,7 @@ fn drawn_endpoint_handles_do_not_move_with_curve_or_smoothing() {
                 assert!(lines
                     .borrow()
                     .iter()
-                    .any(|line| line.2 == 63.0 && (line.3 - 31.25).abs() < 0.001))
+                    .any(|line| line.2 == 63.75 && (line.3 - 31.25).abs() < 0.001))
             });
         }
     }
@@ -591,11 +610,56 @@ fn smart_pickup_reaches_both_stops_for_every_pot_after_segment_selection() {
 }
 
 #[test]
+fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
+    let mut instance = Instance::new(8);
+    instance.event([0.5; 3], [2, 0]);
+    instance.change(centroid_parameter(8), 94);
+    for strength in [-100, 100] {
+        instance.change(strength_parameter(8), strength);
+        instance.change(SMOOTHING, 50);
+        let wave = read_wave(8, |p| instance.values.get(p).copied());
+        let left = (wave.boundary_position(2) * 255.0) as i32;
+        let right = (wave.boundary_position(3) * 255.0) as i32;
+        let mut samples = [0.0; LAST_BUS * 64];
+        for _ in 0..48 {
+            instance.render(&mut samples);
+        }
+        instance.draw();
+        SHAPES.with(|shapes| {
+            let shapes = shapes.borrow();
+            assert!(shapes.contains(&(SHAPE_RECTANGLE, left, 14, right, 42)));
+            assert!(shapes.contains(&(SHAPE_RECTANGLE, 94, 14, 95, 42)));
+            assert!(shapes.contains(&(SHAPE_RECTANGLE, 93, 14, 96, 42)));
+            for i in 1..8 {
+                let x = (wave.boundary_position(i) * 255.0) as i32;
+                for y in (14..=42).step_by(3) {
+                    assert!(shapes.contains(&(SHAPE_POINT, x, y, x, y)));
+                }
+                assert!(!shapes.contains(&(SHAPE_LINE, x, 14, x, 42)));
+            }
+        });
+        TRACE_LINES.with(|lines| {
+            let lines = lines.borrow();
+            let bright = &lines[lines.len() / 2..];
+            for i in 1..8 {
+                let x = wave.boundary_position(i) * 255.0;
+                let y = (28.0 - wave.boundary_level(i) * 13.0).clamp(14.0, 42.0);
+                assert!(bright
+                    .iter()
+                    .any(|line| line.2 == x && (line.3 - y).abs() < 0.01));
+            }
+        });
+    }
+}
+
+#[test]
 fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges() {
     let mut instance = Instance::new(8);
     instance.event([0.8; 3], [2, 0]);
     instance.change(SMOOTHING, 25);
     instance.change(LEVEL, 30);
+    instance.change(centroid_parameter(8), 25);
+    instance.change(strength_parameter(8), 0);
     instance.change(PITCH, 40);
     let before = instance.values.clone();
     instance.event_buttons([0.8; 3], [0, 0], ENCODER_BUTTON_R, 0);
@@ -609,25 +673,40 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         assert!(!shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 7)));
         assert!(shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 12)));
         assert!(!shapes.iter().any(|s| s.0 == SHAPE_BOX));
-        assert!(!shapes.iter().any(|s| s.0 == SHAPE_RECTANGLE && s.2 == 14));
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| s.0 == SHAPE_RECTANGLE && s.2 == 14)
+                .count(),
+            2
+        );
     });
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15, 15]));
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert_eq!(lines.len(), 510);
-        assert!(lines[..255].iter().all(|line| line.4 == 4.0));
-        assert!(lines[255..].iter().all(|line| line.4 == 15.0));
+        assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
+        assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
+        assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
     });
-    GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1]));
+    GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1; 71]));
     SHAPES.with(|shapes| {
         let shapes = shapes.borrow();
         assert!(shapes.contains(&(SHAPE_LINE, 0, 28, 255, 28)));
-        assert!(!shapes
-            .iter()
-            .any(|s| s.0 == SHAPE_LINE && s.2 == 14 && s.4 == 42));
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| s.0 == SHAPE_POINT && s.2 >= 14 && s.4 <= 42)
+                .count(),
+            70
+        );
     });
     TEXT.with(|text| {
-        for expected in ["L: Randomize", "C: Level", "R: Smooth", "R click: Segment"] {
+        for expected in [
+            "L: Warp Pos",
+            "C: Warp Amt",
+            "R: Smooth",
+            "R click: Segment",
+        ] {
             assert!(text
                 .borrow()
                 .iter()
@@ -638,20 +717,23 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         instance.event([0.8 + step as f32 * 0.005; 3], [0, 0]);
     }
     assert_eq!(instance.values[SMOOTHING], 100);
-    assert_eq!(instance.values[LEVEL], 100);
+    assert_eq!(instance.values[strength_parameter(8)], 100);
     let trigger = randomize_parameter(8);
-    assert_eq!(instance.values[trigger], 1);
+    assert_eq!(instance.values[trigger], 0);
+    assert_eq!(instance.values[centroid_parameter(8)], 255);
+    assert_eq!(instance.values[LEVEL], 30);
     assert_eq!(instance.values[PITCH], 40);
     let first_shape = instance.values[GLOBALS..trigger].to_vec();
-    assert_ne!(first_shape, before[GLOBALS..trigger]);
+    assert_eq!(first_shape, before[GLOBALS..trigger]);
     instance.event([1.0; 3], [0, 0]);
     assert_eq!(&instance.values[GLOBALS..trigger], &first_shape);
     for step in (0..200).rev() {
         instance.event([step as f32 * 0.005; 3], [0, 0]);
     }
     assert_eq!(instance.values[SMOOTHING], 0);
-    assert_eq!(instance.values[LEVEL], 0);
+    assert_eq!(instance.values[strength_parameter(8)], -100);
     assert_eq!(instance.values[trigger], 0);
+    assert_eq!(instance.values[centroid_parameter(8)], 0);
     assert_eq!(&instance.values[GLOBALS..trigger], &first_shape);
     assert_eq!(instance.values[PITCH], 40);
     // Slow motion must accumulate instead of disappearing in integer rounding.
@@ -659,7 +741,8 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         instance.event([step as f32 * 0.0002; 3], [0, 0]);
     }
     assert!(instance.values[SMOOTHING] > 0);
-    assert!(instance.values[LEVEL] > 0);
+    assert!(instance.values[strength_parameter(8)] > -100);
+    assert!(instance.values[centroid_parameter(8)] > 0);
     assert_eq!(instance.values[PITCH], 40);
     instance.draw();
     TEXT.with(|text| {
@@ -668,6 +751,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
             && s == &std::format!("Smooth {}", instance.values[SMOOTHING])));
     });
     // Changing modes alongside pot movement re-primes pickup without edits.
+    instance.change(strength_parameter(8), 0);
     let before_switch = instance.values.clone();
     instance.event_buttons([0.5; 3], [0, 0], ENCODER_BUTTON_R, 0);
     assert_eq!(instance.values, before_switch);
@@ -690,11 +774,11 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[4, 4, 4]));
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert_eq!(lines.len(), 510);
-        assert!(lines[..255].iter().all(|line| line.4 == 4.0));
-        assert!(lines[255..].iter().all(|line| line.4 == 15.0));
+        assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
+        assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
+        assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
     });
-    GRID_COLORS.with(|colors| assert_eq!(colors.borrow().len(), 8));
+    GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1; 71]));
     instance.change(segment_parameter(2, 0), -50);
     instance.change(segment_parameter(2, 2), -50);
     instance.change(segment_parameter(2, 1), -50);
@@ -741,12 +825,12 @@ fn editor_selection_relative_pots_and_permanent_footer() {
             assert!(text.iter().any(|(_, y, s)| *y >= 57 && s == expected));
         }
         assert_eq!(text.len(), 8);
-        for expected in ["Randomize 0", "Level 50", "Smooth 0"] {
+        for expected in ["Warp Pos 128", "Warp Amt 0", "Smooth 0"] {
             assert!(text.iter().any(|(_, y, s)| *y == 10 && s == expected));
         }
         assert!(text
             .iter()
-            .any(|(x, y, s)| *x == 106 && *y == 10 && s == "Level 50"));
+            .any(|(x, y, s)| *x == 102 && *y == 10 && s == "Warp Amt 0"));
         assert!(text
             .iter()
             .any(|(x, y, s)| *x == 198 && *y == 10 && s == "Smooth 0"));

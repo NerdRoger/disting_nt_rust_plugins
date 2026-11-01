@@ -1,6 +1,6 @@
 # Wavesmith prototype
 
-A free-running oscillator built from 2–32 equal-width curved segments. Select the
+A free-running oscillator built from 2–32 curved segments, initially equal-width. Select the
 segment count and Anti-alias tables in the algorithm's setup specifications.
 Anti-alias tables accepts 1–20, default 6. The NT allocates parameter layouts and
 buffers at construction; use its respecification workflow to change these counts.
@@ -21,12 +21,12 @@ Only the chosen count is allocated, rather than reserving the maximum.
   Levels and curves range from −100% to +100%; curve 0 is linear. Positive Curve
   bows upward and negative Curve bows downward. Stronger bows reflect at the
   whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
-- Globals mode: left pot edits Randomize (0/1), centre pot edits Level (0–100%),
-  right pot edits Smoothing (0–100%). Turn Randomize up to trigger a new shape,
-  down to rearm it, then up for another variation. Pitch remains on the Oscillator page.
+- Globals mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
+  (−100% to +100%), right pot edits Smoothing (0–100%). Randomize, output Level,
+  and Pitch remain available on the Oscillator parameter page.
 - Right encoder rotation is unused. Left encoder selects the segment in either mode.
 
-Randomize, Level and Smoothing use regular-sized text above the waveform. The
+The top row labels are Warp Pos, Warp Amt and Smooth in regular-sized text. The
 graph occupies y=14–42 with its zero axis at y=28, leaving the help footer fixed.
 Globals
 mode draws this header at full brightness (15) over a dim background (2), and hides the segment selection
@@ -47,6 +47,16 @@ Segment 3 and the left pot on Segment 4 both edit Boundary 03. The beginning and
 end of the complete waveform share Boundary 00, editable from either endpoint.
 It defaults to zero but can be set anywhere from −100% to +100%; both ends always
 meet at that value when the waveform repeats.
+Warp Position ranges from 0 to 255 (default 128); Warp Amount defaults to zero. Positive Warp Amount repels boundary
+positions from the warp position; negative Warp Amount attracts them. Both waveform ends
+remain fixed and boundaries retain their order, level, and curve identity. A
+monotone rational map limits the effective attraction/repulsion to 95% internally
+at full control travel, preventing zero-width segments. Warp Position can sit at either
+edge. A four-pixel black strip with a centered two-pixel full-brightness core
+marks it in both editing modes, drawn over the waveform and clamped on screen
+at either edge. Grid dividers,
+selection shading and endpoint handles follow the redistributed boundaries.
+Zero Warp Amount retains the original equal-width geometry.
 Equal start/end levels produce a flat segment only at Curve 0; nonzero Curve can
 create humps and folded lobes between equal endpoints. The curve is quadratic
 Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curve
@@ -62,8 +72,10 @@ behind it for development, showing pitch-dependent harmonic filtering and the
 audio edit crossfade, before output Level scaling. The bright trace is always
 drawn last so it stays in front wherever the traces meet. The display uses the NT's
 native antialiased float-coordinate drawing API; this does not filter the audio.
-The grid uses solid lines at the lowest nonzero brightness (1) in Segment mode.
-Globals mode hides the vertical segment dividers but retains the horizontal zero axis.
+Both modes show the vertical segment dividers as one-pixel dots spaced three
+pixels apart, at brightness 1 (the lowest nonzero level). The horizontal zero
+axis stays solid at brightness 1, and the thicker warp position marker stays solid.
+This keeps warp position/strength changes visible with less prominent dividers.
 Full-brightness boundary handles in Segment mode mark both
 ends of the selected segment above the curves. The bright trace is independent
 of pitch and the audio path's automatic
@@ -73,11 +85,13 @@ zero it reads a separate creative-smoothing table, preserving the boundary level
 ## Parameters and routing
 
 Oscillator page: Pitch (MIDI note number, default A3/220 Hz), Fine tune in cents,
-Smoothing, Level (default 50%, up to nominal ±5 V at 100%), and Randomize.
+Smoothing, Level (default 50%, up to nominal ±5 V at 100%), Randomize, Warp Position,
+and Warp Amount. The latter two are ordinary modulatable host parameters.
 Randomize is a 0/1 trigger: changing it from 0 to 1 replaces all boundary
 levels and segment curves with pseudorandom values from −100% to +100%. Return it
 to 0, then 1 for another variation; holding it at 1 does not repeat. Endpoints
-share the randomized Boundary 00, and pitch, routing, level and smoothing stay unchanged. The generated
+share the randomized Boundary 00, and pitch, routing, level, smoothing, warp position
+and strength stay unchanged. The generated
 values are ordinary editable host parameters and are saved with the preset.
 Routing page: Output
 (default bus 13 / physical output 1), Output mode (add/replace), and optional
@@ -150,17 +164,32 @@ retain the drawn source shape.
 
 A five-millisecond crossfade prevents abrupt edit clicks without resetting phase.
 That short transition also applies when enabling or disabling smoothing. A table
-set without smoothing takes three source callbacks (sample, FFT half 1, FFT
-half 2) plus four callbacks per pair of tables: seven callbacks at 1 table,
-fifteen at the default 6, and 43 at 20. Every forward and inverse FFT runs in
+set without smoothing takes seven source callbacks (prepare geometry, four
+64-sample chunks, FFT half 1, FFT half 2) plus four callbacks per pair of tables:
+eleven callbacks at 1 table, nineteen at the default 6, and 47 at 20.
+Every forward and inverse FFT runs in
 two dedicated callbacks, each performing four of its eight radix-2 stages.
 Reordering belongs to the first half; inverse normalization to the second.
 Sampling, filtering, preview storage, spectrum copying, and table storage run
 separately from the FFT halves. Each of the two boundary-correction passes takes one
 callback to measure errors and apply DC, followed by callbacks that each apply
-up to four harmonics. With six tables, a smoothed build takes 26 callbacks at
-eight segments, or 32 at 32 segments. At 64 frames and 48 kHz, those are
-about 34.7 ms and 42.7 ms, versus 20 ms without smoothing, followed by the fade.
+up to four harmonics. With six tables and zero Warp Amount, a smoothed build takes
+30 callbacks at eight segments, or 36 at 32 segments. At 24 frames and 48 kHz,
+those are 15 ms and 18 ms, versus 9.5 ms without smoothing, followed by the fade.
+Nonzero Warp Amount with smoothing adds four 64-sample resampling callbacks. Smoothing and
+boundary correction run in equal-width segment coordinates, retaining the
+existing cached correction weights. The finished shape is then stretched into
+the new segment positions before the final anti-alias FFT. The bright preview
+evaluates that stretch directly from the retained smoothing table, keeping
+anchors visible even when a compressed segment spans less than one audio-table
+sample. Strong compression can lose detail in the fixed 256-sample audio tables.
+Shifted boundary positions and reciprocal widths are computed once per rebuild,
+then samples walk the cached segments in order rather than repeatedly searching
+and recalculating positions. The geometry cache fits in the unused end of the
+existing FFT lookup buffer, separate from its twiddles and smoothing gains.
+Sampling and resampling each generate at most 64 samples per callback. At 24
+frames and 48 kHz, 32 segments and six tables take 20 ms to rebuild at nonzero
+Warp Amount with smoothing (40 callbacks), plus the 5 ms crossfade.
 This reduces work per callback without adding buffers or changing the correction.
 Continuous edits are coalesced without restarting an
 unfinished build. The old complete table set plays until the new set is ready.
@@ -196,6 +225,11 @@ and values; it only changes how the host displays them.
 Randomize is appended after the existing parameters, preserving their indices.
 Boundary 00 reuses the former fixed-zero parameter, so this change also preserves
 existing parameter indices and defaults to the previous zero seam.
+Warp Position and Warp Amount are appended after Randomize; all earlier parameter indices
+are unchanged. Their defaults preserve the original equal-width shape.
+Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
+presets stored a raw 0–100 percentage value; those warp position values now use the
+new 0–255 units and may need readjustment.
 
 From the repository's devcontainer:
 
@@ -207,4 +241,4 @@ cargo test -p wavesmith --lib
 Copy `plugins/wavesmith.o` to the NT's plugin folder using your normal deployment
 procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
-variable segment widths, and per-boundary smoothing are deferred.
+independent segment-width editing, and per-boundary smoothing are deferred.

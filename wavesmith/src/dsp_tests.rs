@@ -5,6 +5,16 @@ use std::cell::Cell;
 std::thread_local! {
     static FFT_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static FFT_HALVES: Cell<usize> = const { Cell::new(0) };
+    static GENERATED_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    static BOUNDARY_POSITIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn count_generated_samples(count: usize) {
+    GENERATED_SAMPLES.with(|counter| counter.set(counter.get() + count));
+}
+
+pub(super) fn count_boundary_position() {
+    BOUNDARY_POSITIONS.with(|counter| counter.set(counter.get() + 1));
 }
 
 pub(super) fn count_fft_half() {
@@ -145,7 +155,9 @@ fn rendered_harmonic_gain(increment: f32, harmonic: usize) -> f32 {
 fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency: f32) {
     engine.request(wave);
     // Allow an in-flight older shape, the requested build, and both fades.
-    let longest_build = 10
+    let longest_build = SOURCE_STEPS
+        + 7
+        + SAMPLE_STEPS
         + 2 * correction_steps(MAX_SEGMENTS)
         + engine.layout.count.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS;
     for _ in 0..2 * longest_build + 12 {
@@ -156,6 +168,130 @@ fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency:
     }
     assert_eq!(engine.waves[engine.active], wave);
     assert_eq!(engine.fade, 0);
+}
+
+#[test]
+fn cached_geometry_matches_reference_and_does_not_overlap_fft_or_smoothing_values() {
+    for n in 2..=MAX_SEGMENTS {
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut engine = Engine::new(n, 48000);
+        engine.advance(&mut memory);
+        let fixed = memory[TWIDDLES].data;
+        let mut wave = Wave::new(n);
+        for centroid in [0, 1, 94, 128, 254, 255] {
+            wave.centroid = centroid;
+            for strength in [-100, -50, 50, 100] {
+                wave.strength = strength;
+                prepare_geometry(&wave, &mut memory[TWIDDLES].data);
+                for (a, b) in memory[TWIDDLES].data[..POSITION_CACHE].iter().zip(&fixed) {
+                    assert_eq!(a.re, b.re);
+                    assert_eq!(a.im, b.im);
+                }
+                let mut cursor = 0;
+                for i in 0..SIZE {
+                    let phase = i as f32 / SIZE as f32;
+                    let expected = wave.segment_at(phase);
+                    let actual =
+                        cached_segment_at(&wave, &memory[TWIDDLES].data, phase, &mut cursor);
+                    assert_eq!(actual.0, expected.0);
+                    assert!((actual.1 - expected.1).abs() < 0.000001);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn centroid_mapping_preserves_edges_order_and_segment_shapes_at_all_settings() {
+    for n in 2..=MAX_SEGMENTS {
+        let mut wave = Wave::new(n);
+        for i in 0..n {
+            wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
+            wave.curves[i] = (i * 31 % 201) as i16 - 100;
+        }
+        for centroid in 0..=255 {
+            wave.centroid = centroid;
+            let center = centroid as f32 / 255.0;
+            for strength in [-100, -50, 0, 50, 100] {
+                wave.strength = strength;
+                assert_eq!(wave.boundary_position(0), 0.0);
+                assert_eq!(wave.boundary_position(n), 1.0);
+                for i in 0..n {
+                    let start = wave.boundary_position(i);
+                    let end = wave.boundary_position(i + 1);
+                    assert!(end > start && start >= 0.0 && end <= 1.0);
+                    let original = i as f32 / n as f32;
+                    if strength == 0 {
+                        assert_eq!(start, original);
+                    } else if strength > 0 {
+                        assert!((start - center).abs() + 0.000001 >= (original - center).abs());
+                    } else {
+                        assert!((start - center).abs() <= (original - center).abs() + 0.000001);
+                    }
+                    for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                        let phase = wave.segment_phase(i, t);
+                        assert!(
+                            (wave.sample(phase) - wave.segment_sample(i, t)).abs() < 0.002,
+                            "n {n} center {centroid} strength {strength} segment {i} t {t}"
+                        );
+                    }
+                }
+                assert_eq!(wave.sample(0.0), wave.sample(1.0));
+            }
+        }
+    }
+}
+
+#[test]
+fn redistributed_shape_drives_editor_and_final_audio_spectrum_with_smoothing() {
+    for n in [8, 32] {
+        let mut engine = Engine::new(n, 48000);
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut wave = Wave::new(n);
+        for i in 0..n {
+            wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
+            wave.curves[i] = (i * 31 % 201) as i16 - 100;
+        }
+        for centroid in [0, 94, 128, 255] {
+            wave.centroid = centroid;
+            for strength in [-100, -50, 50, 100] {
+                wave.strength = strength;
+                for smoothing in [0, 50, 100] {
+                    wave.smoothing = smoothing;
+                    finish_build(&mut engine, &mut memory, wave, 220.0);
+                    let mut expected = [Complex::default(); SIZE];
+                    for (i, value) in expected.iter_mut().enumerate() {
+                        let phase = i as f32 / SIZE as f32;
+                        value.re = engine.editor_phase_sample(&memory, phase);
+                        if smoothing == 0 {
+                            assert_eq!(value.re, wave.sample(phase));
+                        }
+                    }
+                    fft(&mut expected, &memory[TWIDDLES].data, false);
+                    // The spectrum used for all audio tables is the stretched
+                    // shape, with pitch filtering still applied afterwards.
+                    for (a, b) in memory[BANK_BLOCKS].data.iter().zip(&expected) {
+                        assert!((a.re - b.re).abs() < 0.0001);
+                        assert!((a.im - b.im).abs() < 0.0001);
+                    }
+                    for boundary in 0..n {
+                        let phase = wave.boundary_position(boundary);
+                        assert!(
+                            (engine.editor_phase_sample(&memory, phase)
+                                - wave.boundary_level(boundary))
+                            .abs()
+                                < 0.0005
+                        );
+                    }
+                    let saved = engine.waves[engine.active];
+                    engine.request(wave);
+                    engine.advance(&mut memory);
+                    assert_eq!(engine.stage, 0);
+                    assert_eq!(engine.waves[engine.active], saved);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -217,11 +353,11 @@ fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts()
                         engine.advance(memory);
                         let after = FFT_COUNTS.with(|counter| counter.get());
                         let halves = FFT_HALVES.with(|counter| counter.get()) - halves_before;
-                        let fft_callback = callback == 1
-                            || callback == 2
+                        let fft_callback = callback == SOURCE_FFT_STAGE
+                            || callback == SOURCE_FFT_STAGE + 1
                             || (smoothing > 0
-                                && (callback == 4
-                                    || callback == 5
+                                && (callback == SOURCE_STEPS + 1
+                                    || callback == SOURCE_STEPS + 2
                                     || callback == audio_stage - 3
                                     || callback == audio_stage - 2))
                             || (callback >= audio_stage
@@ -229,7 +365,8 @@ fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts()
                         assert_eq!(halves, usize::from(fft_callback));
                         assert!((after.0 - before.0) + (after.1 - before.1) <= 1);
                         let inverses = FFT_COUNTS.with(|counter| counter.get().1);
-                        let before_smoothing = usize::from(smoothing > 0 && callback >= 5);
+                        let before_smoothing =
+                            usize::from(smoothing > 0 && callback >= SOURCE_STEPS + 2);
                         let audio_inverses =
                             (callback + 2).saturating_sub(audio_stage) / TABLE_PAIR_STEPS;
                         assert_eq!(inverses, before_smoothing + audio_inverses);
@@ -274,11 +411,13 @@ fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts()
 #[test]
 fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
     for n in [2, 8, 31, 32] {
-        for smoothing in [1, 100] {
+        for smoothing in [0, 1, 100] {
             let mut engine = Engine::new(n, 48000);
             let mut memory = [Block::ZERO; BLOCKS];
             let mut wave = Wave::new(n);
             wave.smoothing = smoothing;
+            wave.centroid = 37;
+            wave.strength = -70;
             finish_build(&mut engine, &mut memory, wave, 440.0);
             let old_bank = engine.active;
             let old = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
@@ -288,7 +427,13 @@ fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
             engine.request(snapshot);
             let callbacks = build_calls(&snapshot, LEVELS);
             for callback in 0..callbacks {
+                GENERATED_SAMPLES.with(|counter| counter.set(0));
+                BOUNDARY_POSITIONS.with(|counter| counter.set(0));
                 engine.advance(&mut memory);
+                GENERATED_SAMPLES.with(|counter| assert!(counter.get() <= SAMPLES_PER_STEP));
+                BOUNDARY_POSITIONS.with(|counter| {
+                    assert_eq!(counter.get(), if callback == 0 { n + 1 } else { 0 })
+                });
                 assert_eq!(engine.active, old_bank);
                 assert_eq!(engine.building, snapshot);
                 assert_eq!(engine.fade > 0, callback + 1 == callbacks);

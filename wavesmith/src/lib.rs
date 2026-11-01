@@ -51,6 +51,13 @@ const fn randomize_parameter(n: usize) -> usize {
     GLOBALS + n * 2
 }
 
+const fn centroid_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 1
+}
+const fn strength_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 2
+}
+
 fn random_level(seed: &mut u32) -> i16 {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 17;
@@ -76,6 +83,10 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
     let mut wave = dsp::Wave::new(n);
     wave.boundaries[0] = value(seam_parameter(n)).unwrap_or(0).clamp(-100, 100);
     wave.smoothing = value(SMOOTHING).unwrap_or(0).clamp(0, 100);
+    wave.centroid = value(centroid_parameter(n))
+        .unwrap_or(dsp::CENTROID_DEFAULT)
+        .clamp(0, dsp::CENTROID_MAX);
+    wave.strength = value(strength_parameter(n)).unwrap_or(0).clamp(-100, 100);
     for i in 1..n.min(dsp::MAX_SEGMENTS + 1) {
         wave.boundaries[i] = value(boundary_parameter(i)).unwrap_or(0).clamp(-100, 100);
     }
@@ -206,9 +217,9 @@ impl Plugin for Wavesmith {
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 1,
+            parameters: GLOBALS + n * 2 + 3,
             pages: 3,
-            page_indices: GLOBALS + n * 2 + 2,
+            page_indices: GLOBALS + n * 2 + 4,
             voices: dsp::blocks(table_count(specs)?),
         })
     }
@@ -257,6 +268,8 @@ impl Plugin for Wavesmith {
                 SMOOTHING as u8,
                 LEVEL as u8,
                 randomize_parameter(n) as u8,
+                centroid_parameter(n) as u8,
+                strength_parameter(n) as u8,
             ],
         )?;
         metadata.add_page(
@@ -284,6 +297,20 @@ impl Plugin for Wavesmith {
         metadata.set_parameter(
             randomize_parameter(n),
             definition(c"Randomize", 0, 1, 0, UNIT_NONE)?,
+        )?;
+        metadata.set_parameter(
+            centroid_parameter(n),
+            definition(
+                c"Warp Position",
+                0,
+                dsp::CENTROID_MAX,
+                dsp::CENTROID_DEFAULT,
+                UNIT_NONE,
+            )?,
+        )?;
+        metadata.set_parameter(
+            strength_parameter(n),
+            definition(c"Warp Amount", -100, 100, 0, UNIT_PERCENT)?,
         )?;
         // Keep the page count fixed, including at the maximum segment count.
         // Walk the shape in time order, repeating Boundary 00 at the end.
