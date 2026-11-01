@@ -56,7 +56,7 @@ impl Instance {
                 itc: 0,
             };
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
-            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 3);
+            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 10);
             assert!(
                 req.sram
                     < (dsp::blocks(tables as usize) * core::mem::size_of::<dsp::Block>() + 8000)
@@ -219,6 +219,21 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
             assert_eq!(references[seam_parameter(n as usize)], 2);
             assert_eq!(references[randomize_parameter(n as usize)], 1);
+            for (index, name) in shape_triggers(n as usize).into_iter().zip([
+                c"Randomize All",
+                c"Randomize Boundaries",
+                c"Randomize Curves",
+                c"Zero Curves",
+                c"Sine Boundaries",
+                c"Triangle Boundaries",
+                c"Square Boundaries",
+                c"Sawtooth Boundaries",
+            ]) {
+                assert_eq!(references[index], 1);
+                let d = *(*instance.base).parameters.add(index);
+                assert_eq!(CStr::from_ptr(d.name), name);
+                assert_eq!((d.min, d.max, d.default, d.unit), (0, 1, 0, UNIT_NONE));
+            }
             for (index, name, minimum, maximum, default) in [
                 (
                     centroid_parameter(n as usize),
@@ -285,6 +300,146 @@ fn table_specification_controls_real_allocations_for_every_supported_count() {
     }
     assert!(Wavesmith::configuration(&[8]).is_none());
     assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 6);
+}
+
+#[test]
+fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
+    for n in 2..=32 {
+        for kind in 0..4 {
+            let mut instance = Instance::new(n);
+            let n = n as usize;
+            instance.change(SMOOTHING, 43);
+            instance.change(centroid_parameter(n), 94);
+            instance.change(strength_parameter(n), -68);
+            let mut boundaries = std::vec![seam_parameter(n)];
+            boundaries.extend((1..n).map(boundary_parameter));
+            let curves: Vec<_> = (0..n).map(|segment| curve_parameter(n, segment)).collect();
+            for (i, &parameter) in boundaries.iter().enumerate() {
+                instance.change(parameter, (i as i16 * 3) - 40);
+            }
+            for (i, &parameter) in curves.iter().enumerate() {
+                instance.change(parameter, 20 + i as i16);
+            }
+            let trigger = shape_triggers(n)[kind];
+            let before = instance.values.clone();
+            instance.change(trigger, 1);
+            let after = instance.values.clone();
+            for parameter in 0..before.len() {
+                let changes_boundary = kind <= 1 && boundaries.contains(&parameter);
+                let changes_curve = kind != 1 && curves.contains(&parameter);
+                if parameter != trigger && !changes_boundary && !changes_curve {
+                    assert_eq!(after[parameter], before[parameter]);
+                }
+            }
+            if kind <= 1 {
+                assert!(boundaries.iter().any(|&p| before[p] != after[p]));
+            }
+            if kind != 1 {
+                assert!(curves.iter().any(|&p| before[p] != after[p]));
+            }
+            if kind == 3 {
+                assert!(curves.iter().all(|&p| after[p] == 0));
+            }
+            instance.change(trigger, 1);
+            assert_eq!(instance.values, after);
+            instance.change(trigger, 0);
+            let rearmed = instance.values.clone();
+            if kind == 3 {
+                instance.change(curves[0], 73);
+            }
+            instance.change(trigger, 1);
+            if kind == 3 {
+                assert!(curves.iter().all(|&p| instance.values[p] == 0));
+            } else {
+                assert!(boundaries
+                    .iter()
+                    .chain(&curves)
+                    .any(|&p| instance.values[p] != rearmed[p]));
+            }
+        }
+    }
+}
+
+#[test]
+fn shape_trigger_edges_are_independent() {
+    let mut instance = Instance::new(8);
+    let [all, boundaries, curves, zero, ..] = shape_triggers(8);
+    for trigger in [all, boundaries, curves, zero] {
+        instance.change(trigger, 1);
+    }
+    let boundary_values: Vec<_> = (1..8)
+        .map(|i| instance.values[boundary_parameter(i)])
+        .collect();
+    instance.change(curve_parameter(8, 0), 73);
+    let before = instance.values.clone();
+    for trigger in [all, boundaries, curves, zero] {
+        instance.change(trigger, 1);
+    }
+    assert_eq!(instance.values, before);
+    instance.change(curves, 0);
+    instance.change(curves, 1);
+    assert!((0..8).any(|i| instance.values[curve_parameter(8, i)] != before[curve_parameter(8, i)]));
+    assert_eq!(
+        (1..8)
+            .map(|i| instance.values[boundary_parameter(i)])
+            .collect::<Vec<_>>(),
+        boundary_values
+    );
+    instance.change(zero, 0);
+    instance.change(zero, 1);
+    assert!((0..8).all(|i| instance.values[curve_parameter(8, i)] == 0));
+}
+
+#[test]
+fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
+    for n in 2..=32 {
+        let mut instance = Instance::new(n);
+        let n = n as usize;
+        instance.change(SMOOTHING, 43);
+        instance.change(centroid_parameter(n), 94);
+        instance.change(strength_parameter(n), -68);
+        for i in 0..n {
+            instance.change(curve_parameter(n, i), 20 + i as i16);
+        }
+        let boundaries: Vec<_> = std::iter::once(seam_parameter(n))
+            .chain((1..n).map(boundary_parameter))
+            .collect();
+        for (kind, shape) in [
+            dsp::BoundaryShape::Sine,
+            dsp::BoundaryShape::Triangle,
+            dsp::BoundaryShape::Square,
+            dsp::BoundaryShape::Sawtooth,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let trigger = shape_triggers(n)[4 + kind];
+            let before = instance.values.clone();
+            instance.change(trigger, 1);
+            for (i, &parameter) in boundaries.iter().enumerate() {
+                assert_eq!(
+                    instance.values[parameter],
+                    dsp::preset_boundary(shape, i, n)
+                );
+            }
+            for parameter in 0..before.len() {
+                if parameter != trigger && !boundaries.contains(&parameter) {
+                    assert_eq!(instance.values[parameter], before[parameter]);
+                }
+            }
+            // Holding this trigger high must not reapply the shape, even with
+            // other waveform triggers already held high from earlier iterations.
+            instance.change(seam_parameter(n), 73);
+            let held = instance.values.clone();
+            for trigger in shape_triggers(n).into_iter().skip(4).take(kind + 1) {
+                instance.change(trigger, 1);
+            }
+            assert_eq!(instance.values, held);
+            instance.change(trigger, 0);
+            instance.change(trigger, 1);
+            assert_eq!(instance.values[seam_parameter(n)], -100);
+        }
+    }
 }
 
 #[test]

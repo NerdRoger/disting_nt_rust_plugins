@@ -57,6 +57,28 @@ const fn centroid_parameter(n: usize) -> usize {
 const fn strength_parameter(n: usize) -> usize {
     randomize_parameter(n) + 2
 }
+const fn randomize_boundaries_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 3
+}
+const fn randomize_curves_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 4
+}
+const fn zero_curves_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 5
+}
+
+fn shape_triggers(n: usize) -> [usize; 8] {
+    [
+        randomize_parameter(n),
+        randomize_boundaries_parameter(n),
+        randomize_curves_parameter(n),
+        zero_curves_parameter(n),
+        randomize_parameter(n) + 6,
+        randomize_parameter(n) + 7,
+        randomize_parameter(n) + 8,
+        randomize_parameter(n) + 9,
+    ]
+}
 
 fn random_level(seed: &mut u32) -> i16 {
     *seed ^= *seed << 13;
@@ -103,7 +125,7 @@ struct State {
     sample_rate: f32,
     ui: ui::UiState,
     random_seed: u32,
-    randomize_high: bool,
+    trigger_high: [bool; 8],
 }
 
 type Callback<'a, Mode> = Context<'a, State, dsp::Block, Mode, Sram>;
@@ -217,9 +239,9 @@ impl Plugin for Wavesmith {
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 3,
+            parameters: GLOBALS + n * 2 + 10,
             pages: 3,
-            page_indices: GLOBALS + n * 2 + 4,
+            page_indices: GLOBALS + n * 2 + 11,
             voices: dsp::blocks(table_count(specs)?),
         })
     }
@@ -235,7 +257,7 @@ impl Plugin for Wavesmith {
             sample_rate: rate as f32,
             ui: ui::UiState::new(),
             random_seed: 0x9e37_79b9 ^ rate ^ n as u32,
-            randomize_high: false,
+            trigger_high: [false; 8],
         })
     }
 
@@ -268,6 +290,13 @@ impl Plugin for Wavesmith {
                 SMOOTHING as u8,
                 LEVEL as u8,
                 randomize_parameter(n) as u8,
+                randomize_boundaries_parameter(n) as u8,
+                randomize_curves_parameter(n) as u8,
+                zero_curves_parameter(n) as u8,
+                shape_triggers(n)[4] as u8,
+                shape_triggers(n)[5] as u8,
+                shape_triggers(n)[6] as u8,
+                shape_triggers(n)[7] as u8,
                 centroid_parameter(n) as u8,
                 strength_parameter(n) as u8,
             ],
@@ -294,10 +323,18 @@ impl Plugin for Wavesmith {
             seam_parameter(n),
             definition(c"Boundary 00", -100, 100, 0, UNIT_PERCENT)?,
         )?;
-        metadata.set_parameter(
-            randomize_parameter(n),
-            definition(c"Randomize", 0, 1, 0, UNIT_NONE)?,
-        )?;
+        for (parameter, name) in shape_triggers(n).into_iter().zip([
+            c"Randomize All",
+            c"Randomize Boundaries",
+            c"Randomize Curves",
+            c"Zero Curves",
+            c"Sine Boundaries",
+            c"Triangle Boundaries",
+            c"Square Boundaries",
+            c"Sawtooth Boundaries",
+        ]) {
+            metadata.set_parameter(parameter, definition(name, 0, 1, 0, UNIT_NONE)?)?;
+        }
         metadata.set_parameter(
             centroid_parameter(n),
             definition(
@@ -327,34 +364,60 @@ impl Plugin for Wavesmith {
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         let n = context.state().count;
-        if parameter != randomize_parameter(n) as i32 {
+        let triggers = shape_triggers(n);
+        let Some(trigger) = triggers.iter().position(|&index| parameter == index as i32) else {
             return;
-        }
+        };
         let high = context
             .read_parameters()
-            .value(randomize_parameter(n))
+            .value(triggers[trigger])
             .unwrap_or(0)
             != 0;
-        let rising = high && !context.state().randomize_high;
-        context.state_mut().randomize_high = high;
+        let rising = high && !context.state().trigger_high[trigger];
+        context.state_mut().trigger_high[trigger] = high;
         if !rising {
+            return;
+        }
+        if trigger >= 4 {
+            let shape = match trigger {
+                4 => dsp::BoundaryShape::Sine,
+                5 => dsp::BoundaryShape::Triangle,
+                6 => dsp::BoundaryShape::Square,
+                _ => dsp::BoundaryShape::Sawtooth,
+            };
+            let _ = context
+                .parameters()
+                .set(seam_parameter(n), dsp::preset_boundary(shape, 0, n));
+            for boundary in 1..n {
+                let _ = context.parameters().set(
+                    boundary_parameter(boundary),
+                    dsp::preset_boundary(shape, boundary, n),
+                );
+            }
             return;
         }
         // Publish real host parameters so the editor, modulation and presets
         // all see the randomized shape. Release the state borrow before setters.
         let mut seed = context.state().random_seed;
-        let _ = context
-            .parameters()
-            .set(seam_parameter(n), random_level(&mut seed));
-        for boundary in 1..n {
+        if trigger == 0 || trigger == 1 {
             let _ = context
                 .parameters()
-                .set(boundary_parameter(boundary), random_level(&mut seed));
+                .set(seam_parameter(n), random_level(&mut seed));
+            for boundary in 1..n {
+                let _ = context
+                    .parameters()
+                    .set(boundary_parameter(boundary), random_level(&mut seed));
+            }
         }
-        for segment in 0..n {
-            let _ = context
-                .parameters()
-                .set(curve_parameter(n, segment), random_level(&mut seed));
+        if trigger == 0 || trigger == 2 || trigger == 3 {
+            for segment in 0..n {
+                let value = if trigger == 3 {
+                    0
+                } else {
+                    random_level(&mut seed)
+                };
+                let _ = context.parameters().set(curve_parameter(n, segment), value);
+            }
         }
         context.state_mut().random_seed = seed;
     }

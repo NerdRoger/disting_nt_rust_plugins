@@ -171,6 +171,44 @@ fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency:
 }
 
 #[test]
+fn waveform_boundary_presets_approximate_one_cycle_at_every_segment_count() {
+    let examples = [
+        (BoundaryShape::Sine, [-100, -71, 0, 71, 100, 71, 0, -71]),
+        (BoundaryShape::Triangle, [-100, -50, 0, 50, 100, 50, 0, -50]),
+        (
+            BoundaryShape::Square,
+            [-100, -100, -100, -100, 100, 100, 100, 100],
+        ),
+        (
+            BoundaryShape::Sawtooth,
+            [-100, -71, -43, -14, 14, 43, 71, 100],
+        ),
+    ];
+    for (shape, expected) in examples {
+        for (i, level) in expected.into_iter().enumerate() {
+            assert_eq!(preset_boundary(shape, i, 8), level);
+        }
+        for n in 2..=MAX_SEGMENTS {
+            let mut wave = Wave::new(n);
+            for i in 0..n {
+                wave.boundaries[i] = preset_boundary(shape, i, n);
+            }
+            assert_eq!(wave.boundaries[0], -100);
+            assert_eq!(preset_boundary(shape, n, n), -100);
+            assert!(wave.boundaries[..n].iter().any(|&v| v > 0));
+            assert!(wave.boundaries[..n]
+                .iter()
+                .all(|&v| (-100..=100).contains(&v)));
+            for i in 0..=SIZE {
+                let value = wave.sample(i as f32 / SIZE as f32);
+                assert!(value.is_finite() && (-1.0..=1.0).contains(&value));
+            }
+            assert_eq!(wave.sample(0.0), wave.sample(1.0));
+        }
+    }
+}
+
+#[test]
 fn cached_geometry_matches_reference_and_does_not_overlap_fft_or_smoothing_values() {
     for n in 2..=MAX_SEGMENTS {
         let mut memory = [Block::ZERO; BLOCKS];

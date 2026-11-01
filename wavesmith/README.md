@@ -22,7 +22,7 @@ Only the chosen count is allocated, rather than reserving the maximum.
   bows upward and negative Curve bows downward. Stronger bows reflect at the
   whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
 - Globals mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
-  (−100% to +100%), right pot edits Smoothing (0–100%). Randomize, output Level,
+  (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
   and Pitch remain available on the Oscillator parameter page.
 - Right encoder rotation is unused. Left encoder selects the segment in either mode.
 
@@ -85,14 +85,32 @@ zero it reads a separate creative-smoothing table, preserving the boundary level
 ## Parameters and routing
 
 Oscillator page: Pitch (MIDI note number, default A3/220 Hz), Fine tune in cents,
-Smoothing, Level (default 50%, up to nominal ±5 V at 100%), Randomize, Warp Position,
-and Warp Amount. The latter two are ordinary modulatable host parameters.
-Randomize is a 0/1 trigger: changing it from 0 to 1 replaces all boundary
-levels and segment curves with pseudorandom values from −100% to +100%. Return it
-to 0, then 1 for another variation; holding it at 1 does not repeat. Endpoints
-share the randomized Boundary 00, and pitch, routing, level, smoothing, warp position
-and strength stay unchanged. The generated
-values are ordinary editable host parameters and are saved with the preset.
+Smoothing, Level (default 50%, up to nominal ±5 V at 100%), eight shape triggers,
+Warp Position and Warp Amount. The warp controls are ordinary modulatable host parameters.
+
+- Randomize All replaces every boundary level and segment curve with
+  pseudorandom values from −100% to +100%.
+- Randomize Boundaries changes only boundary levels, including the shared seam.
+- Randomize Curves changes only segment curves.
+- Zero Curves sets every segment curve to zero.
+- Sine Boundaries sets the boundaries to a sampled sinusoid, starting at its
+  negative peak so even two-segment instances remain bipolar.
+- Triangle Boundaries sets sampled triangle levels, starting at the negative peak.
+- Square Boundaries sets the first half's boundary levels negative and the second
+  half positive. The joins ramp across the available segments.
+- Sawtooth Boundaries sets a rising ramp from the negative seam to the positive
+  last boundary, then returns to the seam across the final segment.
+
+The four waveform presets change boundary levels only, including the shared seam.
+They preserve curves, smoothing and warp settings; use Zero Curves for the cleanest
+linear-segment approximation. With very few segments, the four shapes can coincide
+or approximate their target coarsely. These presets add no FFTs or audio buffers.
+
+Each trigger ranges from 0 to 1 and acts only on its own rising edge. Return it
+to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
+triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
+and warp settings. Generated values remain ordinary editable host parameters
+and are saved with the preset.
 Routing page: Output
 (default bus 13 / physical output 1), Output mode (add/replace), and optional
 1 V/oct Pitch CV bus (0 disables). Pitch CV is sampled once per audio block.
@@ -227,6 +245,11 @@ Boundary 00 reuses the former fixed-zero parameter, so this change also preserve
 existing parameter indices and defaults to the previous zero seam.
 Warp Position and Warp Amount are appended after Randomize; all earlier parameter indices
 are unchanged. Their defaults preserve the original equal-width shape.
+Randomize is now named Randomize All at the same parameter index. Randomize
+Boundaries, Randomize Curves, and Zero Curves are appended after the warp
+parameters, preserving all earlier indices and defaulting to zero.
+The four waveform-boundary triggers are appended after Zero Curves, again
+preserving earlier indices and defaulting to zero.
 Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
 presets stored a raw 0–100 percentage value; those warp position values now use the
 new 0–255 units and may need readjustment.

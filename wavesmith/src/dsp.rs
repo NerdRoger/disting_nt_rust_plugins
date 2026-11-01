@@ -27,6 +27,48 @@ const SOURCE_STEPS: usize = SOURCE_FFT_STAGE + 2;
 // the remaining twiddle-buffer space: 33 positions and 32 reciprocal widths.
 const POSITION_CACHE: usize = SIZE / 2 + (SIZE / 2 + 1).div_ceil(2);
 pub const MAX_SEGMENTS: usize = 32;
+
+#[derive(Clone, Copy)]
+pub enum BoundaryShape {
+    Sine,
+    Triangle,
+    Square,
+    Sawtooth,
+}
+
+pub fn preset_boundary(shape: BoundaryShape, boundary: usize, count: usize) -> i16 {
+    let count = count.clamp(2, MAX_SEGMENTS);
+    let phase = (boundary % count) as f32 / count as f32;
+    // Start sine/triangle at their negative peak so two-segment instances
+    // remain bipolar rather than sampling only the sine's zero crossings.
+    let value = match shape {
+        BoundaryShape::Sine => -sine(core::f32::consts::TAU * phase + core::f32::consts::FRAC_PI_2),
+        BoundaryShape::Triangle => {
+            if phase < 0.5 {
+                -1.0 + 4.0 * phase
+            } else {
+                3.0 - 4.0 * phase
+            }
+        }
+        BoundaryShape::Square => {
+            if phase < 0.5 {
+                -1.0
+            } else {
+                1.0
+            }
+        }
+        // Reach the positive rail at the last interior boundary, then return
+        // to the shared negative seam over the final segment.
+        BoundaryShape::Sawtooth => -1.0 + 2.0 * (boundary % count) as f32 / (count - 1) as f32,
+    };
+    let scaled = value * 100.0;
+    ((if scaled < 0.0 {
+        scaled - 0.5
+    } else {
+        scaled + 0.5
+    }) as i16)
+        .clamp(-100, 100)
+}
 #[cfg(test)]
 const TWIDDLES: usize = BANK_BLOCKS + 2;
 
