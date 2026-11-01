@@ -60,7 +60,21 @@ Zero Warp Amount retains the original equal-width geometry.
 Equal start/end levels produce a flat segment only at Curve 0; nonzero Curve can
 create humps and folded lobes between equal endpoints. The curve is quadratic
 Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curve
-±100. Both endpoints remain exact. Folding is continuous reflection, not clipping.
+±100 at the default Fold Limit of 2. Both endpoints remain exact. Folding is
+continuous reflection, not clipping.
+
+Fold Limit is a global 0–10 parameter (default 2) on the Oscillator page.
+At zero, Curve still bends the segment using a quadratic Bezier control point
+bounded by the global amplitude rails; it introduces no folds or hard clipping.
+At limits 1–10, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
+so each sampled curve value needs no more than the allowed number of reflections
+to return inside the rails. The value is a maximum, not a forced fold count;
+Curve zero remains linear at every setting. Default 2 preserves the previous
+curve arithmetic exactly. High limits can create detail too fine for the
+256-sample audio tables to reproduce faithfully. Overall smoothing and final
+anti-alias filtering still follow the curve/folding stage. Changing Fold Limit
+rebuilds the waveform through the existing chunked, crossfaded path, without
+adding FFTs or waveform buffers. Shape triggers leave Fold Limit unchanged.
 
 The footer is always visible at y=50–63, matching Window Comparator's reserved
 area. The custom display contains global values, the graph and help footer. The draw
@@ -85,7 +99,7 @@ zero it reads a separate creative-smoothing table, preserving the boundary level
 ## Parameters and routing
 
 Oscillator page: Pitch (MIDI note number, default A3/220 Hz), Fine tune in cents,
-Smoothing, Level (default 50%, up to nominal ±5 V at 100%), eight shape triggers,
+Smoothing, Fold Limit, Level (default 50%, up to nominal ±5 V at 100%), eight shape triggers,
 Warp Position and Warp Amount. The warp controls are ordinary modulatable host parameters.
 
 - Randomize All replaces every boundary level and segment curve with
@@ -250,6 +264,8 @@ Boundaries, Randomize Curves, and Zero Curves are appended after the warp
 parameters, preserving all earlier indices and defaulting to zero.
 The four waveform-boundary triggers are appended after Zero Curves, again
 preserving earlier indices and defaulting to zero.
+Fold Limit is appended after the waveform-boundary triggers, preserving all
+earlier parameter indices and defaulting to the previous folding range of 2.
 Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
 presets stored a raw 0–100 percentage value; those warp position values now use the
 new 0–255 units and may need readjustment.

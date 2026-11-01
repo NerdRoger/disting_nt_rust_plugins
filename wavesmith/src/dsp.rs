@@ -6,6 +6,8 @@
 pub const SIZE: usize = 256;
 pub const CENTROID_MAX: i16 = 255;
 pub const CENTROID_DEFAULT: i16 = 128;
+pub const MAX_FOLDS: i16 = 10;
+pub const DEFAULT_FOLD_LIMIT: i16 = 2;
 pub const DEFAULT_TABLES: usize = 6;
 pub const MAX_TABLES: usize = 20;
 #[cfg(test)]
@@ -135,6 +137,7 @@ pub struct Wave {
     pub smoothing: i16,
     pub centroid: i16,
     pub strength: i16,
+    pub fold_limit: i16,
     pub boundaries: [i16; MAX_SEGMENTS + 1],
     pub curves: [i16; MAX_SEGMENTS],
 }
@@ -147,6 +150,7 @@ impl Wave {
             smoothing: 0,
             centroid: CENTROID_DEFAULT,
             strength: 0,
+            fold_limit: DEFAULT_FOLD_LIMIT,
             boundaries: [0; MAX_SEGMENTS + 1],
             curves: [0; MAX_SEGMENTS],
         };
@@ -245,23 +249,41 @@ impl Wave {
         if t == 1.0 {
             return end;
         }
-        // Quadratic Bezier: the control point moves above/below the midpoint.
-        // The bow is zero at both boundaries and reaches +/-4 at the midpoint
-        // at Curve +/-100. Fold only at the whole waveform's +/-1 rails.
         let bend = self.curves[index.min(MAX_SEGMENTS - 1)].clamp(-100, 100) as f32 * 0.01;
-        let value = start + (end - start) * t + 16.0 * bend * t * (1.0 - t);
-        fold(value)
+        let linear = start + (end - start) * t;
+        if bend == 0.0 {
+            return linear;
+        }
+        let folds = self.fold_limit.clamp(0, MAX_FOLDS) as usize;
+        if folds == 0 {
+            // A bounded quadratic Bezier control point keeps curvature active
+            // without overshooting either global rail or introducing clipping.
+            let midpoint = (start + end) * 0.5;
+            let headroom = if bend > 0.0 {
+                1.0 - midpoint
+            } else {
+                1.0 + midpoint
+            };
+            return linear + 2.0 * bend * headroom * t * (1.0 - t);
+        }
+        // Limit the unfolded excursion to +/- (1 + 2*folds), so every sample
+        // returns to the rails within the allowed reflection count. At 2 this
+        // is the original +/-4 midpoint bow and identical curve arithmetic.
+        let value = linear + (8.0 * folds as f32) * bend * t * (1.0 - t);
+        fold(value, folds)
     }
 }
 
-// The anchored curve can reach at most +/-5. Two reflections are sufficient;
-// no remainder, clipping, allocation, or unbounded loop is needed.
-fn fold(mut value: f32) -> f32 {
-    for _ in 0..2 {
+// Excursion is bounded before reflection; never truncate an out-of-range
+// waveform or clip its peaks. Stop early when no further reflection is needed.
+fn fold(mut value: f32, limit: usize) -> f32 {
+    for _ in 0..limit {
         if value > 1.0 {
             value = 2.0 - value;
         } else if value < -1.0 {
             value = -2.0 - value;
+        } else {
+            break;
         }
     }
     value

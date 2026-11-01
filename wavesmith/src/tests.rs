@@ -56,7 +56,7 @@ impl Instance {
                 itc: 0,
             };
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
-            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 10);
+            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 11);
             assert!(
                 req.sram
                     < (dsp::blocks(tables as usize) * core::mem::size_of::<dsp::Block>() + 8000)
@@ -219,6 +219,12 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
             assert_eq!(references[seam_parameter(n as usize)], 2);
             assert_eq!(references[randomize_parameter(n as usize)], 1);
+            let fold = fold_limit_parameter(n as usize);
+            assert_eq!(fold, randomize_parameter(n as usize) + 10);
+            assert_eq!(references[fold], 1);
+            let d = *(*instance.base).parameters.add(fold);
+            assert_eq!(CStr::from_ptr(d.name), c"Fold Limit");
+            assert_eq!((d.min, d.max, d.default, d.unit), (0, 10, 2, UNIT_NONE));
             for (index, name) in shape_triggers(n as usize).into_iter().zip([
                 c"Randomize All",
                 c"Randomize Boundaries",
@@ -311,6 +317,7 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
             instance.change(SMOOTHING, 43);
             instance.change(centroid_parameter(n), 94);
             instance.change(strength_parameter(n), -68);
+            instance.change(fold_limit_parameter(n), 7);
             let mut boundaries = std::vec![seam_parameter(n)];
             boundaries.extend((1..n).map(boundary_parameter));
             let curves: Vec<_> = (0..n).map(|segment| curve_parameter(n, segment)).collect();

@@ -499,6 +499,114 @@ fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
 }
 
 #[test]
+fn fold_limit_controls_excursion_and_preserves_bounded_curves_and_anchors() {
+    let mut wave = Wave::new(3);
+    for limit in 0..=MAX_FOLDS {
+        wave.fold_limit = limit;
+        for start in [-100, -40, 0, 45, 100] {
+            for end in [-100, -40, 0, 45, 100] {
+                wave.boundaries[1] = start;
+                wave.boundaries[2] = end;
+                for curve in [-100, -75, -25, 0, 25, 75, 100] {
+                    wave.curves[1] = curve;
+                    assert_eq!(wave.segment_sample(1, 0.0), wave.boundary_level(1));
+                    assert_eq!(wave.segment_sample(1, 1.0), wave.boundary_level(2));
+                    for i in 1..256 {
+                        let t = i as f32 / 256.0;
+                        let a = wave.boundary_level(1);
+                        let b = wave.boundary_level(2);
+                        let bend = curve as f32 * 0.01;
+                        let actual = wave.segment_sample(1, t);
+                        assert!(actual.is_finite() && (-1.000001..=1.000001).contains(&actual));
+                        let expected = if limit == 0 {
+                            let middle = (a + b) * 0.5;
+                            let control = middle
+                                + bend
+                                    * if bend >= 0.0 {
+                                        1.0 - middle
+                                    } else {
+                                        1.0 + middle
+                                    };
+                            (1.0 - t) * (1.0 - t) * a + 2.0 * (1.0 - t) * t * control + t * t * b
+                        } else {
+                            let mut value =
+                                a + (b - a) * t + (8.0 * limit as f32) * bend * t * (1.0 - t);
+                            let mut reflections = 0;
+                            while value > 1.0 || value < -1.0 {
+                                value = if value > 1.0 {
+                                    2.0 - value
+                                } else {
+                                    -2.0 - value
+                                };
+                                reflections += 1;
+                                assert!(reflections <= limit);
+                            }
+                            value
+                        };
+                        assert!((actual - expected).abs() < 0.000002);
+                        if limit == DEFAULT_FOLD_LIMIT {
+                            let mut legacy = a + (b - a) * t + 16.0 * bend * t * (1.0 - t);
+                            for _ in 0..2 {
+                                if legacy > 1.0 {
+                                    legacy = 2.0 - legacy;
+                                } else if legacy < -1.0 {
+                                    legacy = -2.0 - legacy;
+                                }
+                            }
+                            assert_eq!(actual.to_bits(), legacy.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        if limit > 0 {
+            wave.boundaries[1] = 100;
+            wave.boundaries[2] = 100;
+            wave.curves[1] = 100;
+            assert_eq!(
+                wave.segment_sample(1, 0.5),
+                if limit % 2 == 0 { 1.0 } else { -1.0 }
+            );
+        }
+    }
+    wave.fold_limit = 0;
+    wave.boundaries[1] = 0;
+    wave.boundaries[2] = 0;
+    wave.curves[1] = 100;
+    assert_eq!(wave.segment_sample(1, 0.5), 0.5);
+}
+
+#[test]
+fn changing_fold_limit_rebuilds_the_audio_and_editor_without_changing_other_shape_values() {
+    let mut engine = Engine::with_tables(8, 48000, 1);
+    let mut storage = [Block::ZERO; blocks(1)];
+    let mut wave = Wave::new(8);
+    wave.curves.fill(73);
+    let mut previous = None;
+    for limit in [0, 1, 2, 5, 10, 0] {
+        wave.fold_limit = limit;
+        finish_build(&mut engine, &mut storage, wave, 220.0);
+        let actual = read_table(&engine, &storage, engine.active * 2);
+        for (i, value) in actual.iter().enumerate() {
+            let phase = i as f32 / SIZE as f32;
+            assert!((value.re - wave.sample(phase)).abs() < 0.00001);
+            assert_eq!(
+                engine.editor_phase_sample(&storage, phase),
+                wave.sample(phase)
+            );
+        }
+        if let Some(before) = previous {
+            assert!(actual
+                .iter()
+                .zip(&before)
+                .any(|(a, b): (&Complex, &Complex)| (a.re - b.re).abs() > 0.01));
+        }
+        previous = Some(actual);
+        assert_eq!(engine.waves[engine.active], wave);
+    }
+}
+
+#[test]
 fn curve_bows_past_segment_endpoints_and_folds_only_at_global_limits() {
     let mut wave = Wave::new(3);
     wave.boundaries[1] = 20;

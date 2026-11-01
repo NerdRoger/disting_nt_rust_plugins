@@ -66,6 +66,9 @@ const fn randomize_curves_parameter(n: usize) -> usize {
 const fn zero_curves_parameter(n: usize) -> usize {
     randomize_parameter(n) + 5
 }
+const fn fold_limit_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 10
+}
 
 fn shape_triggers(n: usize) -> [usize; 8] {
     [
@@ -109,6 +112,9 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
         .unwrap_or(dsp::CENTROID_DEFAULT)
         .clamp(0, dsp::CENTROID_MAX);
     wave.strength = value(strength_parameter(n)).unwrap_or(0).clamp(-100, 100);
+    wave.fold_limit = value(fold_limit_parameter(n))
+        .unwrap_or(dsp::DEFAULT_FOLD_LIMIT)
+        .clamp(0, dsp::MAX_FOLDS);
     for i in 1..n.min(dsp::MAX_SEGMENTS + 1) {
         wave.boundaries[i] = value(boundary_parameter(i)).unwrap_or(0).clamp(-100, 100);
     }
@@ -239,9 +245,9 @@ impl Plugin for Wavesmith {
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 10,
+            parameters: GLOBALS + n * 2 + 11,
             pages: 3,
-            page_indices: GLOBALS + n * 2 + 11,
+            page_indices: GLOBALS + n * 2 + 12,
             voices: dsp::blocks(table_count(specs)?),
         })
     }
@@ -288,6 +294,7 @@ impl Plugin for Wavesmith {
                 PITCH as u8,
                 FINE as u8,
                 SMOOTHING as u8,
+                fold_limit_parameter(n) as u8,
                 LEVEL as u8,
                 randomize_parameter(n) as u8,
                 randomize_boundaries_parameter(n) as u8,
@@ -348,6 +355,16 @@ impl Plugin for Wavesmith {
         metadata.set_parameter(
             strength_parameter(n),
             definition(c"Warp Amount", -100, 100, 0, UNIT_PERCENT)?,
+        )?;
+        metadata.set_parameter(
+            fold_limit_parameter(n),
+            definition(
+                c"Fold Limit",
+                0,
+                dsp::MAX_FOLDS,
+                dsp::DEFAULT_FOLD_LIMIT,
+                UNIT_NONE,
+            )?,
         )?;
         // Keep the page count fixed, including at the maximum segment count.
         // Walk the shape in time order, repeating Boundary 00 at the end.
