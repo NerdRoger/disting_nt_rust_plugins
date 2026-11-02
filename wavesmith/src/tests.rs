@@ -41,12 +41,8 @@ struct Instance {
 
 impl Instance {
     fn new(n: i32) -> Self {
-        Self::with_tables(n, dsp::DEFAULT_TABLES as i32)
-    }
-
-    fn with_tables(n: i32, tables: i32) -> Self {
         unsafe {
-            let specs = [n, tables];
+            let specs = [n];
             let f = factory();
             let mut req = NtAlgorithmRequirements {
                 num_parameters: 0,
@@ -56,15 +52,18 @@ impl Instance {
                 itc: 0,
             };
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
-            assert_eq!(req.num_parameters as usize, GLOBALS + n as usize * 2 + 11);
+            assert_eq!(
+                req.num_parameters as usize,
+                GLOBALS + n as usize * 2 + 12 + (VOICE_COUNT - 1) * 3
+            );
             assert!(
                 req.sram
-                    < (dsp::blocks(tables as usize) * core::mem::size_of::<dsp::Block>() + 8000)
+                    < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>() + 8000)
                         as u32
             );
             assert!(core::mem::size_of::<State>() < 1024);
             let alignment =
-                distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
+                distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&specs)
                     .unwrap();
             let layout = Layout::from_size_align(req.sram as usize, alignment).unwrap();
             let memory = alloc_zeroed(layout);
@@ -97,6 +96,11 @@ impl Instance {
         self.values[p] = value;
         unsafe {
             factory().parameter_changed.unwrap()(self.base, p as i32);
+        }
+    }
+    fn midi(&mut self, status: u8, data1: u8, data2: u8) {
+        unsafe {
+            factory().midi_message.unwrap()(self.base, status, data1, data2);
         }
     }
     fn render(&mut self, samples: &mut [f32]) {
@@ -161,7 +165,10 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
     for n in 2..=32 {
         let instance = Instance::new(n);
         unsafe {
-            assert_eq!((*(*instance.base).parameter_pages).num_pages, 3);
+            assert_eq!(
+                (*(*instance.base).parameter_pages).num_pages as usize,
+                VOICE_COUNT + 2
+            );
             assert_eq!(
                 editor_parameter(n as usize, 0, 0),
                 Some(seam_parameter(n as usize))
@@ -176,11 +183,59 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             let pages = &*(*instance.base).parameter_pages;
             let oscillator_group = (*pages.pages).group;
             let routing_group = (*pages.pages.add(1)).group;
-            let page = &*pages.pages.add(2);
+            let page = &*pages.pages.add(VOICE_COUNT + 1);
             assert_eq!(CStr::from_ptr(page.name), c"Waveform");
             assert_ne!(page.group, 0);
             assert_ne!(page.group, oscillator_group);
             assert_ne!(page.group, routing_group);
+            for (voice, name) in [c"Voice 1", c"Voice 2", c"Voice 3", c"Voice 4"]
+                .into_iter()
+                .enumerate()
+            {
+                let voice_page = &*pages.pages.add(voice + 1);
+                assert_eq!(CStr::from_ptr(voice_page.name), name);
+                assert_eq!(voice_page.group, routing_group);
+                let indices =
+                    core::slice::from_raw_parts(voice_page.params, voice_page.num_params as usize);
+                let expected = voice_parameters(n as usize, voice).map(|p| p as u8);
+                assert_eq!(indices, &expected);
+                let [cv, output, mode] = voice_parameters(n as usize, voice);
+                for (parameter, name) in [
+                    (cv, c"Pitch CV"),
+                    (output, c"Output"),
+                    (mode, c"Output mode"),
+                ] {
+                    let d = *(*instance.base).parameters.add(parameter);
+                    assert_eq!(d.min, 0);
+                    assert_eq!(CStr::from_ptr(d.name), name);
+                    let mut prefix = [0 as c_char; PARAMETER_UI_PREFIX_SIZE];
+                    assert_eq!(
+                        factory().parameter_ui_prefix.unwrap()(
+                            instance.base,
+                            parameter as i32,
+                            prefix.as_mut_ptr()
+                        ),
+                        3
+                    );
+                    assert_eq!(
+                        CStr::from_ptr(prefix.as_ptr()).to_bytes(),
+                        std::format!("V{}:", voice + 1).as_bytes()
+                    );
+                }
+                let mut prefix = [0 as c_char; PARAMETER_UI_PREFIX_SIZE];
+                assert_eq!(
+                    factory().parameter_ui_prefix.unwrap()(
+                        instance.base,
+                        PITCH as i32,
+                        prefix.as_mut_ptr()
+                    ),
+                    0
+                );
+                assert_eq!(CStr::from_ptr(prefix.as_ptr()), c"");
+                assert_eq!(instance.values[output], if voice == 0 { 13 } else { 0 });
+                assert_eq!(instance.values[cv], 0);
+                assert_eq!(instance.values[mode], 0);
+            }
             assert_eq!(page.num_params as usize, n as usize * 2 + 1);
             let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
             assert_eq!(rows[0] as usize, seam_parameter(n as usize));
@@ -223,6 +278,14 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
             assert_eq!(references[seam_parameter(n as usize)], 2);
             assert_eq!(references[randomize_parameter(n as usize)], 1);
+            let midi = midi_channel_parameter(n as usize);
+            assert_eq!(references[midi], 1);
+            assert_eq!(midi, GLOBALS + n as usize * 2 + 11 + (VOICE_COUNT - 1) * 3);
+            let d = *(*instance.base).parameters.add(midi);
+            assert_eq!((d.min, d.max, d.default, d.unit), (0, 17, 0, UNIT_ENUM));
+            assert_eq!(CStr::from_ptr(*d.enum_strings), c"Off");
+            assert_eq!(CStr::from_ptr(*d.enum_strings.add(1)), c"All");
+            assert_eq!(CStr::from_ptr(*d.enum_strings.add(17)), c"16");
             let fold = fold_limit_parameter(n as usize);
             assert_eq!(fold, randomize_parameter(n as usize) + 10);
             assert_eq!(references[fold], 1);
@@ -268,48 +331,28 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
 }
 
 #[test]
-fn table_specification_controls_real_allocations_for_every_supported_count() {
-    let mut previous_size = 0;
-    for tables in 1..=20 {
-        for segments in [2, 32] {
-            let mut instance = Instance::with_tables(segments, tables);
-            assert_eq!(
-                Wavesmith::configuration(&[segments, tables])
-                    .unwrap()
-                    .voices,
-                dsp::blocks(tables as usize)
-            );
-            assert_eq!(unsafe { factory() }.num_specifications, 2);
-            let mut samples = [0.0; LAST_BUS * 64];
-            instance.change(PITCH, 105);
-            for smoothing in [0, 100] {
-                instance.change(SMOOTHING, smoothing);
-                // At 20 tables and 32 segments the split rebuild takes 64
-                // callbacks, plus the five-millisecond publication fade.
-                for _ in 0..80 {
-                    instance.render(&mut samples);
-                }
-                assert!(samples.iter().all(|v| v.is_finite()));
-                assert!(samples.iter().any(|v| v.abs() > 0.001));
-                instance.draw();
+fn only_segment_count_is_specified_and_six_tables_are_always_allocated() {
+    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 1);
+    assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Segments");
+    assert_eq!(unsafe { factory() }.num_specifications, 1);
+    for segments in 2..=32 {
+        let mut instance = Instance::new(segments);
+        assert_eq!(
+            Wavesmith::configuration(&[segments]).unwrap().voices,
+            dsp::blocks(dsp::DEFAULT_TABLES)
+        );
+        let mut samples = [0.0; LAST_BUS * 24];
+        instance.change(PITCH, 105);
+        for smoothing in [0, 100] {
+            instance.change(SMOOTHING, smoothing);
+            for _ in 0..80 {
+                instance.render(&mut samples);
             }
-            if segments == 32 {
-                if tables > 1 {
-                    assert_eq!(
-                        instance.layout.size() - previous_size,
-                        core::mem::size_of::<dsp::Block>()
-                    );
-                }
-                previous_size = instance.layout.size();
-            }
+            assert!(samples.iter().all(|v| v.is_finite()));
+            assert!(samples.iter().any(|v| v.abs() > 0.001));
+            instance.draw();
         }
     }
-    for tables in [-1, 0, 21] {
-        assert!(Wavesmith::configuration(&[8, tables]).is_none());
-        assert!(Wavesmith::create(&[8, tables], 48000).is_none());
-    }
-    assert!(Wavesmith::configuration(&[8]).is_none());
-    assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 6);
 }
 
 #[test]
@@ -529,9 +572,7 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
                 instance.draw();
                 TRACE_LINES.with(|lines| {
                     let lines = lines.borrow();
-                    for trace in lines.chunks_exact(lines.len() / 2) {
-                        assert_eq!(trace.first().unwrap().1, trace.last().unwrap().3);
-                    }
+                    assert_eq!(lines.first().unwrap().1, lines.last().unwrap().3);
                 });
             }
         }
@@ -597,6 +638,250 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
 }
 
 #[test]
+fn midi_gates_four_voices_ignores_cv_and_manual_pitch_and_restores_cv_when_off() {
+    const FRAMES: usize = 24;
+    let mut instance = Instance::new(8);
+    for voice in 0..VOICE_COUNT {
+        let [cv, output, mode] = voice_parameters(8, voice);
+        instance.change(cv, voice as i16 + 1);
+        instance.change(output, 13 + voice as i16);
+        instance.change(mode, 1);
+    }
+    instance.change(PITCH, 0);
+    instance.change(midi_channel_parameter(8), 2); // Channel 1.
+    let mut samples = [0.0; LAST_BUS * FRAMES];
+    let ticks = dsp::oscillator_tick_count();
+    for _ in 0..60 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    assert!(samples.iter().all(|&value| value == 0.0));
+    instance.midi(0x91, 60, 100); // Wrong channel.
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    for note in [60, 64, 67, 71] {
+        instance.midi(0x90, note, 100);
+    }
+    let mut crossings = [0usize; VOICE_COUNT];
+    let mut last = [0.0; VOICE_COUNT];
+    for block in 0..220 {
+        // Deliberately unrelated CV; neither this nor manual Pitch affects MIDI.
+        for voice in 0..VOICE_COUNT {
+            samples[voice * FRAMES..(voice + 1) * FRAMES].fill(if block % 2 == 0 {
+                8.0
+            } else {
+                -8.0
+            });
+        }
+        if block == 110 {
+            instance.change(PITCH, 127);
+        }
+        instance.render(&mut samples);
+        if block >= 20 {
+            for voice in 0..VOICE_COUNT {
+                for &sample in &samples[(12 + voice) * FRAMES..(13 + voice) * FRAMES] {
+                    if last[voice] < 0.0 && sample >= 0.0 {
+                        crossings[voice] += 1;
+                    }
+                    last[voice] = sample;
+                }
+            }
+        }
+    }
+    for (voice, frequency) in [261.6256f32, 329.6276, 391.9954, 493.8833]
+        .into_iter()
+        .enumerate()
+    {
+        assert!((crossings[voice] as f32 - frequency * 4800.0 / 48000.0).abs() < 2.0);
+    }
+    instance.midi(0x90, 74, 100); // Steals oldest voice (Voice 1).
+    instance.midi(0x80, 60, 0); // Old key release must not release replacement.
+    for _ in 0..30 {
+        instance.render(&mut samples);
+    }
+    let ticks = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES * VOICE_COUNT);
+    for note in [74, 64, 67, 71] {
+        instance.midi(0x90, note, 0);
+    }
+    for _ in 0..30 {
+        instance.render(&mut samples);
+    }
+    let ticks = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    assert!(samples[12 * FRAMES..16 * FRAMES]
+        .iter()
+        .all(|&value| value == 0.0));
+    instance.change(midi_channel_parameter(8), 0);
+    instance.change(PITCH, 57);
+    samples.fill(0.0);
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES * VOICE_COUNT);
+    assert!(samples[12 * FRAMES..16 * FRAMES]
+        .iter()
+        .any(|&value| value.abs() > 0.00001));
+}
+
+#[test]
+fn midi_disabled_outputs_are_excluded_from_allocation_and_do_not_resume_old_notes() {
+    const FRAMES: usize = 24;
+    let mut instance = Instance::new(8);
+    instance.change(OUTPUT_MODE, 1);
+    instance.change(midi_channel_parameter(8), 1); // All channels.
+    let mut samples = [0.0; LAST_BUS * FRAMES];
+    for _ in 0..60 {
+        instance.render(&mut samples);
+    }
+    for note in [60, 64, 67, 71, 74] {
+        instance.midi(0x90, note, 100);
+    }
+    for _ in 0..30 {
+        instance.render(&mut samples);
+    }
+    let ticks = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
+    instance.change(OUTPUT, 0);
+    let ticks = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    instance.change(OUTPUT, 13);
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    assert!(samples[12 * FRAMES..13 * FRAMES]
+        .iter()
+        .all(|&value| value == 0.0));
+    instance.midi(0x90, 67, 100);
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
+}
+
+#[test]
+fn four_voices_follow_independent_cv_pitches_and_none_output_skips_playback() {
+    const FRAMES: usize = 24;
+    let mut instance = Instance::new(32);
+    let mut samples = [0.0; LAST_BUS * FRAMES];
+    let ticks = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
+    for voice in 0..VOICE_COUNT {
+        let [cv, output, mode] = voice_parameters(32, voice);
+        instance.change(cv, voice as i16 + 1);
+        instance.change(output, 13 + voice as i16);
+        instance.change(mode, 1);
+    }
+    let mut crossings = [0usize; VOICE_COUNT];
+    let mut last = [0.0; VOICE_COUNT];
+    for block in 0..160 {
+        for voice in 0..VOICE_COUNT {
+            samples[voice * FRAMES..(voice + 1) * FRAMES].fill(voice as f32);
+        }
+        let ticks = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - ticks, VOICE_COUNT * FRAMES);
+        if block >= 60 {
+            for voice in 0..VOICE_COUNT {
+                for &sample in &samples[(12 + voice) * FRAMES..(13 + voice) * FRAMES] {
+                    if last[voice] < 0.0 && sample >= 0.0 {
+                        crossings[voice] += 1;
+                    }
+                    last[voice] = sample;
+                }
+            }
+        }
+    }
+    for (voice, &count) in crossings.iter().enumerate() {
+        let expected = 220.0 * (1usize << voice) as f32 * 2400.0 / 48000.0;
+        assert!(
+            (count as f32 - expected).abs() < 2.0,
+            "voice {voice}: {count} vs {expected}"
+        );
+    }
+    for voice in 0..VOICE_COUNT {
+        instance.change(voice_parameters(32, voice)[1], 0);
+    }
+    instance.change(curve_parameter(32, 0), 73);
+    let ticks = dsp::oscillator_tick_count();
+    for _ in 0..80 {
+        samples.fill(2.5);
+        instance.render(&mut samples);
+        assert!(samples.iter().all(|&value| value == 2.5));
+    }
+    assert_eq!(dsp::oscillator_tick_count(), ticks);
+    let [cv, output, mode] = voice_parameters(32, 2);
+    instance.change(cv, 0);
+    instance.change(output, 15);
+    instance.change(mode, 1);
+    samples.fill(0.0);
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
+    assert!(samples[14 * FRAMES..15 * FRAMES]
+        .iter()
+        .any(|&value| value.abs() > 0.001));
+}
+
+#[test]
+fn voice_pitch_inputs_are_snapshotted_before_outputs_and_none_cv_uses_manual_pitch() {
+    let mut instance = Instance::new(32);
+    let [_, out1, mode1] = voice_parameters(32, 0);
+    let [cv2, out2, mode2] = voice_parameters(32, 1);
+    instance.change(out1, 1);
+    instance.change(mode1, 1);
+    instance.change(cv2, 1);
+    instance.change(out2, 14);
+    instance.change(mode2, 1);
+    let mut samples = [0.0; LAST_BUS * 64];
+    let mut last = [0.0; 2];
+    let mut crossings = [0usize; 2];
+    for block in 0..160 {
+        // Bus 1 is both Voice 2's pitch input and Voice 1's destination.
+        samples[..64].fill(1.0);
+        instance.render(&mut samples);
+        if block >= 60 {
+            for (voice, bus) in [0, 13].into_iter().enumerate() {
+                for &sample in &samples[bus * 64..(bus + 1) * 64] {
+                    if last[voice] < 0.0 && sample >= 0.0 {
+                        crossings[voice] += 1;
+                    }
+                    last[voice] = sample;
+                }
+            }
+        }
+    }
+    for (voice, frequency) in [220.0f32, 440.0].into_iter().enumerate() {
+        assert!((crossings[voice] as f32 - frequency * 6400.0 / 48000.0).abs() < 2.0);
+    }
+}
+
+#[test]
+fn voices_sharing_an_output_mix_after_a_single_replace_clear() {
+    let mut reference: Option<Vec<f32>> = None;
+    for enabled in [1, 2, 4] {
+        let mut instance = Instance::new(8);
+        for voice in 0..enabled {
+            let [_, output, mode] = voice_parameters(8, voice);
+            instance.change(output, 13);
+            instance.change(mode, 1);
+        }
+        let mut samples = [0.0; LAST_BUS * 64];
+        for _ in 0..80 {
+            samples.fill(2.0);
+            instance.render(&mut samples);
+        }
+        let output = samples[12 * 64..13 * 64].to_vec();
+        if let Some(mono) = &reference {
+            for (&actual, &expected) in output.iter().zip(mono) {
+                assert!((actual - expected * enabled as f32).abs() < 0.00001);
+            }
+        } else {
+            reference = Some(output);
+        }
+    }
+}
+
+#[test]
 fn output_modes_routing_pitch_cv_and_live_shape_edits() {
     let mut instance = Instance::new(8);
     instance.change(OUTPUT, 64);
@@ -635,7 +920,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
 }
 
 #[test]
-fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing() {
+fn only_bright_editor_trace_is_drawn_with_or_without_smoothing() {
     let mut instance = Instance::new(7);
     instance.change(curve_parameter(7, 2), 100);
     let mut samples = [0.0; LAST_BUS * 64];
@@ -648,9 +933,8 @@ fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing
         instance.draw();
         TRACE_LINES.with(|lines| {
             let lines = lines.borrow();
-            assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
-            assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
-            assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
+            assert!(lines.len() >= 255 && lines.len() <= 255 + 32);
+            assert!(lines.iter().all(|line| line.4 == 15.0));
             assert!(lines
                 .iter()
                 .any(|line| line.1 != line.1 as i32 as f32 || line.3 != line.3 as i32 as f32));
@@ -670,7 +954,7 @@ fn dim_audio_trace_is_drawn_before_bright_editor_trace_with_or_without_smoothing
 }
 
 #[test]
-fn high_pitch_changes_only_the_dim_audio_overlay() {
+fn pitch_changes_do_not_change_the_displayed_waveform() {
     let mut instance = Instance::new(32);
     instance.change(curve_parameter(32, 0), 100);
     let mut samples = [0.0; LAST_BUS * 64];
@@ -686,13 +970,8 @@ fn high_pitch_changes_only_the_dim_audio_overlay() {
     instance.draw();
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert_eq!(&lines[lines.len() / 2..], &low[low.len() / 2..]);
-        assert_ne!(&lines[..lines.len() / 2], &low[..low.len() / 2]);
-        assert!(lines[..lines.len() / 2]
-            .iter()
-            .zip(&lines[lines.len() / 2..])
-            .any(|(audio, source)| (audio.1 - source.1).abs() > 0.1
-                || (audio.3 - source.3).abs() > 0.1));
+        assert_eq!(*lines, low);
+        assert!(lines.iter().all(|line| line.4 == 15.0));
     });
 }
 
@@ -806,7 +1085,7 @@ fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
         });
         TRACE_LINES.with(|lines| {
             let lines = lines.borrow();
-            let bright = &lines[lines.len() / 2..];
+            let bright = &*lines;
             for i in 1..8 {
                 let x = wave.boundary_position(i) * 255.0;
                 let y = (28.0 - wave.boundary_level(i) * 13.0).clamp(14.0, 42.0);
@@ -1064,9 +1343,8 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15, 15]));
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
-        assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
-        assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
+        assert!(lines.len() >= 255 && lines.len() <= 255 + 32);
+        assert!(lines.iter().all(|line| line.4 == 15.0));
     });
     GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1; 71]));
     SHAPES.with(|shapes| {
@@ -1147,9 +1425,8 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15, 15, 15]));
     TRACE_LINES.with(|lines| {
         let lines = lines.borrow();
-        assert!(lines.len() >= 510 && lines.len() <= 2 * (255 + 32));
-        assert!(lines[..lines.len() / 2].iter().all(|line| line.4 == 4.0));
-        assert!(lines[lines.len() / 2..].iter().all(|line| line.4 == 15.0));
+        assert!(lines.len() >= 255 && lines.len() <= 255 + 32);
+        assert!(lines.iter().all(|line| line.4 == 15.0));
     });
     GRID_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[1; 71]));
     instance.change(segment_parameter(2, 0), -50);

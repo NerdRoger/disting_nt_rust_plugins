@@ -302,57 +302,37 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     }
     // The float-coordinate API antialiases the display line. Retain fractional
     // heights instead of quantizing the curve before handing it to the host.
-    // Complete the dim audio pass first so the bright editor trace is always
-    // in front, even when traces intersect across neighboring segments.
-    for audio in [true, false] {
-        let y = |phase: f32| {
-            let value = if audio {
-                let phase = if phase >= 1.0 {
-                    0
-                } else {
-                    (phase * 4_294_967_296.0) as u32
-                };
-                state.engine.display_sample(memory, phase)
-            } else {
-                state.engine.editor_phase_sample(memory, phase)
-            };
-            (28.0 - value * 13.0).clamp(14.0, 42.0)
-        };
-        for segment in 0..n {
-            let start = source.boundary_position(segment);
-            let end = source.boundary_position(segment + 1);
-            let mut previous_x = start * 255.0;
-            let end_x = end * 255.0;
-            let mut previous_y = y(start);
-            let mut pixel = previous_x as usize + 1;
-            while (pixel as f32) < end_x {
-                let current = y(pixel as f32 / 255.0);
-                canvas.shape_f(
-                    Shape::Line,
-                    previous_x,
-                    previous_y,
-                    pixel as f32,
-                    current,
-                    if audio { 4.0 } else { 15.0 },
-                );
-                previous_x = pixel as f32;
-                previous_y = current;
-                pixel += 1;
-            }
-            // Keep a vertex at each exact boundary, even for segments narrower
-            // than one display pixel. Both passes use identical phase geometry.
+    let y = |phase: f32| {
+        let value = state.engine.editor_phase_sample(memory, phase);
+        (28.0 - value * 13.0).clamp(14.0, 42.0)
+    };
+    for segment in 0..n {
+        let start = source.boundary_position(segment);
+        let end = source.boundary_position(segment + 1);
+        let mut previous_x = start * 255.0;
+        let end_x = end * 255.0;
+        let mut previous_y = y(start);
+        let mut pixel = previous_x as usize + 1;
+        while (pixel as f32) < end_x {
+            let current = y(pixel as f32 / 255.0);
             canvas.shape_f(
                 Shape::Line,
                 previous_x,
                 previous_y,
-                end_x,
-                y(end),
-                if audio { 4.0 } else { 15.0 },
+                pixel as f32,
+                current,
+                15.0,
             );
+            previous_x = pixel as f32;
+            previous_y = current;
+            pixel += 1;
         }
+        // Keep a vertex at each exact boundary, even for segments narrower
+        // than one display pixel.
+        canvas.shape_f(Shape::Line, previous_x, previous_y, end_x, y(end), 15.0);
     }
     if state.ui.mode == EditMode::Warp {
-        // Draw over the traces so the full-brightness core and black margins
+        // Draw over the waveform so the full-brightness core and black margins
         // remain visible. Keep the complete four-pixel marker on screen at either edge.
         let center = source.centroid.clamp(0, dsp::CENTROID_MAX) as i32;
         let marker_left = (center - 1).clamp(0, 252);
@@ -367,7 +347,7 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
         );
     }
     // Full-brightness boundary handles are drawn last so the antialiased
-    // playback line cannot dim their outlines. Their anchor values stay fixed.
+    // waveform line cannot dim their outlines. Their anchor values stay fixed.
     for (x, t) in [(left, 0.0), (right, 1.0)]
         .into_iter()
         .filter(|_| state.ui.mode == EditMode::Segment)

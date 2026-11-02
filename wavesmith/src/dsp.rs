@@ -612,6 +612,85 @@ fn store_table(
     Some(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Oscillator {
+    phase: u32,
+    level: f32,
+    increment: f32,
+    playback_level: usize,
+    playback_blend: f32,
+}
+
+impl Oscillator {
+    pub const fn new() -> Self {
+        Self {
+            phase: 0,
+            level: 0.0,
+            increment: 0.0,
+            playback_level: 0,
+            playback_blend: 0.0,
+        }
+    }
+    pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
+        self.increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+    }
+
+    pub fn tick(
+        &mut self,
+        engine: &Engine,
+        memory: &Memory,
+        frequency: f32,
+        sample_rate: f32,
+        level: f32,
+        frame: usize,
+    ) -> f32 {
+        #[cfg(test)]
+        tests::count_oscillator_tick();
+        let slew = (1000.0 / sample_rate).min(1.0);
+        let target = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+        self.increment += slew * (target - self.increment);
+        (self.playback_level, self.playback_blend) = engine.layout.playback_levels(self.increment);
+        self.level += slew * (level - self.level);
+        // All voices see the same fade time for this audio frame. When a fade
+        // ends within the block, later frames use only the new bank.
+        let fading = engine.fade > 0 && frame < engine.fade;
+        let bank = if engine.fade > 0 && !fading {
+            1 - engine.active
+        } else {
+            engine.active
+        };
+        let old = engine.voice_sample(
+            memory,
+            bank,
+            self.phase,
+            self.playback_level,
+            self.playback_blend,
+        );
+        let sample = if fading {
+            let blend = 1.0 - (engine.fade - frame) as f32 / engine.fade_length as f32;
+            let new = engine.voice_sample(
+                memory,
+                1 - engine.active,
+                self.phase,
+                self.playback_level,
+                self.playback_blend,
+            );
+            old + (new - old) * blend
+        } else {
+            old
+        };
+        self.phase = self
+            .phase
+            .wrapping_add((self.increment * 4_294_967_296.0) as u32);
+        sample * self.level * 5.0
+    }
+}
+
+#[cfg(test)]
+pub fn oscillator_tick_count() -> usize {
+    tests::oscillator_tick_count()
+}
+
 #[derive(Clone, Copy)]
 pub struct Engine {
     layout: TableLayout,
@@ -626,21 +705,25 @@ pub struct Engine {
     sample_segment: usize,
     fade: usize,
     fade_length: usize,
+    #[cfg(test)]
     phase: u32,
+    #[cfg(test)]
     level: f32,
+    #[cfg(test)]
     increment: f32,
     ready: [bool; 2],
+    #[cfg(test)]
     playback_level: usize,
+    #[cfg(test)]
     playback_blend: f32,
 }
 
 impl Engine {
-    #[cfg(test)]
     pub fn new(count: usize, sample_rate: u32) -> Self {
         Self::with_tables(count, sample_rate, DEFAULT_TABLES)
     }
 
-    pub fn with_tables(count: usize, sample_rate: u32, tables: usize) -> Self {
+    fn with_tables(count: usize, sample_rate: u32, tables: usize) -> Self {
         let wave = Wave::new(count);
         Self {
             layout: TableLayout::new(tables),
@@ -655,11 +738,16 @@ impl Engine {
             sample_segment: 0,
             fade: 0,
             fade_length: (sample_rate as usize / 200).max(1),
+            #[cfg(test)]
             phase: 0,
+            #[cfg(test)]
             level: 0.0,
+            #[cfg(test)]
             increment: 0.0,
             ready: [false; 2],
+            #[cfg(test)]
             playback_level: 0,
+            #[cfg(test)]
             playback_blend: 0.0,
         }
     }
@@ -950,17 +1038,53 @@ impl Engine {
         left + (right - left) * fraction
     }
 
+    #[cfg(test)]
     fn wave_sample(&self, memory: &Memory, bank: usize, phase: u32) -> f32 {
+        self.voice_sample(
+            memory,
+            bank,
+            phase,
+            self.playback_level,
+            self.playback_blend,
+        )
+    }
+
+    fn voice_sample(
+        &self,
+        memory: &Memory,
+        bank: usize,
+        phase: u32,
+        playback_level: usize,
+        playback_blend: f32,
+    ) -> f32 {
         if !self.ready[bank & 1] {
             return 0.0;
         }
-        let index = (bank & 1) * (self.layout.count + 1) + self.playback_level;
+        let index = (bank & 1) * (self.layout.count + 1) + playback_level;
         let rich = self.lookup(memory, index, phase);
-        if self.playback_blend == 0.0 || self.playback_level + 1 == self.layout.count {
+        if playback_blend == 0.0 || playback_level + 1 == self.layout.count {
             return rich;
         }
-        rich + (self.lookup(memory, index + 1, phase) - rich) * self.playback_blend
+        rich + (self.lookup(memory, index + 1, phase) - rich) * playback_blend
     }
+    #[cfg(test)]
+    pub fn show_voice(&mut self, voice: &Oscillator) {
+        self.playback_level = voice.playback_level;
+        self.playback_blend = voice.playback_blend;
+    }
+
+    pub fn advance_time(&mut self, frames: usize) {
+        if self.fade > 0 {
+            if frames >= self.fade {
+                self.fade = 0;
+                self.active = 1 - self.active;
+            } else {
+                self.fade -= frames;
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn tick(&mut self, memory: &Memory, frequency: f32, sample_rate: f32, level: f32) -> f32 {
         // Slew tuning and gain over about one millisecond; phase never resets.
         let slew = (1000.0 / sample_rate).min(1.0);
@@ -1064,6 +1188,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     pub fn display_sample(&self, memory: &Memory, phase: u32) -> f32 {
         if self.fade > 0 {
             let blend = 1.0 - self.fade as f32 / self.fade_length as f32;

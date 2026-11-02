@@ -3,14 +3,15 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 mod dsp;
+mod midi;
 mod ui;
 
-use core::ffi::CStr;
+use core::ffi::{c_char, CStr};
 use distingnt_api::api::{
     audio::AudioBuses,
     drawing::Canvas,
-    metadata::Definition,
-    parameters::{Audio, Ui},
+    metadata::{Definition, EnumStrings},
+    parameters::{Audio, ReadOnly, Ui},
     plugin::{Configuration, Context, Metadata, Plugin, Specification},
     state_memory::Sram,
 };
@@ -24,15 +25,29 @@ const PITCH_CV: usize = 4;
 const SMOOTHING: usize = 5;
 const LEVEL: usize = 6;
 const GLOBALS: usize = 7;
+const VOICE_COUNT: usize = 4;
+static MIDI_CHANNELS: EnumStrings<18> = EnumStrings::new([
+    c"Off", c"All", c"1", c"2", c"3", c"4", c"5", c"6", c"7", c"8", c"9", c"10", c"11", c"12",
+    c"13", c"14", c"15", c"16",
+]);
+fn midi_channel_parameter(n: usize) -> usize {
+    randomize_parameter(n) + 11 + (VOICE_COUNT - 1) * 3
+}
+
+// Keep Voice 1 at its existing parameter indices for preset compatibility.
+// Additional voices append three parameters each, in CV/output/mode order.
+fn voice_parameters(n: usize, voice: usize) -> [usize; 3] {
+    if voice == 0 {
+        [PITCH_CV, OUTPUT, OUTPUT_MODE]
+    } else {
+        let first = randomize_parameter(n) + 11 + (voice - 1) * 3;
+        [first, first + 1, first + 2]
+    }
+}
 
 fn count(specs: &[i32]) -> Option<usize> {
     let value = usize::try_from(*specs.first()?).ok()?;
     (2..=32).contains(&value).then_some(value)
-}
-
-fn table_count(specs: &[i32]) -> Option<usize> {
-    let value = usize::try_from(*specs.get(1)?).ok()?;
-    (1..=dsp::MAX_TABLES).contains(&value).then_some(value)
 }
 
 const fn boundary_parameter(boundary: usize) -> usize {
@@ -127,6 +142,8 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
 #[derive(Clone, Copy)]
 struct State {
     engine: dsp::Engine,
+    oscillators: [dsp::Oscillator; VOICE_COUNT],
+    midi: midi::MidiState,
     count: usize,
     sample_rate: f32,
     ui: ui::UiState,
@@ -223,32 +240,25 @@ impl Plugin for Wavesmith {
     const NAME: &'static CStr = c"Wavesmith";
     const DESCRIPTION: &'static CStr = c"Sculpt a live oscillator from curved segments";
     const TAGS: u32 = TAG_INSTRUMENT;
-    const SPECIFICATIONS: &'static [Specification] = &[
-        Specification {
-            name: c"Segments",
-            min: 2,
-            max: 32,
-            default: 8,
-            kind: TYPE_GENERIC,
-        },
-        Specification {
-            name: c"Anti-alias tables",
-            min: 1,
-            max: dsp::MAX_TABLES as i32,
-            default: dsp::DEFAULT_TABLES as i32,
-            kind: TYPE_GENERIC,
-        },
-    ];
+    const SPECIFICATIONS: &'static [Specification] = &[Specification {
+        name: c"Segments",
+        min: 2,
+        max: 32,
+        default: 8,
+        kind: TYPE_GENERIC,
+    }];
     const CUSTOM_UI: u32 = POT_L | POT_C | POT_R | ENCODER_L | ENCODER_R | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
+    const MIDI: bool = true;
+    const PARAMETER_TEXT: bool = true;
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 11,
-            pages: 3,
-            page_indices: GLOBALS + n * 2 + 12,
-            voices: dsp::blocks(table_count(specs)?),
+            parameters: GLOBALS + n * 2 + 12 + (VOICE_COUNT - 1) * 3,
+            pages: VOICE_COUNT + 2,
+            page_indices: GLOBALS + n * 2 + 13 + (VOICE_COUNT - 1) * 3,
+            voices: dsp::blocks(dsp::DEFAULT_TABLES),
         })
     }
 
@@ -258,7 +268,9 @@ impl Plugin for Wavesmith {
             return None;
         }
         Some(State {
-            engine: dsp::Engine::with_tables(n, rate, table_count(specs)?),
+            engine: dsp::Engine::new(n, rate),
+            oscillators: [dsp::Oscillator::new(); VOICE_COUNT],
+            midi: midi::MidiState::new(rate),
             count: n,
             sample_rate: rate as f32,
             ui: ui::UiState::new(),
@@ -274,11 +286,11 @@ impl Plugin for Wavesmith {
     fn metadata(specs: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
         let n = count(specs)?;
         for (i, d) in [
-            definition(c"Output", 1, LAST_BUS as i16, 13, UNIT_AUDIO_OUTPUT),
+            definition(c"Output", 0, LAST_BUS as i16, 13, UNIT_AUDIO_OUTPUT),
             definition(c"Output mode", 0, 1, 0, UNIT_OUTPUT_MODE),
             definition(c"Pitch", 0, 127, 57, UNIT_MIDI_NOTE),
             definition(c"Fine tune", -100, 100, 0, UNIT_CENTS),
-            definition(c"Pitch CV (1V/oct)", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT),
+            definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT),
             definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT),
             definition(c"Level", 0, 100, 50, UNIT_PERCENT),
         ]
@@ -291,6 +303,7 @@ impl Plugin for Wavesmith {
             c"Oscillator",
             1,
             &[
+                midi_channel_parameter(n) as u8,
                 PITCH as u8,
                 FINE as u8,
                 SMOOTHING as u8,
@@ -308,11 +321,26 @@ impl Plugin for Wavesmith {
                 strength_parameter(n) as u8,
             ],
         )?;
-        metadata.add_page(
-            c"Routing",
-            2,
-            &[OUTPUT as u8, OUTPUT_MODE as u8, PITCH_CV as u8],
-        )?;
+        for (voice, page) in [c"Voice 1", c"Voice 2", c"Voice 3", c"Voice 4"]
+            .into_iter()
+            .enumerate()
+        {
+            let [cv, output, mode] = voice_parameters(n, voice);
+            if voice > 0 {
+                metadata.set_parameter(
+                    cv,
+                    definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT)?,
+                )?;
+                metadata.set_parameter(
+                    output,
+                    definition(c"Output", 0, LAST_BUS as i16, 0, UNIT_AUDIO_OUTPUT)?,
+                )?;
+                metadata
+                    .set_parameter(mode, definition(c"Output mode", 0, 1, 0, UNIT_OUTPUT_MODE)?)?;
+            }
+            // Matching groups retain the selected parameter row between voices.
+            metadata.add_page(page, 2, &[cv as u8, output as u8, mode as u8])?;
+        }
         for (i, name) in BOUNDARY_NAMES.iter().enumerate().take(n - 1) {
             metadata.set_parameter(
                 boundary_parameter(i + 1),
@@ -366,6 +394,18 @@ impl Plugin for Wavesmith {
                 UNIT_NONE,
             )?,
         )?;
+        metadata.set_parameter(
+            midi_channel_parameter(n),
+            Definition::new(
+                c"MIDI Channel",
+                0,
+                17,
+                0,
+                UNIT_ENUM,
+                SCALING_NONE,
+                Some(MIDI_CHANNELS.table()),
+            )?,
+        )?;
         // Keep the page count fixed, including at the maximum segment count.
         // Walk the shape in time order, repeating Boundary 00 at the end.
         let mut indices = [0u8; dsp::MAX_SEGMENTS * 2 + 1];
@@ -381,6 +421,30 @@ impl Plugin for Wavesmith {
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         let n = context.state().count;
+        if parameter == midi_channel_parameter(n) as i32 {
+            let setting = context
+                .read_parameters()
+                .value(midi_channel_parameter(n))
+                .unwrap_or(0)
+                .clamp(0, 17) as u8;
+            let state = context.state_mut();
+            if state.midi.set_channel(setting) {
+                state.oscillators = [dsp::Oscillator::new(); VOICE_COUNT];
+            }
+            return;
+        }
+        for voice in 0..VOICE_COUNT {
+            if parameter == voice_parameters(n, voice)[1] as i32
+                && context
+                    .read_parameters()
+                    .value(parameter as usize)
+                    .unwrap_or(0)
+                    == 0
+            {
+                context.state_mut().midi.forget(voice);
+                return;
+            }
+        }
         let triggers = shape_triggers(n);
         let Some(trigger) = triggers.iter().position(|&index| parameter == index as i32) else {
             return;
@@ -439,45 +503,160 @@ impl Plugin for Wavesmith {
         context.state_mut().random_seed = seed;
     }
 
+    fn prefix(context: &mut Callback<'_, ReadOnly>, parameter: i32, buffer: &mut [c_char]) -> i32 {
+        for voice in 0..VOICE_COUNT {
+            if voice_parameters(context.state().count, voice)
+                .into_iter()
+                .any(|p| parameter == p as i32)
+            {
+                let Some([v, number, colon, terminator]) = buffer.get_mut(..4) else {
+                    return 0;
+                };
+                *v = b'V' as c_char;
+                *number = (b'1' + voice as u8) as c_char;
+                *colon = b':' as c_char;
+                *terminator = 0;
+                return 3;
+            }
+        }
+        0
+    }
+
+    fn midi_message(context: &mut Callback<'_, Audio>, status: u8, data1: u8, data2: u8) {
+        let n = context.state().count;
+        let p = context.read_parameters();
+        let setting = p.value(midi_channel_parameter(n)).unwrap_or(0).clamp(0, 17) as u8;
+        let mut enabled = [false; VOICE_COUNT];
+        for (voice, on) in enabled.iter_mut().enumerate() {
+            *on = (1..=LAST_BUS as i16)
+                .contains(&p.value(voice_parameters(n, voice)[1]).unwrap_or(0));
+        }
+        let state = context.state_mut();
+        if state.midi.set_channel(setting) {
+            state.oscillators = [dsp::Oscillator::new(); VOICE_COUNT];
+        }
+        state.midi.message(status, data1, data2, &enabled);
+    }
+
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
         let n = context.state().count.clamp(2, 32);
         let p = context.read_parameters();
         let wave = read_wave(n, |index| p.value(index));
-        let output = p.value(OUTPUT).unwrap_or(13);
-        let replace = p.value(OUTPUT_MODE).unwrap_or(0) != 0;
         let note = p.value(PITCH).unwrap_or(57).clamp(0, 127) as f32;
         let fine = p.value(FINE).unwrap_or(0).clamp(-100, 100) as f32 / 1200.0;
-        let cv_bus = p.value(PITCH_CV).unwrap_or(0);
         let level = p.value(LEVEL).unwrap_or(50).clamp(0, 100) as f32 * 0.01;
+        let midi_setting = p.value(midi_channel_parameter(n)).unwrap_or(0).clamp(0, 17) as u8;
         let Some(mut buses) = AudioBuses::new(samples, frames) else {
             return;
         };
-        let cv = buses.read_first(cv_bus);
-        let cv = if cv.is_finite() {
-            cv.clamp(-10.0, 10.0)
-        } else {
-            0.0
-        };
-        let frequency = 440.0
-            * distingnt_api::api::math::exp2(((note - 69.0) / 12.0 + fine + cv).clamp(-16.0, 16.0));
-        let Some(output) = buses.bus_mut(output) else {
-            return;
-        };
+        let mut routes = [(0i16, false, 0.0f32); VOICE_COUNT];
+        // Snapshot every enabled voice's CV before any output is written,
+        // including when one voice reads a bus another voice outputs onto.
+        for (voice, route) in routes.iter_mut().enumerate() {
+            let [cv_parameter, output_parameter, mode_parameter] = voice_parameters(n, voice);
+            let output = p
+                .value(output_parameter)
+                .unwrap_or(if voice == 0 { 13 } else { 0 });
+            if !(1..=LAST_BUS as i16).contains(&output) {
+                continue;
+            }
+            *route = (output, p.value(mode_parameter).unwrap_or(0) != 0, 0.0);
+            if midi_setting != 0 {
+                continue;
+            }
+            let cv = buses.read_first(p.value(cv_parameter).unwrap_or(0));
+            let cv = if cv.is_finite() {
+                cv.clamp(-10.0, 10.0)
+            } else {
+                0.0
+            };
+            let frequency = 440.0
+                * distingnt_api::api::math::exp2(
+                    ((note - 69.0) / 12.0 + fine + cv).clamp(-16.0, 16.0),
+                );
+            *route = (output, p.value(mode_parameter).unwrap_or(0) != 0, frequency);
+        }
         let processing = context.processing();
         let state = processing.state;
         let memory = processing.voices;
-        state.engine.request(wave);
-        state.engine.advance(memory);
-        for sample in output {
-            let value = state
-                .engine
-                .tick(memory, frequency, state.sample_rate, level);
-            if replace {
-                *sample = value;
-            } else {
-                *sample += value;
+        if state.midi.set_channel(midi_setting) {
+            state.oscillators = [dsp::Oscillator::new(); VOICE_COUNT];
+        }
+        let enabled = routes.map(|route| route.0 != 0);
+        state.midi.sync_enabled(&enabled);
+        state.midi.begin_block();
+        if midi_setting != 0 {
+            for ((midi, oscillator), route) in state
+                .midi
+                .voices
+                .iter_mut()
+                .zip(state.oscillators.iter_mut())
+                .zip(routes.iter_mut())
+            {
+                if route.0 == 0 || !midi.sounding() {
+                    continue;
+                }
+                let frequency = 440.0
+                    * distingnt_api::api::math::exp2(
+                        ((midi.pitch() as f32 - 69.0) / 12.0 + fine).clamp(-16.0, 16.0),
+                    );
+                if midi.take_retune() {
+                    oscillator.tune_when_silent(frequency, state.sample_rate);
+                }
+                route.2 = frequency;
             }
         }
+        state.engine.request(wave);
+        state.engine.advance(memory);
+        // Replace clears the previous bus signal once, then voices sharing that
+        // bus are summed rather than overwriting one another.
+        for (voice, &(output, replace, _)) in routes.iter().enumerate() {
+            if output != 0
+                && replace
+                && !routes
+                    .iter()
+                    .take(voice)
+                    .any(|&(earlier, clears, _)| earlier == output && clears)
+            {
+                buses.fill(output, 0.0);
+            }
+        }
+        let gate_step = state.midi.gate_step;
+        for ((oscillator, midi), &(output, _, frequency)) in state
+            .oscillators
+            .iter_mut()
+            .zip(state.midi.voices.iter_mut())
+            .zip(&routes)
+        {
+            if output == 0 || frequency == 0.0 {
+                continue;
+            }
+            let Some(output) = buses.bus_mut(output) else {
+                continue;
+            };
+            for (frame, sample) in output.iter_mut().enumerate() {
+                let gate = if midi_setting == 0 {
+                    1.0
+                } else {
+                    midi.next_gain(gate_step)
+                };
+                if gate == 0.0 {
+                    break;
+                }
+                *sample += gate
+                    * oscillator.tick(
+                        &state.engine,
+                        memory,
+                        frequency,
+                        state.sample_rate,
+                        level,
+                        frame,
+                    );
+            }
+        }
+        // Shared edit time advances once per block even when every output is
+        // None, so silent editing cannot stall an unfinished crossfade/build.
+        state.engine.advance_time(frames);
     }
 
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {

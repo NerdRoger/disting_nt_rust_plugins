@@ -7,6 +7,14 @@ std::thread_local! {
     static FFT_HALVES: Cell<usize> = const { Cell::new(0) };
     static GENERATED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     static BOUNDARY_POSITIONS: Cell<usize> = const { Cell::new(0) };
+    static OSCILLATOR_TICKS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn count_oscillator_tick() {
+    OSCILLATOR_TICKS.with(|counter| counter.set(counter.get() + 1));
+}
+pub(super) fn oscillator_tick_count() -> usize {
+    OSCILLATOR_TICKS.with(|counter| counter.get())
 }
 
 pub(super) fn count_generated_samples(count: usize) {
@@ -494,6 +502,94 @@ fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
             assert!(engine.dirty);
             finish_build(&mut engine, &mut memory, wave, 440.0);
             assert_eq!(engine.waves[engine.active], wave);
+        }
+    }
+}
+
+#[test]
+fn independent_playback_matches_the_previous_mono_path_across_edits_and_fade_boundaries() {
+    let mut shared = Engine::new(32, 48000);
+    let mut reference = shared;
+    let mut memory = [Block::ZERO; BLOCKS];
+    let mut reference_memory = memory;
+    let mut oscillator = Oscillator::new();
+    let mut wave = Wave::new(32);
+    for block in 0..160 {
+        if block == 40 {
+            wave.curves[2] = 75;
+            wave.smoothing = 40;
+        }
+        if block == 100 {
+            wave.strength = -70;
+            wave.fold_limit = 5;
+        }
+        shared.request(wave);
+        reference.request(wave);
+        shared.advance(&mut memory);
+        reference.advance(&mut reference_memory);
+        let frequency = if block < 80 { 220.0 } else { 8800.0 };
+        for frame in 0..64 {
+            let actual = oscillator.tick(&shared, &memory, frequency, 48000.0, 0.5, frame);
+            let expected = reference.tick(&reference_memory, frequency, 48000.0, 0.5);
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "block {block}, frame {frame}"
+            );
+        }
+        shared.advance_time(64);
+        shared.show_voice(&oscillator);
+        assert_eq!(shared.fade, reference.fade);
+        assert_eq!(shared.active, reference.active);
+        assert_eq!(shared.playback_level, reference.playback_level);
+    }
+}
+
+#[test]
+fn shared_rebuilds_and_crossfade_time_do_not_depend_on_enabled_voice_count() {
+    for enabled in [0, 1, 4] {
+        let mut engine = Engine::new(32, 48000);
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut voices = [Oscillator::new(); 4];
+        let mut wave = Wave::new(32);
+        wave.curves.fill(73);
+        wave.smoothing = 50;
+        wave.strength = -70;
+        let callbacks = build_calls(&wave, LEVELS);
+        FFT_COUNTS.with(|counter| counter.set((0, 0)));
+        for callback in 0..callbacks + 5 {
+            engine.request(wave);
+            engine.advance(&mut memory);
+            for (index, voice) in voices.iter_mut().take(enabled).enumerate() {
+                for frame in 0..64 {
+                    assert!(voice
+                        .tick(
+                            &engine,
+                            &memory,
+                            220.0 * (index + 1) as f32,
+                            48000.0,
+                            0.5,
+                            frame
+                        )
+                        .is_finite());
+                }
+            }
+            if callback + 1 == callbacks {
+                assert_eq!(engine.fade, engine.fade_length);
+            }
+            engine.advance_time(64);
+        }
+        assert_eq!(engine.waves[engine.active], wave);
+        assert_eq!(engine.fade, 0);
+        assert_eq!(
+            FFT_COUNTS.with(|counter| counter.get()),
+            (2, LEVELS.div_ceil(2) + 1)
+        );
+        for voice in voices.iter().skip(enabled) {
+            assert_eq!(*voice, Oscillator::new());
+        }
+        if enabled > 1 {
+            assert_ne!(voices[0].phase, voices[1].phase);
         }
     }
 }
