@@ -61,7 +61,7 @@ impl Instance {
                     < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>() + 8000)
                         as u32
             );
-            assert!(core::mem::size_of::<State>() < 1024);
+            assert!(core::mem::size_of::<State>() < 1280);
             let alignment =
                 distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&specs)
                     .unwrap();
@@ -635,6 +635,55 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
         assert_eq!(wave.segment_sample(0, 0.0), 0.0);
         assert_eq!(wave.segment_sample(n as usize - 1, 1.0), 0.0);
     }
+}
+
+#[test]
+fn stable_midi_and_cv_reuse_frequency_caches_and_steady_playback_across_blocks() {
+    const FRAMES: usize = 24;
+    let mut instance = Instance::new(8);
+    for voice in 0..VOICE_COUNT {
+        let [cv, output, mode] = voice_parameters(8, voice);
+        instance.change(cv, voice as i16 + 1);
+        instance.change(output, 13 + voice as i16);
+        instance.change(mode, 1);
+    }
+    instance.change(midi_channel_parameter(8), 1);
+    for note in [60, 64, 67, 71] {
+        instance.midi(0x90, note, 100);
+    }
+    let mut samples = [0.0; LAST_BUS * FRAMES];
+    for _ in 0..160 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::playback_work_counts();
+    for _ in 0..100 {
+        instance.render(&mut samples);
+    }
+    let after = dsp::playback_work_counts();
+    assert_eq!(after.0 - before.0, 100 * FRAMES * VOICE_COUNT);
+    assert_eq!(after.1, before.1);
+    instance.change(FINE, 10);
+    instance.render(&mut samples);
+    assert_eq!(dsp::playback_work_counts().1 - after.1, VOICE_COUNT);
+    instance.change(midi_channel_parameter(8), 0);
+    for _ in 0..160 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::playback_work_counts();
+    for _ in 0..100 {
+        instance.render(&mut samples);
+    }
+    let after = dsp::playback_work_counts();
+    assert_eq!(after.0 - before.0, 100 * FRAMES * VOICE_COUNT);
+    assert_eq!(after.1, before.1);
+    samples[..FRAMES].fill(0.00001); // No deadband on actual CV pitch.
+    instance.render(&mut samples);
+    assert_eq!(dsp::playback_work_counts().1 - after.1, 1);
+    // An output routing change must not convert pitch or disturb the voice.
+    instance.change(OUTPUT, 20);
+    let before = dsp::playback_work_counts().1;
+    instance.render(&mut samples);
+    assert_eq!(dsp::playback_work_counts().1, before);
 }
 
 #[test]

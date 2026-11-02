@@ -201,6 +201,28 @@ tables, around F7 the eighth harmonic
 is retained fully. Pitch changes reuse the bank without rebuilding it.
 Steady playback uses at most two table lookups per waveform sample, with four
 during a brief waveform-edit crossfade. There is no per-sample harmonic synthesis.
+Each voice caches its anti-alias table selection and blend until its actual,
+slewed pitch changes by 1 mV equivalent at 1 V/oct (1.2 cents) from the last
+accepted selection. This applies equally to CV and MIDI playback. Actual phase
+and pitch smoothing still follow every pitch change; the deadband affects only
+anti-alias filtering. Small changes accumulate against the cached pitch, so
+slow glides still update the filter. Stable notes reuse the selection without
+repeating its table search and blend calculation on every sample. This adds one
+cached float per voice and no waveform buffers or FFT work.
+Voice caches also persist across audio blocks: note/CV-to-frequency conversion
+runs only when the exact combined pitch changes, and phase-increment and slew
+setup runs only when frequency or sample rate changes. Level smoothing restarts
+only when Level changes. Pitch and level recurrences stop when they reach their
+existing floating-point fixed point, without snapping or rounding the pitch.
+Once a voice is settled, its MIDI gate is fully open (or MIDI is Off), and no
+waveform crossfade is running, a simpler block renderer uses the cached integer
+phase step, gain, table selection and blend. It resolves the current table slices
+outside the sample loop and interpolates the source samples directly. A changing
+pitch/level, note attack/release/steal, or waveform crossfade uses the dynamic
+path. Table slices are rebound each block so a published waveform bank is used
+immediately, without storing long-lived references to host memory. Stable CV
+benefits too; even tiny CV changes invalidate the frequency cache. This adds
+only small per-voice state and no waveform buffers or FFTs.
 Low notes retain more detail; high notes become smoother and may become quieter
 if most of the drawn shape's energy was in the removed harmonics. This reduces
 aliasing substantially, but finite source sampling and linear table interpolation

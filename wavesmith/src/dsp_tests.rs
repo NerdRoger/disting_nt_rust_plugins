@@ -8,6 +8,16 @@ std::thread_local! {
     static GENERATED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     static BOUNDARY_POSITIONS: Cell<usize> = const { Cell::new(0) };
     static OSCILLATOR_TICKS: Cell<usize> = const { Cell::new(0) };
+    static STEADY_TICKS: Cell<usize> = const { Cell::new(0) };
+    static FREQUENCY_CONVERSIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn count_frequency_conversion() {
+    FREQUENCY_CONVERSIONS.with(|counter| counter.set(counter.get() + 1));
+}
+pub(super) fn count_steady_tick() {
+    count_oscillator_tick();
+    STEADY_TICKS.with(|counter| counter.set(counter.get() + 1));
 }
 
 pub(super) fn count_oscillator_tick() {
@@ -15,6 +25,12 @@ pub(super) fn count_oscillator_tick() {
 }
 pub(super) fn oscillator_tick_count() -> usize {
     OSCILLATOR_TICKS.with(|counter| counter.get())
+}
+pub(super) fn playback_work_counts() -> (usize, usize) {
+    (
+        STEADY_TICKS.with(|counter| counter.get()),
+        FREQUENCY_CONVERSIONS.with(|counter| counter.get()),
+    )
 }
 
 pub(super) fn count_generated_samples(count: usize) {
@@ -507,7 +523,7 @@ fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
 }
 
 #[test]
-fn independent_playback_matches_the_previous_mono_path_across_edits_and_fade_boundaries() {
+fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_path() {
     let mut shared = Engine::new(32, 48000);
     let mut reference = shared;
     let mut memory = [Block::ZERO; BLOCKS];
@@ -531,18 +547,166 @@ fn independent_playback_matches_the_previous_mono_path_across_edits_and_fade_bou
         for frame in 0..64 {
             let actual = oscillator.tick(&shared, &memory, frequency, 48000.0, 0.5, frame);
             let expected = reference.tick(&reference_memory, frequency, 48000.0, 0.5);
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "block {block}, frame {frame}"
+            // Only the anti-alias blend may differ inside the 1.2-cent band.
+            assert_eq!(oscillator.phase, reference.phase);
+            assert_eq!(oscillator.increment, reference.increment);
+            assert_eq!(oscillator.level, reference.level);
+            assert!(
+                (actual - expected).abs() < 0.15,
+                "block {block}, frame {frame}: {actual} vs {expected}"
             );
         }
         shared.advance_time(64);
         shared.show_voice(&oscillator);
         assert_eq!(shared.fade, reference.fade);
         assert_eq!(shared.active, reference.active);
-        assert_eq!(shared.playback_level, reference.playback_level);
     }
+}
+
+#[test]
+fn anti_alias_cache_ignores_small_jitter_but_pitch_tracks_it_and_slow_changes_accumulate() {
+    let engine = Engine::new(8, 48000);
+    let memory = [Block::ZERO; BLOCKS];
+    let mut voice = Oscillator::new();
+    // In the blend band for the richest table, where small pitch changes would
+    // otherwise change the blend on every sample.
+    let base = 48000.0 * 0.48 / 127.0;
+    voice.tune_when_silent(base, 48000.0);
+    voice.tick(&engine, &memory, base, 48000.0, 1.0, 0);
+    let accepted = voice.selection_increment;
+    let selection = (voice.playback_level, voice.playback_blend);
+    let start_phase = voice.phase;
+    let mut reference = Oscillator::new();
+    reference.tune_when_silent(base, 48000.0);
+    reference.tick(&engine, &memory, base, 48000.0, 1.0, 0);
+    for frame in 0..2000 {
+        let frequency = base * if frame % 100 < 50 { 1.0003 } else { 0.9997 };
+        voice.tick(&engine, &memory, frequency, 48000.0, 1.0, frame);
+        reference.tick(&engine, &memory, base, 48000.0, 1.0, frame);
+        assert_eq!(voice.selection_increment, accepted);
+        assert_eq!((voice.playback_level, voice.playback_blend), selection);
+    }
+    assert_ne!(voice.increment, accepted);
+    assert_ne!(voice.phase, reference.phase);
+    assert_ne!(voice.phase, start_phase);
+    // Tiny monotonic changes eventually cross the last accepted pitch, rather
+    // than being lost because each individual change is below the threshold.
+    for direction in [1.0f32, -1.0] {
+        voice.tune_when_silent(base, 48000.0);
+        voice.tick(&engine, &memory, base, 48000.0, 1.0, 0);
+        let accepted = voice.selection_increment;
+        for frame in 0..600 {
+            let frequency = base * (1.0 + direction * frame as f32 * 0.000002);
+            voice.tick(&engine, &memory, frequency, 48000.0, 1.0, frame);
+        }
+        assert!((voice.selection_increment - accepted) * direction > 0.0);
+        assert!((voice.playback_blend - selection.1) * direction > 0.0);
+    }
+}
+
+#[test]
+fn anti_alias_cache_refreshes_on_midi_retuning_and_stays_within_one_millivolt_on_sweeps() {
+    for rate in [32000, 48000, 96000] {
+        let engine = Engine::new(8, rate);
+        let memory = [Block::ZERO; BLOCKS];
+        let mut voice = Oscillator::new();
+        for note in [36.0f32, 108.0, 60.0] {
+            let frequency = 440.0 * 2.0f32.powf((note - 69.0) / 12.0);
+            voice.tune_when_silent(frequency, rate as f32);
+            voice.tick(&engine, &memory, frequency, rate as f32, 1.0, 0);
+            assert_eq!(voice.selection_increment, voice.increment);
+            assert_eq!(
+                (voice.playback_level, voice.playback_blend),
+                engine.layout.playback_levels(voice.increment)
+            );
+        }
+        for frame in 0..16000 {
+            let octave = if frame < 8000 {
+                frame as f32 / 1000.0
+            } else {
+                (16000 - frame) as f32 / 1000.0
+            };
+            let frequency = 40.0 * 2.0f32.powf(octave);
+            voice.tick(&engine, &memory, frequency, rate as f32, 1.0, frame);
+            let error = (voice.increment / voice.selection_increment).log2().abs();
+            assert!(error <= 0.001001, "{error} octaves at {rate} Hz");
+            assert_eq!(
+                (voice.playback_level, voice.playback_blend),
+                engine.layout.playback_levels(voice.selection_increment)
+            );
+            let highest = engine.layout.cutoff(voice.playback_level) as f32;
+            assert!(voice.increment * highest < 0.5 || voice.playback_blend == 1.0);
+        }
+    }
+}
+
+#[test]
+fn steady_block_playback_is_bit_exact_through_table_blends_pitch_level_changes_and_bank_swaps() {
+    for rate in [32000, 48000, 96000] {
+        let mut engine = Engine::new(8, rate);
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut wave = Wave::new(8);
+        let mut optimized = Oscillator::new();
+        let mut reference = optimized;
+        let before = playback_work_counts().0;
+        for block in 0..750 {
+            // Settle both in a table blend and in single-table regions.
+            let frequency = match block {
+                0..=249 => rate as f32 * 0.48 / 127.0,
+                250..=499 => 8800.0,
+                _ => 220.0,
+            };
+            let level = if block < 370 { 0.5 } else { 0.23 };
+            if block == 130 || block == 600 {
+                wave.curves[0] = if block == 130 { 85 } else { -73 };
+                wave.smoothing = 40;
+                wave.strength = -50;
+            }
+            engine.request(wave);
+            engine.advance(&mut memory);
+            optimized.prepare(frequency, rate as f32, level);
+            let mut actual = [1.25; 24];
+            if !optimized.render_steady(&engine, &memory, &mut actual) {
+                for (frame, sample) in actual.iter_mut().enumerate() {
+                    *sample += optimized.tick_prepared(&engine, &memory, frame);
+                }
+            }
+            for (frame, &actual) in actual.iter().enumerate() {
+                let expected =
+                    1.25 + reference.tick(&engine, &memory, frequency, rate as f32, level, frame);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "rate {rate}, block {block}, frame {frame}"
+                );
+            }
+            assert_eq!(optimized.phase, reference.phase);
+            assert_eq!(optimized.increment, reference.increment);
+            assert_eq!(optimized.level, reference.level);
+            engine.advance_time(24);
+        }
+        assert!(playback_work_counts().0 > before + 2400);
+    }
+}
+
+#[test]
+fn frequency_conversion_cache_persists_and_exact_cv_changes_invalidate_it() {
+    let mut voice = Oscillator::new();
+    let before = playback_work_counts().1;
+    assert_eq!(voice.frequency(0.0), 440.0);
+    let snapshot = voice;
+    for _ in 0..1000 {
+        assert_eq!(voice.frequency(0.0), 440.0);
+    }
+    assert_eq!(playback_work_counts().1 - before, 1);
+    assert_eq!(voice, snapshot);
+    let tiny_cv_change = 0.00001;
+    assert!(voice.frequency(tiny_cv_change) > 440.0);
+    assert_eq!(playback_work_counts().1 - before, 2);
+    voice.frequency(tiny_cv_change);
+    assert_eq!(playback_work_counts().1 - before, 2);
+    assert_eq!(voice.frequency(-1.0), 220.0);
+    assert_eq!(playback_work_counts().1 - before, 3);
 }
 
 #[test]

@@ -36,6 +36,9 @@ impl NoteVoice {
     pub fn take_retune(&mut self) -> bool {
         core::mem::replace(&mut self.retune, false)
     }
+    pub fn gate_is_steady(&self) -> bool {
+        self.held && !self.switching && self.gain == 1.0
+    }
     pub fn next_gain(&mut self, step: f32) -> f32 {
         self.gain = if self.held && !self.switching {
             (self.gain + step).min(1.0)

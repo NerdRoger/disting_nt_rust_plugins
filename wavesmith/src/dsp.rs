@@ -619,7 +619,23 @@ pub struct Oscillator {
     increment: f32,
     playback_level: usize,
     playback_blend: f32,
+    selection_increment: f32,
+    cached_octave: f32,
+    cached_frequency: f32,
+    cached_rate: f32,
+    prepared_frequency: f32,
+    target_increment: f32,
+    target_level: f32,
+    slew: f32,
+    phase_step: u32,
+    pitch_moving: bool,
+    level_moving: bool,
 }
+
+// 1 mV at 1 V/oct is 0.001 octaves (1.2 cents). Compare frequency ratios
+// instead of converting the slewed oscillator pitch back to volts/logarithms.
+const SELECTION_RATIO: f32 = 1.000_693_4; // 2^0.001
+const SELECTION_RATIO_INVERSE: f32 = 0.999_307_1; // 2^-0.001
 
 impl Oscillator {
     pub const fn new() -> Self {
@@ -629,12 +645,51 @@ impl Oscillator {
             increment: 0.0,
             playback_level: 0,
             playback_blend: 0.0,
+            selection_increment: 0.0,
+            cached_octave: f32::INFINITY,
+            cached_frequency: 0.0,
+            cached_rate: 0.0,
+            prepared_frequency: 0.0,
+            target_increment: 0.0,
+            target_level: 0.0,
+            slew: 0.0,
+            phase_step: 0,
+            pitch_moving: false,
+            level_moving: false,
         }
     }
-    pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
-        self.increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+    /// Cache the exact exponent, including Fine and CV. No pitch deadband.
+    pub fn frequency(&mut self, octave: f32) -> f32 {
+        if octave != self.cached_octave {
+            self.cached_octave = octave;
+            self.cached_frequency = 440.0 * distingnt_api::api::math::exp2(octave);
+            #[cfg(test)]
+            tests::count_frequency_conversion();
+        }
+        self.cached_frequency
     }
 
+    pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {
+        if frequency != self.prepared_frequency || sample_rate != self.cached_rate {
+            self.prepared_frequency = frequency;
+            self.cached_rate = sample_rate;
+            self.slew = (1000.0 / sample_rate).min(1.0);
+            self.target_increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+            self.pitch_moving = true;
+        }
+        if level != self.target_level {
+            self.target_level = level;
+            self.level_moving = true;
+        }
+    }
+
+    pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
+        self.increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+        self.phase_step = (self.increment * 4_294_967_296.0) as u32;
+        self.pitch_moving = true;
+    }
+
+    #[cfg(test)]
     pub fn tick(
         &mut self,
         engine: &Engine,
@@ -644,13 +699,37 @@ impl Oscillator {
         level: f32,
         frame: usize,
     ) -> f32 {
+        self.prepare(frequency, sample_rate, level);
+        self.tick_prepared(engine, memory, frame)
+    }
+
+    pub fn tick_prepared(&mut self, engine: &Engine, memory: &Memory, frame: usize) -> f32 {
         #[cfg(test)]
         tests::count_oscillator_tick();
-        let slew = (1000.0 / sample_rate).min(1.0);
-        let target = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
-        self.increment += slew * (target - self.increment);
-        (self.playback_level, self.playback_blend) = engine.layout.playback_levels(self.increment);
-        self.level += slew * (level - self.level);
+        if self.pitch_moving {
+            let previous = self.increment;
+            self.increment += self.slew * (self.target_increment - self.increment);
+            // Stop at exactly the same floating-point fixed point as the old
+            // recurrence. No snap-to-target or extra pitch quantization.
+            self.pitch_moving = self.increment != previous;
+            self.phase_step = (self.increment * 4_294_967_296.0) as u32;
+            // Anchor the deadband to the last accepted pitch, so gradual CV changes
+            // accumulate. Phase still follows every change, including sub-millivolt
+            // movement. Follow the actual slewed pitch rather than its destination.
+            if self.selection_increment == 0.0
+                || self.increment >= self.selection_increment * SELECTION_RATIO
+                || self.increment <= self.selection_increment * SELECTION_RATIO_INVERSE
+            {
+                (self.playback_level, self.playback_blend) =
+                    engine.layout.playback_levels(self.increment);
+                self.selection_increment = self.increment;
+            }
+        }
+        if self.level_moving {
+            let previous = self.level;
+            self.level += self.slew * (self.target_level - self.level);
+            self.level_moving = self.level != previous;
+        }
         // All voices see the same fade time for this audio frame. When a fade
         // ends within the block, later frames use only the new bank.
         let fading = engine.fade > 0 && frame < engine.fade;
@@ -679,16 +758,79 @@ impl Oscillator {
         } else {
             old
         };
-        self.phase = self
-            .phase
-            .wrapping_add((self.increment * 4_294_967_296.0) as u32);
+        self.phase = self.phase.wrapping_add(self.phase_step);
         sample * self.level * 5.0
+    }
+
+    /// Fast path for a settled voice and a fully open gate. Table slices are
+    /// rebound each block so publication can never leave a stale bank reference.
+    pub fn render_steady(&mut self, engine: &Engine, memory: &Memory, output: &mut [f32]) -> bool {
+        if self.pitch_moving
+            || self.level_moving
+            || engine.fade != 0
+            || !engine.ready[engine.active & 1]
+        {
+            return false;
+        }
+        let table_index = (engine.active & 1) * (engine.layout.count + 1) + self.playback_level;
+        let Some(rich) = memory.get(table_index / 2) else {
+            return false;
+        };
+        let read = |block: &Block, imaginary: bool, index: usize, next: usize, fraction: f32| {
+            let (left, right) = if imaginary {
+                (block.data[index].im, block.data[next].im)
+            } else {
+                (block.data[index].re, block.data[next].re)
+            };
+            left + (right - left) * fraction
+        };
+        let blend = self.playback_blend;
+        let simple = blend == 0.0 || self.playback_level + 1 == engine.layout.count;
+        // Resolve table storage and interpolation mode outside the sample loop.
+        if simple {
+            for sample in output {
+                let index = (self.phase >> 24) as usize;
+                let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
+                let value = read(
+                    rich,
+                    table_index & 1 != 0,
+                    index,
+                    (index + 1) & (SIZE - 1),
+                    fraction,
+                );
+                *sample += value * self.level * 5.0;
+                self.phase = self.phase.wrapping_add(self.phase_step);
+                #[cfg(test)]
+                tests::count_steady_tick();
+            }
+        } else {
+            let Some(lean) = memory.get((table_index + 1) / 2) else {
+                return false;
+            };
+            for sample in output {
+                let index = (self.phase >> 24) as usize;
+                let next = (index + 1) & (SIZE - 1);
+                let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
+                let a = read(rich, table_index & 1 != 0, index, next, fraction);
+                let b = read(lean, (table_index + 1) & 1 != 0, index, next, fraction);
+                *sample += (a + (b - a) * blend) * self.level * 5.0;
+                self.phase = self.phase.wrapping_add(self.phase_step);
+                #[cfg(test)]
+                tests::count_steady_tick();
+            }
+        }
+        true
     }
 }
 
 #[cfg(test)]
 pub fn oscillator_tick_count() -> usize {
     tests::oscillator_tick_count()
+}
+
+#[cfg(test)]
+pub fn playback_work_counts() -> (usize, usize) {
+    tests::playback_work_counts()
 }
 
 #[derive(Clone, Copy)]

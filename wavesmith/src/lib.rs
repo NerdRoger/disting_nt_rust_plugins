@@ -570,11 +570,8 @@ impl Plugin for Wavesmith {
             } else {
                 0.0
             };
-            let frequency = 440.0
-                * distingnt_api::api::math::exp2(
-                    ((note - 69.0) / 12.0 + fine + cv).clamp(-16.0, 16.0),
-                );
-            *route = (output, p.value(mode_parameter).unwrap_or(0) != 0, frequency);
+            // Carry the exact pitch exponent until state is available below.
+            route.2 = ((note - 69.0) / 12.0 + fine + cv).clamp(-16.0, 16.0);
         }
         let processing = context.processing();
         let state = processing.state;
@@ -596,14 +593,18 @@ impl Plugin for Wavesmith {
                 if route.0 == 0 || !midi.sounding() {
                     continue;
                 }
-                let frequency = 440.0
-                    * distingnt_api::api::math::exp2(
-                        ((midi.pitch() as f32 - 69.0) / 12.0 + fine).clamp(-16.0, 16.0),
-                    );
+                let frequency = oscillator
+                    .frequency(((midi.pitch() as f32 - 69.0) / 12.0 + fine).clamp(-16.0, 16.0));
                 if midi.take_retune() {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }
                 route.2 = frequency;
+            }
+        } else {
+            for (oscillator, route) in state.oscillators.iter_mut().zip(routes.iter_mut()) {
+                if route.0 != 0 {
+                    route.2 = oscillator.frequency(route.2);
+                }
             }
         }
         state.engine.request(wave);
@@ -634,6 +635,12 @@ impl Plugin for Wavesmith {
             let Some(output) = buses.bus_mut(output) else {
                 continue;
             };
+            oscillator.prepare(frequency, state.sample_rate, level);
+            if (midi_setting == 0 || midi.gate_is_steady())
+                && oscillator.render_steady(&state.engine, memory, output)
+            {
+                continue;
+            }
             for (frame, sample) in output.iter_mut().enumerate() {
                 let gate = if midi_setting == 0 {
                     1.0
@@ -643,15 +650,7 @@ impl Plugin for Wavesmith {
                 if gate == 0.0 {
                     break;
                 }
-                *sample += gate
-                    * oscillator.tick(
-                        &state.engine,
-                        memory,
-                        frequency,
-                        state.sample_rate,
-                        level,
-                        frame,
-                    );
+                *sample += gate * oscillator.tick_prepared(&state.engine, memory, frame);
             }
         }
         // Shared edit time advances once per block even when every output is
