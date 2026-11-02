@@ -6,12 +6,12 @@ mod dsp;
 mod midi;
 mod ui;
 
-use core::ffi::CStr;
+use core::ffi::{c_char, CStr};
 use distingnt_api::api::{
     audio::AudioBuses,
     drawing::Canvas,
     metadata::{Definition, EnumStrings},
-    parameters::{Audio, Ui},
+    parameters::{Audio, ReadOnly, Ui},
     plugin::{Configuration, Context, Metadata, Plugin, Specification},
     state_memory::Sram,
 };
@@ -26,17 +26,20 @@ const SMOOTHING: usize = 5;
 const LEVEL: usize = 6;
 const GLOBALS: usize = 7;
 const VOICE_COUNT: usize = 10; // Maximum; only the specified pool is processed.
-const VOICE_CV_NAMES: [&CStr; VOICE_COUNT] = [
-    c"Voice 1 Pitch CV",
-    c"Voice 2 Pitch CV",
-    c"Voice 3 Pitch CV",
-    c"Voice 4 Pitch CV",
-    c"Voice 5 Pitch CV",
-    c"Voice 6 Pitch CV",
-    c"Voice 7 Pitch CV",
-    c"Voice 8 Pitch CV",
-    c"Voice 9 Pitch CV",
-    c"Voice 10 Pitch CV",
+const VOICE_PAGE_NAMES: [&CStr; VOICE_COUNT] = [
+    c"Voice 1",
+    c"Voice 2",
+    c"Voice 3",
+    c"Voice 4",
+    c"Voice 5",
+    c"Voice 6",
+    c"Voice 7",
+    c"Voice 8",
+    c"Voice 9",
+    c"Voice 10",
+];
+const VOICE_PREFIXES: [&CStr; VOICE_COUNT] = [
+    c"V1:", c"V2:", c"V3:", c"V4:", c"V5:", c"V6:", c"V7:", c"V8:", c"V9:", c"V10:",
 ];
 static MIDI_CHANNELS: EnumStrings<18> = EnumStrings::new([
     c"Off", c"All", c"1", c"2", c"3", c"4", c"5", c"6", c"7", c"8", c"9", c"10", c"11", c"12",
@@ -52,6 +55,14 @@ fn voice_pitch_parameter(n: usize, voice: usize) -> usize {
     } else {
         randomize_parameter(n) + 11 + voice
     }
+}
+
+// Append tuning after the existing MIDI/CV parameters to preserve their indices.
+fn voice_transpose_parameter(n: usize, voices: usize, voice: usize) -> usize {
+    randomize_parameter(n) + 11 + voices + voice * 2
+}
+fn voice_fine_parameter(n: usize, voices: usize, voice: usize) -> usize {
+    voice_transpose_parameter(n, voices, voice) + 1
 }
 
 fn voice_count(specs: &[i32]) -> Option<usize> {
@@ -164,10 +175,40 @@ struct State {
     ui: ui::UiState,
     random_seed: u32,
     trigger_high: [bool; 8],
+    grayed_for_midi: Option<bool>,
 }
 
 type Callback<'a, Mode> = Context<'a, State, dsp::Block, Mode, Sram>;
 struct Wavesmith;
+
+fn sync_midi_parameter_graying(context: &mut Callback<'_, Audio>) {
+    let n = context.state().count;
+    let voices = context.state().voice_count;
+    let midi = context
+        .read_parameters()
+        .value(midi_channel_parameter(n))
+        .unwrap_or(0)
+        .clamp(0, 17)
+        != 0;
+    if context.state().grayed_for_midi == Some(midi) {
+        return;
+    }
+    // Publish before calling the host so synchronous reentry cannot repeat it.
+    context.state_mut().grayed_for_midi = Some(midi);
+    let mut parameters = context.parameters();
+    let mut applied = parameters.gray(PITCH, midi).is_some();
+    for voice in 0..voices {
+        applied &= parameters
+            .gray(voice_pitch_parameter(n, voice), midi)
+            .is_some();
+        applied &= parameters
+            .gray(voice_transpose_parameter(n, voices, voice), midi)
+            .is_some();
+    }
+    if !applied {
+        context.state_mut().grayed_for_midi = None;
+    }
+}
 
 fn definition(
     name: &'static CStr,
@@ -274,13 +315,14 @@ impl Plugin for Wavesmith {
     const CUSTOM_UI: u32 = POT_L | POT_C | POT_R | ENCODER_L | ENCODER_R | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
     const MIDI: bool = true;
+    const PARAMETER_TEXT: bool = true;
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 11 + voice_count(specs)?,
-            pages: 3,
-            page_indices: GLOBALS + n * 2 + 12 + voice_count(specs)?,
+            parameters: GLOBALS + n * 2 + 11 + voice_count(specs)? * 3,
+            pages: 3 + voice_count(specs)?,
+            page_indices: GLOBALS + n * 2 + 12 + voice_count(specs)? * 3,
             regions: dsp::blocks(dsp::DEFAULT_TABLES),
         })
     }
@@ -308,6 +350,7 @@ impl Plugin for Wavesmith {
                 ui: ui::UiState::new(),
                 random_seed: 0x9e37_79b9 ^ rate ^ n as u32,
                 trigger_high: [false; 8],
+                grayed_for_midi: None,
             }
         );
         Some(())
@@ -329,7 +372,7 @@ impl Plugin for Wavesmith {
             definition(c"Output mode", 0, 1, 0, UNIT_OUTPUT_MODE),
             definition(c"Pitch", 0, 127, 57, UNIT_MIDI_NOTE),
             definition(c"Fine tune", -100, 100, 0, UNIT_CENTS),
-            definition(c"Voice 1 Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT),
+            definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT),
             definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT),
             definition(c"Level", 0, 100, 50, UNIT_PERCENT),
         ]
@@ -361,23 +404,25 @@ impl Plugin for Wavesmith {
             ],
         )?;
         let voices = voice_count(specs)?;
-        let mut routing = [0u8; VOICE_COUNT + 2];
-        routing[0] = OUTPUT as u8;
-        routing[1] = OUTPUT_MODE as u8;
-        for (voice, (&name, row)) in VOICE_CV_NAMES
-            .iter()
-            .zip(routing.iter_mut().skip(2))
-            .take(voices)
-            .enumerate()
-        {
+        metadata.add_page(c"Routings", 2, &[OUTPUT as u8, OUTPUT_MODE as u8])?;
+        for (voice, &page_name) in VOICE_PAGE_NAMES.iter().take(voices).enumerate() {
             let cv = voice_pitch_parameter(n, voice);
             if voice > 0 {
-                metadata
-                    .set_parameter(cv, definition(name, 0, LAST_BUS as i16, 0, UNIT_CV_INPUT)?)?;
+                metadata.set_parameter(
+                    cv,
+                    definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT)?,
+                )?;
             }
-            *row = cv as u8;
+            let transpose = voice_transpose_parameter(n, voices, voice);
+            let fine = voice_fine_parameter(n, voices, voice);
+            metadata.set_parameter(
+                transpose,
+                definition(c"Transpose", -48, 48, 0, UNIT_SEMITONES)?,
+            )?;
+            metadata.set_parameter(fine, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)?)?;
+            // Shared group retains the selected parameter row between voices.
+            metadata.add_page(page_name, 3, &[cv as u8, transpose as u8, fine as u8])?;
         }
-        metadata.add_page(c"Routings", 2, routing.get(..voices + 2)?)?;
         for (i, name) in BOUNDARY_NAMES.iter().enumerate().take(n - 1) {
             metadata.set_parameter(
                 boundary_parameter(i + 1),
@@ -443,7 +488,7 @@ impl Plugin for Wavesmith {
                 Some(MIDI_CHANNELS.table()),
             )?,
         )?;
-        // Keep the page count fixed, including at the maximum segment count.
+        // Segment count does not add pages; even ten voices stay below 32 pages.
         // Walk the shape in time order, repeating Boundary 00 at the end.
         let mut indices = [0u8; dsp::MAX_SEGMENTS * 2 + 1];
         *indices.first_mut()? = seam_parameter(n) as u8;
@@ -452,13 +497,14 @@ impl Plugin for Wavesmith {
             *indices.get_mut(segment * 2 + 2)? =
                 editor_parameter(n, segment, 1).unwrap_or(seam_parameter(n)) as u8;
         }
-        metadata.add_page(c"Waveform", 3, indices.get(..n * 2 + 1)?)?;
+        metadata.add_page(c"Waveform", 4, indices.get(..n * 2 + 1)?)?;
         Some(())
     }
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         let n = context.state().count;
         if parameter == midi_channel_parameter(n) as i32 {
+            sync_midi_parameter_graying(context);
             let setting = context
                 .read_parameters()
                 .value(midi_channel_parameter(n))
@@ -533,7 +579,35 @@ impl Plugin for Wavesmith {
         context.state_mut().random_seed = seed;
     }
 
+    fn prefix(context: &mut Callback<'_, ReadOnly>, parameter: i32, buffer: &mut [c_char]) -> i32 {
+        let Ok(parameter) = usize::try_from(parameter) else {
+            return 0;
+        };
+        let n = context.state().count;
+        let voices = context.state().voice_count;
+        for (voice, &prefix) in VOICE_PREFIXES.iter().take(voices).enumerate() {
+            if [
+                voice_pitch_parameter(n, voice),
+                voice_transpose_parameter(n, voices, voice),
+                voice_fine_parameter(n, voices, voice),
+            ]
+            .contains(&parameter)
+            {
+                let bytes = prefix.to_bytes_with_nul();
+                let Some(output) = buffer.get_mut(..bytes.len()) else {
+                    return 0;
+                };
+                for (out, &byte) in output.iter_mut().zip(bytes) {
+                    *out = byte as c_char;
+                }
+                return bytes.len() as i32 - 1;
+            }
+        }
+        0
+    }
+
     fn midi_message(context: &mut Callback<'_, Audio>, status: u8, data1: u8, data2: u8) {
+        sync_midi_parameter_graying(context);
         let n = context.state().count;
         let p = context.read_parameters();
         let setting = p.value(midi_channel_parameter(n)).unwrap_or(0).clamp(0, 17) as u8;
@@ -551,6 +625,7 @@ impl Plugin for Wavesmith {
     }
 
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
+        sync_midi_parameter_graying(context);
         let n = context.state().count.clamp(2, 32);
         let p = context.read_parameters();
         let wave = read_wave(n, |index| p.value(index));
@@ -565,20 +640,33 @@ impl Plugin for Wavesmith {
         let output_enabled = (1..=LAST_BUS as i16).contains(&output_bus);
         let replace = p.value(OUTPUT_MODE).unwrap_or(0) != 0;
         let mut pitches = [0.0f32; VOICE_COUNT];
-        // Snapshot every CV before clearing/writing the shared destination.
-        if output_enabled && midi_setting == 0 {
-            for (voice, pitch) in pitches
-                .iter_mut()
-                .take(context.state().voice_count)
-                .enumerate()
-            {
+        // Snapshot tuning/CV before clearing or writing the shared destination.
+        let voices = context.state().voice_count;
+        if output_enabled {
+            for (voice, pitch) in pitches.iter_mut().take(voices).enumerate() {
+                let voice_fine = p
+                    .value(voice_fine_parameter(n, voices, voice))
+                    .unwrap_or(0)
+                    .clamp(-100, 100) as f32
+                    / 1200.0;
+                if midi_setting != 0 {
+                    // MIDI ignores global Pitch, Pitch CV and per-voice Transpose.
+                    *pitch = fine + voice_fine;
+                    continue;
+                }
+                let transpose = p
+                    .value(voice_transpose_parameter(n, voices, voice))
+                    .unwrap_or(0)
+                    .clamp(-48, 48) as f32
+                    / 12.0;
                 let cv = buses.read_first(p.value(voice_pitch_parameter(n, voice)).unwrap_or(0));
                 let cv = if cv.is_finite() {
                     cv.clamp(-10.0, 10.0)
                 } else {
                     0.0
                 };
-                *pitch = ((note - 69.0) / 12.0 + fine + cv).clamp(-16.0, 16.0);
+                *pitch =
+                    ((note - 69.0) / 12.0 + fine + voice_fine + transpose + cv).clamp(-16.0, 16.0);
             }
         }
         let processing = context.processing();
@@ -608,10 +696,11 @@ impl Plugin for Wavesmith {
             }
             if midi_setting != 0 {
                 if !midi.sounding() {
+                    *pitch = 0.0;
                     continue;
                 }
                 let frequency = oscillator
-                    .frequency(((midi.pitch() as f32 - 69.0) / 12.0 + fine).clamp(-16.0, 16.0));
+                    .frequency(((midi.pitch() as f32 - 69.0) / 12.0 + *pitch).clamp(-16.0, 16.0));
                 if midi.take_retune() {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }

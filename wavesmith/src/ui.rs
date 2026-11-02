@@ -125,7 +125,13 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 100,
             ),
         };
-        let locked = parameter.is_none();
+        let midi = context
+            .read_parameters()
+            .value(midi_channel_parameter(context.state().count))
+            .unwrap_or(0)
+            .clamp(0, 17)
+            != 0;
+        let locked = parameter.is_none() || (parameter == Some(PITCH) && midi);
         let value = parameter
             .and_then(|p| context.read_parameters().value(p))
             .unwrap_or(0);
@@ -282,7 +288,12 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     for (x, prefix, parameter, default) in header {
         let value = parameters.value(parameter).unwrap_or(default);
         if parameter == PITCH {
-            pitch_note(&mut canvas, x, value, header_color);
+            let midi = parameters
+                .value(midi_channel_parameter(n))
+                .unwrap_or(0)
+                .clamp(0, 17)
+                != 0;
+            pitch_note(&mut canvas, x, value, if midi { 5 } else { header_color });
         } else {
             number(&mut canvas, x, prefix, value, header_color);
         }

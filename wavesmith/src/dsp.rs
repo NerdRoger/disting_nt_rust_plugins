@@ -667,6 +667,11 @@ impl Oscillator {
             level_moving: false,
         }
     }
+    #[cfg(test)]
+    pub fn cached_frequency_for_test(&self) -> f32 {
+        self.cached_frequency
+    }
+
     /// Cache the exact exponent, including Fine and CV. No pitch deadband.
     pub fn frequency(&mut self, octave: f32) -> f32 {
         if octave != self.cached_octave {

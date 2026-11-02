@@ -127,9 +127,13 @@ to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
 triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
 and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
-The Routings page lists shared Output, Output mode (add/replace), then
-Voice 1 Pitch CV through Voice N Pitch CV for the configured Voices count.
-There are no individual voice pages or per-voice enable/output controls.
+The Routings page contains shared Output and Output mode (add/replace).
+Each configured voice has its own Voice 1, Voice 2, etc. page, containing Pitch CV,
+Transpose, and Fine tune in that order. Parameter names are shared; the API's
+parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
+a navigation group so switching voices retains the selected parameter row.
+Transpose ranges from -48 to +48 semitones; per-voice Fine tune ranges from -100
+to +100 cents. Both offsets default to zero. Output routing remains shared.
 Output defaults to bus 13 / physical output 1. Output None disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
 shared waveform rebuilding and edit fades can still finish while silent.
@@ -137,8 +141,10 @@ An enabled output sums every configured voice without normalization or limiting.
 Replace clears the destination once before mixing the whole pool; Add preserves
 the existing bus signal. Level is applied to each voice as before.
 
-In CV mode every configured voice plays continuously. A voice whose Pitch CV is
-None plays at the shared manual Pitch and Fine tune. CV values are snapshotted
+In CV mode every configured voice plays continuously. Its pitch is shared Pitch
+plus Pitch CV, shared Fine tune, voice Transpose, and voice Fine tune. A Pitch CV
+of None contributes zero volts, so voices can form manual chords with Transpose
+or detuned stacks with their Fine tune offsets. CV values are snapshotted
 before the shared output is cleared or written, including when an input is also
 the destination bus. Each voice has its own phase, pitch/gain slew and anti-alias
 selection. Persistent frequency caches and steady playback remain active.
@@ -149,8 +155,12 @@ and parameter metadata includes only the specified CV inputs.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
 or a channel number to control every enabled voice with MIDI instead. In MIDI
-mode, Pitch CV inputs and manual Pitch are ignored; shared Fine tune and Level
-still apply. The Voices specification determines the 1–10-note MIDI pool. Unassigned MIDI
+mode, Pitch CV inputs, manual Pitch, and per-voice Transpose are ignored. Shared
+Fine tune, per-voice Fine tune, and Level still apply. The ignored parameters are
+grayed out through the NT API while MIDI is enabled and restored when MIDI is
+Off, without changing their stored values. In the custom Tuning view, Pitch is
+dim and its pot is inactive in MIDI mode; Fine and Level remain editable.
+The Voices specification determines the 1–10-note MIDI pool. Unassigned MIDI
 voices remain silent; when no notes are held, the shared output is silent after
 release fades finish.
 
@@ -169,9 +179,11 @@ etc., and N independently named Curve parameters. One Waveform page lists them
 in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
 and so on, ending with Curve N and Boundary 00. Each interior boundary appears
 once and is still shared by its neighboring segments in the custom editor.
-One editable parameter supplies both endpoint rows. There are always three plugin pages
-(Oscillator, Routings, Waveform), plus the NT's own Common page, for every segment
-count. This avoids the firmware's page-count issue at high segment counts.
+One editable parameter supplies both endpoint rows. There are three shared
+pages (Oscillator, Routings, Waveform) plus one page per configured voice and
+the NT's own Common page. Segment count does not add pages; the maximum is 13
+plugin pages with ten voices. This avoids the firmware's page-count issue at
+high segment counts.
 All numeric shape parameters are host-visible;
 dedicated segment modulation routing is deferred. Ordinary parameter values are
 stored by the NT host with the preset; editor selection is temporary.
@@ -326,7 +338,11 @@ Fold Limit is appended after the waveform-boundary triggers, preserving all
 earlier parameter indices and defaulting to the previous folding range of 2.
 Shared Output/Output mode and Voice 1 Pitch CV reuse the original indices.
 MIDI Channel follows Fold Limit, then the remaining configured Voice N Pitch CV
-parameters are appended. All CV inputs default to None.
+parameters are appended. All CV inputs default to None. Each voice's Transpose
+and Fine tune pair is appended after all existing CV parameters, preserving the
+previous parameter indices. Moving CV/tuning controls to per-voice pages and
+using parameter UI prefixes changes only presentation, preserving parameter
+indices and values. Zero offsets preserve the existing tuning.
 Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
 presets stored a raw 0–100 percentage value; those warp position values now use the
 new 0–255 units and may need readjustment.
