@@ -537,7 +537,7 @@ fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_pat
         }
         if block == 100 {
             wave.strength = -70;
-            wave.fold_limit = 5;
+            wave.fold_limit = 1;
         }
         shared.request(wave);
         reference.request(wave);
@@ -843,7 +843,7 @@ fn changing_fold_limit_rebuilds_the_audio_and_editor_without_changing_other_shap
     let mut wave = Wave::new(8);
     wave.curves.fill(73);
     let mut previous = None;
-    for limit in [0, 1, 2, 5, 10, 0] {
+    for limit in [0, 1, 2, 0] {
         wave.fold_limit = limit;
         finish_build(&mut engine, &mut storage, wave, 220.0);
         let actual = read_table(&engine, &storage, engine.active * 2);

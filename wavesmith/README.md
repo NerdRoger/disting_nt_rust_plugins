@@ -66,15 +66,15 @@ Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curv
 ±100 at the default Fold Limit of 2. Both endpoints remain exact. Folding is
 continuous reflection, not clipping.
 
-Fold Limit is a global 0–10 parameter (default 2) on the Oscillator page.
+Fold Limit is a global 0–2 parameter (default 2) on the Oscillator page.
 At zero, Curve still bends the segment using a quadratic Bezier control point
 bounded by the global amplitude rails; it introduces no folds or hard clipping.
-At limits 1–10, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
+At limits 1–2, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
 so each sampled curve value needs no more than the allowed number of reflections
 to return inside the rails. The value is a maximum, not a forced fold count;
 Curve zero remains linear at every setting. Default 2 preserves the previous
-curve arithmetic exactly. High limits can create detail too fine for the
-256-sample audio tables to reproduce faithfully. Overall smoothing and final
+curve arithmetic exactly. The maximum is two to keep folding useful at the
+256-sample table resolution. Overall smoothing and final
 anti-alias filtering still follow the curve/folding stage. Changing Fold Limit
 rebuilds the waveform through the existing chunked, crossfaded path, without
 adding FFTs or waveform buffers. Shape triggers leave Fold Limit unchanged.

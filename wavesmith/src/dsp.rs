@@ -6,7 +6,7 @@
 pub const SIZE: usize = 256;
 pub const CENTROID_MAX: i16 = 255;
 pub const CENTROID_DEFAULT: i16 = 128;
-pub const MAX_FOLDS: i16 = 10;
+pub const MAX_FOLDS: i16 = 2;
 pub const DEFAULT_FOLD_LIMIT: i16 = 2;
 pub const DEFAULT_TABLES: usize = 6;
 pub const MAX_TABLES: usize = 20;
