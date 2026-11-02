@@ -36,13 +36,17 @@ fn segment_parameter(segment: usize, field: usize) -> usize {
 struct Instance {
     base: *mut NtAlgorithm,
     layout: Layout,
+    guard_offset: usize,
     values: Vec<i16>,
 }
 
 impl Instance {
     fn new(n: i32) -> Self {
+        Self::with_voices(n, 1)
+    }
+    fn with_voices(n: i32, voices: i32) -> Self {
         unsafe {
-            let specs = [n];
+            let specs = [n, voices];
             let f = factory();
             let mut req = NtAlgorithmRequirements {
                 num_parameters: 0,
@@ -54,20 +58,21 @@ impl Instance {
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
             assert_eq!(
                 req.num_parameters as usize,
-                GLOBALS + n as usize * 2 + 12 + (VOICE_COUNT - 1) * 3
+                GLOBALS + n as usize * 2 + 11 + voices as usize
             );
             assert!(
                 req.sram
                     < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>() + 8000)
                         as u32
             );
-            assert!(core::mem::size_of::<State>() < 1280);
+            assert!(core::mem::size_of::<State>() < 2048);
             let alignment =
-                distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&specs)
+                distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
                     .unwrap();
-            let layout = Layout::from_size_align(req.sram as usize, alignment).unwrap();
+            let layout = Layout::from_size_align(req.sram as usize + 64, alignment).unwrap();
             let memory = alloc_zeroed(layout);
             assert!(!memory.is_null());
+            ptr::write_bytes(memory.add(req.sram as usize), 0xa5, 64);
             let base = f.construct.unwrap()(
                 &NtAlgorithmMemoryPtrs {
                     sram: memory,
@@ -88,6 +93,7 @@ impl Instance {
             Self {
                 base,
                 layout,
+                guard_offset: req.sram as usize,
                 values,
             }
         }
@@ -111,6 +117,16 @@ impl Instance {
                 (samples.len() / LAST_BUS / 4) as i32,
             );
         }
+        self.assert_guard();
+    }
+    fn assert_guard(&self) {
+        let guard = unsafe {
+            core::slice::from_raw_parts(self.base.cast::<u8>().add(self.guard_offset), 64)
+        };
+        assert!(
+            guard.iter().all(|&byte| byte == 0xa5),
+            "algorithm wrote beyond its SRAM allocation"
+        );
     }
     fn event(&mut self, pots: [f32; 3], encoders: [i8; 2]) {
         self.event_buttons(pots, encoders, 0, 0);
@@ -165,10 +181,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
     for n in 2..=32 {
         let instance = Instance::new(n);
         unsafe {
-            assert_eq!(
-                (*(*instance.base).parameter_pages).num_pages as usize,
-                VOICE_COUNT + 2
-            );
+            assert_eq!((*(*instance.base).parameter_pages).num_pages as usize, 3);
             assert_eq!(
                 editor_parameter(n as usize, 0, 0),
                 Some(seam_parameter(n as usize))
@@ -183,59 +196,25 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             let pages = &*(*instance.base).parameter_pages;
             let oscillator_group = (*pages.pages).group;
             let routing_group = (*pages.pages.add(1)).group;
-            let page = &*pages.pages.add(VOICE_COUNT + 1);
+            let page = &*pages.pages.add(2);
             assert_eq!(CStr::from_ptr(page.name), c"Waveform");
             assert_ne!(page.group, 0);
             assert_ne!(page.group, oscillator_group);
             assert_ne!(page.group, routing_group);
-            for (voice, name) in [c"Voice 1", c"Voice 2", c"Voice 3", c"Voice 4"]
-                .into_iter()
-                .enumerate()
-            {
-                let voice_page = &*pages.pages.add(voice + 1);
-                assert_eq!(CStr::from_ptr(voice_page.name), name);
-                assert_eq!(voice_page.group, routing_group);
-                let indices =
-                    core::slice::from_raw_parts(voice_page.params, voice_page.num_params as usize);
-                let expected = voice_parameters(n as usize, voice).map(|p| p as u8);
-                assert_eq!(indices, &expected);
-                let [cv, output, mode] = voice_parameters(n as usize, voice);
-                for (parameter, name) in [
-                    (cv, c"Pitch CV"),
-                    (output, c"Output"),
-                    (mode, c"Output mode"),
-                ] {
-                    let d = *(*instance.base).parameters.add(parameter);
-                    assert_eq!(d.min, 0);
-                    assert_eq!(CStr::from_ptr(d.name), name);
-                    let mut prefix = [0 as c_char; PARAMETER_UI_PREFIX_SIZE];
-                    assert_eq!(
-                        factory().parameter_ui_prefix.unwrap()(
-                            instance.base,
-                            parameter as i32,
-                            prefix.as_mut_ptr()
-                        ),
-                        3
-                    );
-                    assert_eq!(
-                        CStr::from_ptr(prefix.as_ptr()).to_bytes(),
-                        std::format!("V{}:", voice + 1).as_bytes()
-                    );
-                }
-                let mut prefix = [0 as c_char; PARAMETER_UI_PREFIX_SIZE];
-                assert_eq!(
-                    factory().parameter_ui_prefix.unwrap()(
-                        instance.base,
-                        PITCH as i32,
-                        prefix.as_mut_ptr()
-                    ),
-                    0
-                );
-                assert_eq!(CStr::from_ptr(prefix.as_ptr()), c"");
-                assert_eq!(instance.values[output], if voice == 0 { 13 } else { 0 });
-                assert_eq!(instance.values[cv], 0);
-                assert_eq!(instance.values[mode], 0);
-            }
+            let routing = &*pages.pages.add(1);
+            assert_eq!(CStr::from_ptr(routing.name), c"Routings");
+            assert_eq!(
+                core::slice::from_raw_parts(routing.params, routing.num_params as usize),
+                &[OUTPUT as u8, OUTPUT_MODE as u8, PITCH_CV as u8]
+            );
+            assert_eq!(instance.values[OUTPUT], 13);
+            assert_eq!(instance.values[OUTPUT_MODE], 0);
+            assert_eq!(instance.values[PITCH_CV], 0);
+            assert_eq!(
+                CStr::from_ptr((*(*instance.base).parameters.add(PITCH_CV)).name),
+                c"Voice 1 Pitch CV"
+            );
+            assert!(factory().parameter_ui_prefix.is_none());
             assert_eq!(page.num_params as usize, n as usize * 2 + 1);
             let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
             assert_eq!(rows[0] as usize, seam_parameter(n as usize));
@@ -280,7 +259,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert_eq!(references[randomize_parameter(n as usize)], 1);
             let midi = midi_channel_parameter(n as usize);
             assert_eq!(references[midi], 1);
-            assert_eq!(midi, GLOBALS + n as usize * 2 + 11 + (VOICE_COUNT - 1) * 3);
+            assert_eq!(midi, GLOBALS + n as usize * 2 + 11);
             let d = *(*instance.base).parameters.add(midi);
             assert_eq!((d.min, d.max, d.default, d.unit), (0, 17, 0, UNIT_ENUM));
             assert_eq!(CStr::from_ptr(*d.enum_strings), c"Off");
@@ -331,14 +310,14 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
 }
 
 #[test]
-fn only_segment_count_is_specified_and_six_tables_are_always_allocated() {
-    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 1);
+fn specification_layout_keeps_six_tables_fixed_and_defaults_to_one_voice() {
+    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 2);
     assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Segments");
-    assert_eq!(unsafe { factory() }.num_specifications, 1);
+    assert_eq!(unsafe { factory() }.num_specifications, 2);
     for segments in 2..=32 {
         let mut instance = Instance::new(segments);
         assert_eq!(
-            Wavesmith::configuration(&[segments]).unwrap().voices,
+            Wavesmith::configuration(&[segments, 1]).unwrap().regions,
             dsp::blocks(dsp::DEFAULT_TABLES)
         );
         let mut samples = [0.0; LAST_BUS * 24];
@@ -638,282 +617,260 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
 }
 
 #[test]
-fn stable_midi_and_cv_reuse_frequency_caches_and_steady_playback_across_blocks() {
-    const FRAMES: usize = 24;
-    let mut instance = Instance::new(8);
-    for voice in 0..VOICE_COUNT {
-        let [cv, output, mode] = voice_parameters(8, voice);
-        instance.change(cv, voice as i16 + 1);
-        instance.change(output, 13 + voice as i16);
-        instance.change(mode, 1);
-    }
-    instance.change(midi_channel_parameter(8), 1);
-    for note in [60, 64, 67, 71] {
-        instance.midi(0x90, note, 100);
-    }
-    let mut samples = [0.0; LAST_BUS * FRAMES];
-    for _ in 0..160 {
-        instance.render(&mut samples);
-    }
-    let before = dsp::playback_work_counts();
-    for _ in 0..100 {
-        instance.render(&mut samples);
-    }
-    let after = dsp::playback_work_counts();
-    assert_eq!(after.0 - before.0, 100 * FRAMES * VOICE_COUNT);
-    assert_eq!(after.1, before.1);
-    instance.change(FINE, 10);
-    instance.render(&mut samples);
-    assert_eq!(dsp::playback_work_counts().1 - after.1, VOICE_COUNT);
-    instance.change(midi_channel_parameter(8), 0);
-    for _ in 0..160 {
-        instance.render(&mut samples);
-    }
-    let before = dsp::playback_work_counts();
-    for _ in 0..100 {
-        instance.render(&mut samples);
-    }
-    let after = dsp::playback_work_counts();
-    assert_eq!(after.0 - before.0, 100 * FRAMES * VOICE_COUNT);
-    assert_eq!(after.1, before.1);
-    samples[..FRAMES].fill(0.00001); // No deadband on actual CV pitch.
-    instance.render(&mut samples);
-    assert_eq!(dsp::playback_work_counts().1 - after.1, 1);
-    // An output routing change must not convert pitch or disturb the voice.
-    instance.change(OUTPUT, 20);
-    let before = dsp::playback_work_counts().1;
-    instance.render(&mut samples);
-    assert_eq!(dsp::playback_work_counts().1, before);
-}
-
-#[test]
-fn midi_gates_four_voices_ignores_cv_and_manual_pitch_and_restores_cv_when_off() {
-    const FRAMES: usize = 24;
-    let mut instance = Instance::new(8);
-    for voice in 0..VOICE_COUNT {
-        let [cv, output, mode] = voice_parameters(8, voice);
-        instance.change(cv, voice as i16 + 1);
-        instance.change(output, 13 + voice as i16);
-        instance.change(mode, 1);
-    }
-    instance.change(PITCH, 0);
-    instance.change(midi_channel_parameter(8), 2); // Channel 1.
-    let mut samples = [0.0; LAST_BUS * FRAMES];
-    let ticks = dsp::oscillator_tick_count();
-    for _ in 0..60 {
-        instance.render(&mut samples);
-    }
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    assert!(samples.iter().all(|&value| value == 0.0));
-    instance.midi(0x91, 60, 100); // Wrong channel.
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    for note in [60, 64, 67, 71] {
-        instance.midi(0x90, note, 100);
-    }
-    let mut crossings = [0usize; VOICE_COUNT];
-    let mut last = [0.0; VOICE_COUNT];
-    for block in 0..220 {
-        // Deliberately unrelated CV; neither this nor manual Pitch affects MIDI.
-        for voice in 0..VOICE_COUNT {
-            samples[voice * FRAMES..(voice + 1) * FRAMES].fill(if block % 2 == 0 {
-                8.0
-            } else {
-                -8.0
-            });
-        }
-        if block == 110 {
-            instance.change(PITCH, 127);
-        }
-        instance.render(&mut samples);
-        if block >= 20 {
-            for voice in 0..VOICE_COUNT {
-                for &sample in &samples[(12 + voice) * FRAMES..(13 + voice) * FRAMES] {
-                    if last[voice] < 0.0 && sample >= 0.0 {
-                        crossings[voice] += 1;
+fn configurable_voices_have_only_shared_routing_and_named_cv_parameters() {
+    assert_eq!(
+        (
+            Wavesmith::SPECIFICATIONS[1].min,
+            Wavesmith::SPECIFICATIONS[1].max,
+            Wavesmith::SPECIFICATIONS[1].default
+        ),
+        (1, 10, 1)
+    );
+    for n in 2..=32 {
+        for voices in 1..=VOICE_COUNT {
+            let instance = Instance::with_voices(n, voices as i32);
+            let config = Wavesmith::configuration(&[n, voices as i32]).unwrap();
+            assert_eq!(config.pages, 3);
+            assert_eq!(
+                config.regions * core::mem::size_of::<dsp::Block>(),
+                24 * 1024
+            );
+            unsafe {
+                let pages = &*(*instance.base).parameter_pages;
+                let routing = &*pages.pages.add(1);
+                let rows = core::slice::from_raw_parts(routing.params, routing.num_params as usize);
+                assert_eq!(rows.len(), voices + 2);
+                assert_eq!(&rows[..2], &[OUTPUT as u8, OUTPUT_MODE as u8]);
+                let mut seen = std::vec![0; instance.values.len()];
+                for i in 0..3 {
+                    let page = &*pages.pages.add(i);
+                    for &p in core::slice::from_raw_parts(page.params, page.num_params as usize) {
+                        seen[p as usize] += 1;
                     }
-                    last[voice] = sample;
+                }
+                for (p, references) in seen.into_iter().enumerate() {
+                    assert_eq!(
+                        references,
+                        if p == seam_parameter(n as usize) {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                }
+                for voice in 0..voices {
+                    let cv = voice_pitch_parameter(n as usize, voice);
+                    assert_eq!(rows[voice + 2] as usize, cv);
+                    let d = &*(*instance.base).parameters.add(cv);
+                    assert_eq!(
+                        CStr::from_ptr(d.name).to_str().unwrap(),
+                        std::format!("Voice {} Pitch CV", voice + 1)
+                    );
+                    assert_eq!(
+                        (d.min, d.max, d.default, d.unit),
+                        (0, LAST_BUS as i16, 0, UNIT_CV_INPUT)
+                    );
                 }
             }
         }
     }
-    for (voice, frequency) in [261.6256f32, 329.6276, 391.9954, 493.8833]
-        .into_iter()
-        .enumerate()
-    {
-        assert!((crossings[voice] as f32 - frequency * 4800.0 / 48000.0).abs() < 2.0);
+    for invalid in [-1, 0, 11] {
+        assert!(Wavesmith::configuration(&[8, invalid]).is_none());
     }
-    instance.midi(0x90, 74, 100); // Steals oldest voice (Voice 1).
-    instance.midi(0x80, 60, 0); // Old key release must not release replacement.
-    for _ in 0..30 {
-        instance.render(&mut samples);
-    }
-    let ticks = dsp::oscillator_tick_count();
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES * VOICE_COUNT);
-    for note in [74, 64, 67, 71] {
-        instance.midi(0x90, note, 0);
-    }
-    for _ in 0..30 {
-        instance.render(&mut samples);
-    }
-    let ticks = dsp::oscillator_tick_count();
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    assert!(samples[12 * FRAMES..16 * FRAMES]
-        .iter()
-        .all(|&value| value == 0.0));
-    instance.change(midi_channel_parameter(8), 0);
-    instance.change(PITCH, 57);
-    samples.fill(0.0);
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES * VOICE_COUNT);
-    assert!(samples[12 * FRAMES..16 * FRAMES]
-        .iter()
-        .any(|&value| value.abs() > 0.00001));
+    assert!(Wavesmith::configuration(&[8]).is_none());
 }
 
 #[test]
-fn midi_disabled_outputs_are_excluded_from_allocation_and_do_not_resume_old_notes() {
+fn stable_midi_and_cv_reuse_caches_for_only_the_configured_pool() {
     const FRAMES: usize = 24;
-    let mut instance = Instance::new(8);
-    instance.change(OUTPUT_MODE, 1);
-    instance.change(midi_channel_parameter(8), 1); // All channels.
-    let mut samples = [0.0; LAST_BUS * FRAMES];
-    for _ in 0..60 {
-        instance.render(&mut samples);
-    }
-    for note in [60, 64, 67, 71, 74] {
-        instance.midi(0x90, note, 100);
-    }
-    for _ in 0..30 {
-        instance.render(&mut samples);
-    }
-    let ticks = dsp::oscillator_tick_count();
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
-    instance.change(OUTPUT, 0);
-    let ticks = dsp::oscillator_tick_count();
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    instance.change(OUTPUT, 13);
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    assert!(samples[12 * FRAMES..13 * FRAMES]
-        .iter()
-        .all(|&value| value == 0.0));
-    instance.midi(0x90, 67, 100);
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
-}
-
-#[test]
-fn four_voices_follow_independent_cv_pitches_and_none_output_skips_playback() {
-    const FRAMES: usize = 24;
-    let mut instance = Instance::new(32);
-    let mut samples = [0.0; LAST_BUS * FRAMES];
-    let ticks = dsp::oscillator_tick_count();
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
-    for voice in 0..VOICE_COUNT {
-        let [cv, output, mode] = voice_parameters(32, voice);
-        instance.change(cv, voice as i16 + 1);
-        instance.change(output, 13 + voice as i16);
-        instance.change(mode, 1);
-    }
-    let mut crossings = [0usize; VOICE_COUNT];
-    let mut last = [0.0; VOICE_COUNT];
-    for block in 0..160 {
-        for voice in 0..VOICE_COUNT {
-            samples[voice * FRAMES..(voice + 1) * FRAMES].fill(voice as f32);
+    for voices in 1..=VOICE_COUNT {
+        let mut instance = Instance::with_voices(8, voices as i32);
+        instance.change(OUTPUT_MODE, 1);
+        for voice in 0..voices {
+            instance.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
         }
-        let ticks = dsp::oscillator_tick_count();
+        instance.change(midi_channel_parameter(8), 1);
+        for voice in 0..voices {
+            instance.midi(0x90, 60 + voice as u8, 100);
+        }
+        let mut samples = [0.0; LAST_BUS * FRAMES];
+        for _ in 0..160 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::playback_work_counts();
+        for _ in 0..100 {
+            instance.render(&mut samples);
+        }
+        let after = dsp::playback_work_counts();
+        assert_eq!(after.0 - before.0, 100 * FRAMES * voices);
+        assert_eq!(after.1, before.1);
+        instance.change(FINE, 10);
         instance.render(&mut samples);
-        assert_eq!(dsp::oscillator_tick_count() - ticks, VOICE_COUNT * FRAMES);
-        if block >= 60 {
-            for voice in 0..VOICE_COUNT {
-                for &sample in &samples[(12 + voice) * FRAMES..(13 + voice) * FRAMES] {
-                    if last[voice] < 0.0 && sample >= 0.0 {
-                        crossings[voice] += 1;
-                    }
-                    last[voice] = sample;
+        assert_eq!(dsp::playback_work_counts().1 - after.1, voices);
+        instance.change(midi_channel_parameter(8), 0);
+        for _ in 0..160 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::playback_work_counts();
+        for _ in 0..100 {
+            instance.render(&mut samples);
+        }
+        let after = dsp::playback_work_counts();
+        assert_eq!(after.0 - before.0, 100 * FRAMES * voices);
+        assert_eq!(after.1, before.1);
+        samples[..FRAMES].fill(0.00001);
+        instance.render(&mut samples);
+        assert_eq!(dsp::playback_work_counts().1 - after.1, 1);
+    }
+}
+
+#[test]
+fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
+    const FRAMES: usize = 24;
+    for voices in 1..=VOICE_COUNT {
+        let mut instance = Instance::with_voices(8, voices as i32);
+        instance.change(OUTPUT_MODE, 1);
+        instance.change(midi_channel_parameter(8), 2);
+        instance.change(PITCH, 0);
+        for voice in 0..voices {
+            instance.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
+        }
+        let mut samples = [0.0; LAST_BUS * FRAMES];
+        let before = dsp::oscillator_tick_count();
+        for _ in 0..60 {
+            instance.render(&mut samples);
+        }
+        instance.midi(0x91, 60, 100);
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        for voice in 0..voices {
+            instance.midi(0x90, 60 + voice as u8, 100);
+        }
+        for _ in 0..160 {
+            for voice in 0..voices {
+                samples[voice * FRAMES..(voice + 1) * FRAMES].fill(8.0);
+            }
+            instance.render(&mut samples);
+        }
+        let before = dsp::playback_work_counts();
+        instance.change(PITCH, 127);
+        for voice in 0..voices {
+            samples[voice * FRAMES..(voice + 1) * FRAMES].fill(-8.0);
+        }
+        instance.render(&mut samples);
+        assert_eq!(dsp::playback_work_counts().0 - before.0, voices * FRAMES);
+        assert_eq!(dsp::playback_work_counts().1, before.1);
+        instance.midi(0x90, 84, 100); // Steal oldest.
+        instance.midi(0x80, 60, 0); // Stale release must not stop replacement.
+        for _ in 0..30 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices * FRAMES);
+        for voice in 1..voices {
+            instance.midi(0x90, 60 + voice as u8, 0);
+        }
+        instance.midi(0x90, 84, 0);
+        for _ in 0..30 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        assert!(samples[12 * FRAMES..13 * FRAMES].iter().all(|&v| v == 0.0));
+        instance.change(midi_channel_parameter(8), 0);
+        instance.change(PITCH, 57);
+        samples.fill(0.0);
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices * FRAMES);
+    }
+}
+
+#[test]
+fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
+    for voices in 1..=VOICE_COUNT {
+        let mut instance = Instance::with_voices(8, voices as i32);
+        instance.change(OUTPUT_MODE, 1);
+        instance.change(midi_channel_parameter(8), 1);
+        for voice in 0..voices {
+            instance.midi(0x90, 60 + voice as u8, 100);
+        }
+        let mut samples = [0.0; LAST_BUS * 24];
+        for _ in 0..80 {
+            instance.render(&mut samples);
+        }
+        instance.change(OUTPUT, 0);
+        let before = dsp::oscillator_tick_count();
+        samples.fill(2.0);
+        for _ in 0..80 {
+            instance.render(&mut samples);
+        }
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        assert!(samples.iter().all(|&v| v == 2.0));
+        instance.change(OUTPUT, 13);
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
+        instance.midi(0x90, 67, 100);
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, 24);
+    }
+}
+
+#[test]
+fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first() {
+    const FRAMES: usize = 24;
+    for voices in 1..=VOICE_COUNT {
+        let mut mixed = Instance::with_voices(8, voices as i32);
+        mixed.change(OUTPUT, 1); // Overwrites Voice 1's pitch input after snapshot.
+        mixed.change(OUTPUT_MODE, 1);
+        for voice in 0..voices {
+            mixed.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
+        }
+        let mut references: Vec<_> = (0..voices)
+            .map(|_| {
+                let mut mono = Instance::new(8);
+                mono.change(OUTPUT_MODE, 1);
+                mono.change(PITCH_CV, 1);
+                mono
+            })
+            .collect();
+        let mut samples = [0.0; LAST_BUS * FRAMES];
+        for _ in 0..120 {
+            for voice in 0..voices {
+                samples[voice * FRAMES..(voice + 1) * FRAMES].fill(voice as f32 * 0.25);
+            }
+            mixed.render(&mut samples);
+            let mut expected = [0.0; FRAMES];
+            for (voice, mono) in references.iter_mut().enumerate() {
+                let mut buffer = [0.0; LAST_BUS * FRAMES];
+                buffer[..FRAMES].fill(voice as f32 * 0.25);
+                mono.render(&mut buffer);
+                for (sum, &v) in expected.iter_mut().zip(&buffer[12 * FRAMES..13 * FRAMES]) {
+                    *sum += v;
                 }
             }
-        }
-    }
-    for (voice, &count) in crossings.iter().enumerate() {
-        let expected = 220.0 * (1usize << voice) as f32 * 2400.0 / 48000.0;
-        assert!(
-            (count as f32 - expected).abs() < 2.0,
-            "voice {voice}: {count} vs {expected}"
-        );
-    }
-    for voice in 0..VOICE_COUNT {
-        instance.change(voice_parameters(32, voice)[1], 0);
-    }
-    instance.change(curve_parameter(32, 0), 73);
-    let ticks = dsp::oscillator_tick_count();
-    for _ in 0..80 {
-        samples.fill(2.5);
-        instance.render(&mut samples);
-        assert!(samples.iter().all(|&value| value == 2.5));
-    }
-    assert_eq!(dsp::oscillator_tick_count(), ticks);
-    let [cv, output, mode] = voice_parameters(32, 2);
-    instance.change(cv, 0);
-    instance.change(output, 15);
-    instance.change(mode, 1);
-    samples.fill(0.0);
-    instance.render(&mut samples);
-    assert_eq!(dsp::oscillator_tick_count() - ticks, FRAMES);
-    assert!(samples[14 * FRAMES..15 * FRAMES]
-        .iter()
-        .any(|&value| value.abs() > 0.001));
-}
-
-#[test]
-fn voice_pitch_inputs_are_snapshotted_before_outputs_and_none_cv_uses_manual_pitch() {
-    let mut instance = Instance::new(32);
-    let [_, out1, mode1] = voice_parameters(32, 0);
-    let [cv2, out2, mode2] = voice_parameters(32, 1);
-    instance.change(out1, 1);
-    instance.change(mode1, 1);
-    instance.change(cv2, 1);
-    instance.change(out2, 14);
-    instance.change(mode2, 1);
-    let mut samples = [0.0; LAST_BUS * 64];
-    let mut last = [0.0; 2];
-    let mut crossings = [0usize; 2];
-    for block in 0..160 {
-        // Bus 1 is both Voice 2's pitch input and Voice 1's destination.
-        samples[..64].fill(1.0);
-        instance.render(&mut samples);
-        if block >= 60 {
-            for (voice, bus) in [0, 13].into_iter().enumerate() {
-                for &sample in &samples[bus * 64..(bus + 1) * 64] {
-                    if last[voice] < 0.0 && sample >= 0.0 {
-                        crossings[voice] += 1;
-                    }
-                    last[voice] = sample;
-                }
+            for (&actual, &expected) in samples[..FRAMES].iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() < 0.00001,
+                    "voices {voices}: {actual} vs {expected}"
+                );
             }
         }
-    }
-    for (voice, frequency) in [220.0f32, 440.0].into_iter().enumerate() {
-        assert!((crossings[voice] as f32 - frequency * 6400.0 / 48000.0).abs() < 2.0);
+        let before = dsp::oscillator_tick_count();
+        mixed.change(OUTPUT, 0);
+        mixed.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
     }
 }
 
 #[test]
-fn voices_sharing_an_output_mix_after_a_single_replace_clear() {
+fn configured_voices_sum_without_normalization_and_replace_clears_only_once() {
     let mut reference: Option<Vec<f32>> = None;
-    for enabled in [1, 2, 4] {
-        let mut instance = Instance::new(8);
-        for voice in 0..enabled {
-            let [_, output, mode] = voice_parameters(8, voice);
-            instance.change(output, 13);
-            instance.change(mode, 1);
-        }
+    for voices in 1..=VOICE_COUNT {
+        let mut instance = Instance::with_voices(8, voices as i32);
+        instance.change(OUTPUT_MODE, 1);
         let mut samples = [0.0; LAST_BUS * 64];
         for _ in 0..80 {
             samples.fill(2.0);
@@ -921,8 +878,8 @@ fn voices_sharing_an_output_mix_after_a_single_replace_clear() {
         }
         let output = samples[12 * 64..13 * 64].to_vec();
         if let Some(mono) = &reference {
-            for (&actual, &expected) in output.iter().zip(mono) {
-                assert!((actual - expected * enabled as f32).abs() < 0.00001);
+            for (&actual, &v) in output.iter().zip(mono) {
+                assert!((actual - v * voices as f32).abs() < 0.0001);
             }
         } else {
             reference = Some(output);
@@ -1617,4 +1574,149 @@ unsafe extern "C" fn NT_drawShapeF(kind: u8, x0: f32, y0: f32, x1: f32, y1: f32,
     assert!((0.0..=255.0).contains(&x0) && (0.0..=255.0).contains(&x1));
     assert!((14.0..=42.0).contains(&y0) && (14.0..=42.0).contains(&y1));
     TRACE_LINES.with(|lines| lines.borrow_mut().push((x0, y0, x1, y1, color)));
+}
+
+#[test]
+fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
+    for voices in [1, 4, 10] {
+        let mut mixed = Instance::with_voices(8, voices);
+        mixed.change(OUTPUT_MODE, 1);
+        mixed.change(midi_channel_parameter(8), 1);
+        for voice in 0..voices {
+            mixed.midi(0x90, 60 + voice as u8, 100);
+        }
+        let mut references: Vec<_> = (0..voices)
+            .map(|voice| {
+                let mut mono = Instance::new(8);
+                mono.change(OUTPUT_MODE, 1);
+                mono.change(midi_channel_parameter(8), 1);
+                mono.midi(0x90, 60 + voice as u8, 100);
+                mono
+            })
+            .collect();
+        for block in 0..160 {
+            if block == 120 {
+                for voice in 0..voices {
+                    mixed.midi(0x80, 60 + voice as u8, 0);
+                }
+                for (voice, mono) in references.iter_mut().enumerate() {
+                    mono.midi(0x80, 60 + voice as u8, 0);
+                }
+            }
+            let mut samples = [0.0; LAST_BUS * 24];
+            mixed.render(&mut samples);
+            let mut expected = [0.0; 24];
+            for mono in &mut references {
+                let mut buffer = [0.0; LAST_BUS * 24];
+                mono.render(&mut buffer);
+                for (sum, &v) in expected.iter_mut().zip(&buffer[12 * 24..13 * 24]) {
+                    *sum += v;
+                }
+            }
+            for (&actual, &expected) in samples[12 * 24..13 * 24].iter().zip(&expected) {
+                assert!((actual - expected).abs() < 0.00001);
+            }
+        }
+    }
+}
+
+// Snapshot fields, not struct bytes: ABI padding is not initialized data.
+fn persistence_metadata(instance: &Instance) -> Vec<String> {
+    let mut result = Vec::new();
+    unsafe {
+        let factory = factory();
+        assert!(factory.serialise.is_none());
+        assert!(factory.deserialise.is_none());
+        assert!(factory.parameter_string.is_none());
+        assert!(factory.parameter_ui_prefix.is_none());
+        assert!(factory.string_parameter_buffer.is_none());
+        let mut names = Vec::new();
+        for index in 0..instance.values.len() {
+            let p = &*(*instance.base).parameters.add(index);
+            let name = CStr::from_ptr(p.name).to_str().unwrap();
+            assert!(!name.is_empty());
+            assert!(!names.contains(&name), "duplicate parameter name {name}");
+            names.push(name);
+            assert!(p.min <= p.default && p.default <= p.max);
+            assert!((p.min..=p.max).contains(&instance.values[index]));
+            result.push(std::format!(
+                "{index}:{name}:{}:{}:{}:{}:{}:{:p}:{:p}",
+                p.min,
+                p.max,
+                p.default,
+                p.unit,
+                p.scaling,
+                p.name,
+                p.enum_strings
+            ));
+            if p.unit == UNIT_ENUM {
+                assert!(!p.enum_strings.is_null());
+                for value in p.min..=p.max {
+                    let label = CStr::from_ptr(*p.enum_strings.add(value as usize))
+                        .to_str()
+                        .unwrap();
+                    assert!(!label.is_empty());
+                    result.push(std::format!("enum:{value}:{label}"));
+                }
+            } else {
+                assert!(p.enum_strings.is_null());
+            }
+        }
+        let pages = &*(*instance.base).parameter_pages;
+        assert_eq!(pages.num_pages, 3);
+        for i in 0..pages.num_pages as usize {
+            let page = &*pages.pages.add(i);
+            let name = CStr::from_ptr(page.name).to_str().unwrap();
+            let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
+            assert!(rows.iter().all(|&p| (p as usize) < instance.values.len()));
+            result.push(std::format!(
+                "page:{name}:{}:{:p}:{rows:?}",
+                page.group,
+                page.params
+            ));
+        }
+    }
+    instance.assert_guard();
+    result
+}
+
+#[test]
+fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activity() {
+    for (segments, voices) in [(8, 1), (16, 10), (32, 10)] {
+        let mut instance = Instance::with_voices(segments, voices);
+        let initial = persistence_metadata(&instance);
+        for index in 0..instance.values.len() {
+            let (min, max) = unsafe {
+                let p = &*(*instance.base).parameters.add(index);
+                (p.min, p.max)
+            };
+            for value in [min, max] {
+                instance.change(index, value);
+                assert_eq!(persistence_metadata(&instance), initial);
+            }
+        }
+        instance.change(OUTPUT, 13);
+        instance.change(OUTPUT_MODE, 1);
+        instance.change(midi_channel_parameter(segments as usize), 1);
+        instance.change(SMOOTHING, 37);
+        for voice in 0..voices {
+            instance.midi(0x90, 48 + voice as u8, 100);
+        }
+        let mut samples = [0.0; LAST_BUS * 24];
+        for block in 0..400 {
+            if block % 16 == 0 {
+                instance.change(
+                    curve_parameter(segments as usize, block / 16 % segments as usize),
+                    (block as i16 % 201) - 100,
+                );
+                instance.change(
+                    strength_parameter(segments as usize),
+                    (block as i16 % 201) - 100,
+                );
+            }
+            instance.render(&mut samples);
+            instance.draw();
+            assert_eq!(persistence_metadata(&instance), initial);
+        }
+    }
 }

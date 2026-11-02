@@ -237,7 +237,7 @@ fn pitch_note(canvas: &mut Canvas<'_>, x: i32, value: i16, color: i32) {
 
 pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     let state = context.state();
-    let memory = context.voices();
+    let memory = context.regions();
     let selected = state.ui.selected;
     // Expose the validated nonzero divisor to the optimizer so it does not
     // retain a precompiled non-PIC divide-by-zero panic helper.

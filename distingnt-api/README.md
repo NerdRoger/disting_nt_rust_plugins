@@ -16,10 +16,33 @@ values remain available at the crate root. Raw clients explicitly depend on
 
 ## Framework and adapters
 
-Implement `api::plugin::Plugin` with ordinary State/Voice values, a StateMemory
+Implement `api::plugin::Plugin` with ordinary State/Region values, a StateMemory
 policy, factory specifications, validated metadata and safe callbacks. Invoke
 `export_plugin!(YourPlugin)` in a no_std crate enforcing forbid(unsafe_code).
 See Window Comparator's plugin.rs and Monosynth's lib.rs for complete examples.
+
+Every plugin must implement `Plugin::initialize_state` and
+`Plugin::initialize_region`. Both receive a `RegionInitializer` pointing at the
+final host allocation. Use `initialize_region!(destination, State { field: value,
+... })` for structs, `destination.set(value)` for scalar/unit states, and
+`destination.fill(value)` or `fill_with(|index| value)` for array states. The
+macro checks that every struct field is supplied. Plugins retain
+`forbid(unsafe_code)`; pointer admission and raw writes remain inside the API.
+Success without completed initialization is rejected before publishing the
+instance, including for preallocated regions.
+
+`Configuration::regions` specifies the number of additional preallocated
+regions, each holding one object of the plugin's `Region` type. The API lays
+these objects out as a fixed-size array in the host-provided RAM and calls
+`initialize_region` once per object. `Context::regions()`/`regions_mut()` and
+`Processing::regions` expose that initialized array. These are memory regions,
+not musical voices; a plugin needing no additional objects specifies zero.
+
+Construction requires the direct `initialize_state` and `initialize_region`
+hooks; value-returning constructors and generic whole-state setters are unavailable. This is a required API migration for downstream plugins.
+Instance state retains its selected SRAM/DTC placement; preallocated regions
+remain in SRAM. This avoids whole-state construction temporaries, but individual
+field constructors and other function locals can still use stack space.
 
 Set `Plugin::INITIALIZATION_IN_DRAM = true` to select DRAM entry points for
 requirements calculation and construction. It defaults to false for other
@@ -52,7 +75,7 @@ ones are enabled as follows:
 | C++ callbacks | Rust hooks | Enable with |
 | --- | --- | --- |
 | calculateStaticRequirements, initialise | calculate_static_requirements, initialise | STATIC_INITIALIZATION |
-| calculateRequirements, construct | configuration, create, create_voice, metadata | Always supplied by the framework |
+| calculateRequirements, construct | configuration, initialize_state, initialize_region, metadata | Always supplied by the framework |
 | parameterChanged, step, draw | parameter_changed, step, draw | Always supplied |
 | midiRealtime, midiMessage | midi_realtime, midi_message | MIDI |
 | hasCustomUi, customUi, setupUi | has_custom_ui, custom_ui, setup_ui | Nonzero CUSTOM_UI mask |
@@ -102,7 +125,7 @@ implementations compile away; no new storage is added to existing instances.
   Window Comparator retains SRAM state; Monosynth retains its 16-byte DTC DSP
   state. Monosynth now uses framework-owned per-instance metadata in SRAM.
 
-State/voices must be Copy because the host has no destruction callback. This
+State/regions must be Copy because the host has no destruction callback. This
 constraint does not cause whole-state copies on each callback. Rust borrowing
 prevents state references from spanning reentrant setters. Small wrappers use
 ordinary inline hints; there is no allocation or dynamic dispatch.

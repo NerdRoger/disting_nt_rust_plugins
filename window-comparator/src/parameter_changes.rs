@@ -51,7 +51,7 @@ fn update_global_range(context: &mut Callback<'_, Audio>, parameter: usize) -> O
 }
 
 fn update_channel_range(context: &mut Callback<'_, Audio>, channel: usize) -> Option<()> {
-    let offset = context.voices().get(channel)?.offset();
+    let offset = context.regions().get(channel)?.offset();
     // Keep this read inside the channel loop, matching reentrant notification order.
     let limits = Limits::from_range(
         context.read_parameters().scaled(gp::RANGE_MIN)? as i8,
@@ -77,7 +77,7 @@ fn update_channel_range(context: &mut Callback<'_, Audio>, channel: usize) -> Op
     Some(())
 }
 
-// The closure borrows the context only while running. No state/voice reference
+// The closure borrows the context only while running. No state/region reference
 // spans a setter, and cleanup runs even if the operation returns None.
 fn with_guard(
     context: &mut Callback<'_, Audio>,
@@ -86,12 +86,12 @@ fn with_guard(
     operation: impl FnOnce(&mut Callback<'_, Audio>) -> Option<()>,
 ) -> Option<()> {
     context
-        .voices_mut()
+        .regions_mut()
         .get_mut(channel)?
         .set_guard(guard, true);
     let result = operation(context);
     context
-        .voices_mut()
+        .regions_mut()
         .get_mut(channel)?
         .set_guard(guard, false);
     result
@@ -104,7 +104,7 @@ fn update_channel(
     channel: usize,
     parameter: usize,
 ) -> Option<()> {
-    let offset = context.voices().get(channel)?.offset();
+    let offset = context.regions().get(channel)?.offset();
     match parameter.checked_sub(offset) {
         Some(cp::OVERRIDE_ATTENUATION) => {
             let gray = context.read_parameters().value(parameter)? != 1;
@@ -133,7 +133,7 @@ fn synchronize_bounds(
         context.read_parameters().value(offset + cp::LEFT)?,
         context.read_parameters().value(offset + cp::RIGHT)?,
     );
-    if !context.voices().get(channel)?.guard(Guard::SizePosition) {
+    if !context.regions().get(channel)?.guard(Guard::SizePosition) {
         context
             .parameters()
             .set(offset + cp::CENTER, values.center as i16)?;
@@ -165,7 +165,7 @@ fn synchronize_center_width(
         context.read_parameters().value(offset + cp::CENTER)?,
         context.read_parameters().value(offset + cp::WIDTH)?,
     );
-    if !context.voices().get(channel)?.guard(Guard::Bounds) {
+    if !context.regions().get(channel)?.guard(Guard::Bounds) {
         context
             .parameters()
             .set(offset + cp::LEFT, values.left as i16)?;

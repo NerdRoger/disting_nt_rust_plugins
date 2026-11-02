@@ -36,7 +36,7 @@ The companion Monosynth still has 1,528 allocated bytes.
 
 Removed `Parameters`, parameter-change `Host`, UI `Host`, and `Instance`, along
 with `context_adapter.rs`. UI and parameter synchronization operate on the API's
-typed callback context. Reads copy values and state/voice borrows end before
+typed callback context. Reads copy values and state/region borrows end before
 reentrant setters or metadata notifications. Existing recursion guards and
 notification ordering remain intact.
 

@@ -13,12 +13,12 @@ and ParameterInfo, not foreign pointers or raw definition fields.
 ## Construction and metadata
 
 The framework computes an aligned, nonoverlapping SRAM layout for its C ABI
-header, ordinary Rust state, parameter definitions, pages, indices and voices.
+header, ordinary Rust state, parameter definitions, pages, indices and regions.
 It checks the supplied buffer's size/alignment and requires the constructor's
 parameter count to match the host's requirements. This also guards against a
 safe plugin returning inconsistent configurations between callbacks.
 
-State and voices must implement Copy because the host has no destruction hook;
+State and regions must implement Copy because the host has no destruction hook;
 this prevents silently losing owned Drop resources. State is stored once and
 borrowed during callbacks, rather than copied for each callback.
 
@@ -38,12 +38,12 @@ owned construction buffer, but no live instance is published.
 ## Reentrancy and lifetimes
 
 Contexts are neither Clone nor Copy. A parameter-setter capability exclusively
-borrows its context, preventing any reference returned from state/voice access
+borrows its context, preventing any reference returned from state/region access
 from remaining active across a reentrant setter or notification. Read-only
 parameter handles cannot mutate metadata. Audio and UI contexts expose the
 appropriate setter. Compile-fail tests enforce these restrictions.
 
-Audio processing borrows disjoint state, voices, parameter definitions/values and
+Audio processing borrows disjoint state, regions, parameter definitions/values and
 audio samples. Its context cannot issue setters while those borrows exist.
 Metadata updates borrow only local numeric Bounds; pointer-bearing fields cannot
 be changed through a safe update. The API writes changes before notifying the

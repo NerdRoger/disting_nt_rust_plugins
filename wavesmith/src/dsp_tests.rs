@@ -711,10 +711,10 @@ fn frequency_conversion_cache_persists_and_exact_cv_changes_invalidate_it() {
 
 #[test]
 fn shared_rebuilds_and_crossfade_time_do_not_depend_on_enabled_voice_count() {
-    for enabled in [0, 1, 4] {
+    for enabled in [0, 1, 4, 8] {
         let mut engine = Engine::new(32, 48000);
         let mut memory = [Block::ZERO; BLOCKS];
-        let mut voices = [Oscillator::new(); 4];
+        let mut voices = [Oscillator::new(); super::super::VOICE_COUNT];
         let mut wave = Wave::new(32);
         wave.curves.fill(73);
         wave.smoothing = 50;

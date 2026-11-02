@@ -13,7 +13,7 @@ pub(super) struct WindowComparator;
 
 impl Plugin for WindowComparator {
     type State = State;
-    type Voice = Channel;
+    type Region = Channel;
     type StateMemory = distingnt_api::api::state_memory::Sram;
     const GUID: u32 = multichar(b'A', b'T', b'w', b'R');
     const NAME: &'static core::ffi::CStr = c"Rust Window Comparator";
@@ -38,23 +38,35 @@ impl Plugin for WindowComparator {
             parameters: count_parameters(count),
             pages: count + 3,
             page_indices: count_parameters(count),
-            voices: count,
+            regions: count,
         })
     }
-    fn create(specs: &[i32], rate: u32) -> Option<State> {
+    fn initialize_state(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, State>,
+        specs: &[i32],
+        rate: u32,
+    ) -> Option<()> {
         let channels = ChannelCount::new(*specs.first()? as usize)?;
-        Some(State {
-            num_channels: channels,
-            first_step: true,
-            range_min: -5,
-            range_max: 5,
-            range: 10,
-            clock: model::AudioClock::new(rate)?,
-            ui: ui::UiState::new(channels),
-        })
+        distingnt_api::initialize_region!(
+            destination,
+            State {
+                num_channels: channels,
+                first_step: true,
+                range_min: -5,
+                range_max: 5,
+                range: 10,
+                clock: model::AudioClock::new(rate)?,
+                ui: ui::UiState::new(channels),
+            }
+        );
+        Some(())
     }
-    fn create_voice(_: &[i32], index: usize) -> Option<Channel> {
-        Channel::new(index)
+    fn initialize_region(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Channel>,
+        _: &[i32],
+        index: usize,
+    ) -> Option<()> {
+        Channel::initialize(destination, index)
     }
     fn metadata(specs: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
         parameters::build(ChannelCount::new(*specs.first()? as usize)?.get(), metadata)

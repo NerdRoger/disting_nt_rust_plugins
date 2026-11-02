@@ -39,13 +39,13 @@ Processing uses pointer-free ParameterValues/ParameterInfo views instead of
 exposing raw ABI definition slices.
 
 `plugin.rs` implements the API crate's safe `Plugin` trait. It declares the
-factory/specification, creates ordinary Rust state and channels, initializes
-metadata through the API's validated builder, and implements safe callbacks.
+factory/specification, initializes state and channel objects directly in
+preallocated regions, builds metadata through the API's validated builder, and implements safe callbacks.
 `export_plugin!(WindowComparator)` delegates symbol export, factory registration,
 ABI trampolines, and the panic handler to the API crate.
 
 Callbacks use safe API contexts directly. There are no plugin-local host or
-painter traits and no context adapter. State/voice references and parameter
+painter traits and no context adapter. State/region references and parameter
 setters borrow the same context, so the compiler rejects holding a state
 reference across a reentrant setter. There are no runtime borrow locks or
 per-callback copies of the full state.

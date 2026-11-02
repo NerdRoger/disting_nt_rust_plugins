@@ -27,14 +27,6 @@ struct SynthState {
 }
 
 impl SynthState {
-    const fn new() -> Self {
-        Self {
-            phase: 0,
-            increment: 0,
-            envelope: 0.0,
-            gate: false,
-        }
-    }
     fn note_off(&mut self) {
         self.gate = false;
     }
@@ -114,7 +106,7 @@ struct RustSynth;
 type Callback<'a> = Context<'a, SynthState, (), Audio, Dtc>;
 impl Plugin for RustSynth {
     type State = SynthState;
-    type Voice = ();
+    type Region = ();
     type StateMemory = Dtc;
     const GUID: u32 = multichar(b'A', b'T', b'm', b's');
     const NAME: &'static core::ffi::CStr = c"Rustsynth";
@@ -127,13 +119,31 @@ impl Plugin for RustSynth {
             parameters: PARAMETER_COUNT,
             pages: 2,
             page_indices: 4,
-            voices: 0,
+            regions: 0,
         })
     }
-    fn create(_: &[i32], _: u32) -> Option<SynthState> {
-        Some(SynthState::new())
+    fn initialize_state(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, SynthState>,
+        _: &[i32],
+        _: u32,
+    ) -> Option<()> {
+        distingnt_api::initialize_region!(
+            destination,
+            SynthState {
+                phase: 0,
+                increment: 0,
+                envelope: 0.0,
+                gate: false,
+            }
+        );
+        Some(())
     }
-    fn create_voice(_: &[i32], _: usize) -> Option<()> {
+    fn initialize_region(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, ()>,
+        _: &[i32],
+        _: usize,
+    ) -> Option<()> {
+        destination.set(());
         Some(())
     }
     fn metadata(_: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {

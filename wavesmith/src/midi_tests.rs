@@ -14,7 +14,7 @@ fn allocation_steals_oldest_and_old_note_off_cannot_release_its_replacement() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
     let enabled = [true; VOICE_COUNT];
-    for note in [60, 64, 67, 71] {
+    for note in [60, 64, 67, 71, 72, 73, 75, 77, 80, 83] {
         midi.message(0x90, note, 100, &enabled);
     }
     run_gate(&mut midi, 250);
@@ -38,7 +38,9 @@ fn allocation_steals_oldest_and_old_note_off_cannot_release_its_replacement() {
 #[test]
 fn channel_filter_disabled_outputs_and_velocity_zero_note_off() {
     let mut midi = MidiState::new(48000);
-    let enabled = [false, true, false, true];
+    let mut enabled = [false; VOICE_COUNT];
+    enabled[1] = true;
+    enabled[3] = true;
     midi.message(0x90, 60, 100, &enabled);
     assert!(midi.voices.iter().all(|v| !v.held));
     midi.set_channel(3); // channel 2
@@ -63,7 +65,8 @@ fn channel_filter_disabled_outputs_and_velocity_zero_note_off() {
 fn gates_fade_and_pending_note_off_does_not_restart_a_stolen_voice() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let enabled = [true, false, false, false];
+    let mut enabled = [false; VOICE_COUNT];
+    enabled[0] = true;
     midi.message(0x90, 60, 127, &enabled);
     run_gate(&mut midi, 120);
     assert!((midi.voices[0].gain - 0.5).abs() < 0.001);
@@ -117,4 +120,32 @@ fn all_channels_track_note_off_by_channel_and_voice_order_stays_bounded() {
     }
     midi.sync_enabled(&[false; VOICE_COUNT]);
     assert!(midi.voices.iter().all(|v| *v == NoteVoice::new()));
+}
+
+#[test]
+fn every_configured_pool_uses_idle_voices_then_steals_only_its_oldest_note() {
+    for count in 1..=VOICE_COUNT {
+        let mut midi = MidiState::new(48000);
+        midi.set_channel(1);
+        let mut enabled = [false; VOICE_COUNT];
+        for on in enabled.iter_mut().take(count) {
+            *on = true;
+        }
+        for note in 0..count {
+            midi.message(0x90, 60 + note as u8, 100, &enabled);
+        }
+        run_gate(&mut midi, 250);
+        assert_eq!(midi.voices.iter().filter(|v| v.held).count(), count);
+        midi.message(0x90, 84, 100, &enabled);
+        assert_eq!(midi.voices[0].note, 84);
+        midi.message(0x80, 60, 0, &enabled);
+        assert!(midi.voices[0].held);
+        run_gate(&mut midi, 500);
+        assert_eq!(midi.voices[0].playing_note, 84);
+        assert!(midi
+            .voices
+            .iter()
+            .skip(count)
+            .all(|v| *v == NoteVoice::new()));
+    }
 }

@@ -35,7 +35,7 @@ use distingnt_api::{api::metadata::Definition, UNIT_STRING, SCALING_NONE};
 struct Probe;
 impl Plugin for Probe {
     type State = [u8; 8];
-    type Voice = ();
+    type Region = ();
     type StateMemory = Sram;
     const GUID: u32 = 1;
     const NAME: &'static core::ffi::CStr = c"Static probe";
@@ -49,10 +49,16 @@ impl Plugin for Probe {
     fn calculate_static_requirements() -> StaticRequirements { StaticRequirements { dram: 16 } }
     fn initialise(memory: StaticMemory<'_>) { memory.dram.fill(42); }
     fn configuration(_: &[i32]) -> Option<Configuration> {
-        Some(Configuration { parameters: 1, pages: 0, page_indices: 0, voices: 0 })
+        Some(Configuration { parameters: 1, pages: 0, page_indices: 0, regions: 0 })
     }
-    fn create(_: &[i32], _: u32) -> Option<Self::State> { Some([0; 8]) }
-    fn create_voice(_: &[i32], _: usize) -> Option<()> { Some(()) }
+    fn initialize_state(destination: &mut RegionInitializer<'_, Self::State>, _: &[i32], _: u32) -> Option<()> {
+        destination.fill(0);
+        Some(())
+    }
+    fn initialize_region(destination: &mut RegionInitializer<'_, ()>, _: &[i32], _: usize) -> Option<()> {
+        destination.set(());
+        Some(())
+    }
     fn metadata(_: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
         metadata.set_parameter(0, Definition::new(c"Text", 0, 0, 0, UNIT_STRING, SCALING_NONE, None)?)
     }

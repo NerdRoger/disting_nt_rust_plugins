@@ -90,3 +90,12 @@ work. The Cargo workspace now lives at this repository root. Historical reports
 retain references to the original `rusttest` layout. No original source files
 were moved or removed. Git was initialized locally with the API registered as a
 submodule; no initial root commit or GitHub remote/publication was created.
+
+## Required in-place construction
+
+All Rust plugins implement the shared API's `initialize_state` and
+`initialize_region` hooks. Structs use `distingnt_api::initialize_region!` to write
+fields into the final allocation; scalar/unit states use `set`, and arrays use
+`fill`/`fill_with`. There is no value-returning constructor fallback. Keep plugin
+code safe and avoid large field-constructor temporaries as well. See
+[distingnt-api](distingnt-api/README.md) for the construction contract.

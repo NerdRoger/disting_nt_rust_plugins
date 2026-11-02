@@ -110,6 +110,25 @@ pub(super) struct Channel {
 }
 
 impl Channel {
+    pub fn initialize(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>,
+        index: usize,
+    ) -> Option<()> {
+        if index >= 8 {
+            return None;
+        }
+        distingnt_api::initialize_region!(
+            destination,
+            Channel {
+                offset: channel_offset(index),
+                comparator: Comparator::default(),
+                updating_bounds: false,
+                updating_size_pos: false,
+            }
+        );
+        Some(())
+    }
+    #[cfg(test)]
     pub fn new(index: usize) -> Option<Self> {
         if index >= 8 {
             return None;
@@ -256,7 +275,7 @@ pub(super) fn step(
     let mut buses = AudioBlock::new(samples, frames)?;
     let data = context.processing();
     let parameters = data.parameters;
-    let channels = data.voices;
+    let channels = data.regions;
     if parameters.len() != count_parameters(channels.len()) {
         return None;
     }

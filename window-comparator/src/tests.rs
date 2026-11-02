@@ -608,7 +608,7 @@ fn all_channel_layouts_are_stable_and_complete() {
             assert!(seen.iter().all(|x| *x));
             for ch in 0..n as usize {
                 assert_eq!(
-                    context(a).voices().get(ch).unwrap().offset(),
+                    context(a).regions().get(ch).unwrap().offset(),
                     channel_offset(ch)
                 );
             }
@@ -628,7 +628,7 @@ fn later_channels_read_earlier_channels_bus_writes() {
         assert_eq!(out[4], 10.0);
         assert_eq!(out[8], 0.0);
         assert_eq!(out[12], 10.0);
-        assert_eq!(context(i.a).voices().get(1).unwrap().current_value(), 5.0);
+        assert_eq!(context(i.a).regions().get(1).unwrap().current_value(), 5.0);
     }
 }
 
@@ -657,7 +657,7 @@ fn synchronization_guards_clear_when_a_host_setter_fails() {
             let result = parameter_changes::changed(&mut callback, gp::COUNT + parameter);
             ALGORITHM_INDEX.with(|index| index.set(0));
             assert!(result.is_none());
-            let channel = &callback.voices()[0];
+            let channel = &callback.regions()[0];
             assert!(!channel.guard(Guard::Bounds));
             assert!(!channel.guard(Guard::SizePosition));
             // Clearing the flag also allows the next valid update to succeed.

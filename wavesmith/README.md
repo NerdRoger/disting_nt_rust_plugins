@@ -1,10 +1,10 @@
 # Wavesmith prototype
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
-Segments is the only algorithm setup specification. Every instance uses six
-256-sample anti-alias tables per bank. Four independent pitch/output voices
+Setup specifications are Segments (2–32, default 8) and Voices (1–10, default 1).
+Every instance uses six 256-sample anti-alias tables per bank. Configured voices
 share the same waveform and table banks. Shape edits work while audio plays.
-Use the NT's respecification workflow to change the segment count.
+Use the NT's respecification workflow to change either count.
 
 ## Controls
 
@@ -127,29 +127,32 @@ to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
 triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
 and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
-Voice 1 through Voice 4 each have a page ordered Pitch CV (1 V/oct), Output,
-then Output mode (add/replace). Output None disables that voice: its CV reading,
-frequency calculation, phase advancement and sample generation are skipped.
-An enabled output with Pitch CV None plays at the shared manually selected
-Pitch and Fine tune. Level is also shared. Voice 1 defaults to bus 13 / physical
-output 1; Voices 2–4 default to None. Each voice has its own phase, pitch/gain
-slew and anti-alias table selection. Input CVs are snapshotted once per block
-before any output is written. Voices sharing an output are summed; if any has
-Replace selected, the previous bus signal is cleared once before mixing them.
-The waveform builder, table buffers and edit-crossfade clock are shared, so
-enabling more voices does not multiply FFT work or speed up edit fades. The
-shared edit clock continues even when all voices are disabled. Only small
-playback states and nine routing parameters are added; no table banks are copied.
-All voices use the names Pitch CV, Output, and Output mode. The parameter UI
-prefix identifies their voice as V1: through V4:. Voice pages share a navigation
-group so switching between them retains the selected parameter row.
+The Routings page lists shared Output, Output mode (add/replace), then
+Voice 1 Pitch CV through Voice N Pitch CV for the configured Voices count.
+There are no individual voice pages or per-voice enable/output controls.
+Output defaults to bus 13 / physical output 1. Output None disables all voice
+CV reading, frequency conversion, phase advancement and sample generation;
+shared waveform rebuilding and edit fades can still finish while silent.
+An enabled output sums every configured voice without normalization or limiting.
+Replace clears the destination once before mixing the whole pool; Add preserves
+the existing bus signal. Level is applied to each voice as before.
+
+In CV mode every configured voice plays continuously. A voice whose Pitch CV is
+None plays at the shared manual Pitch and Fine tune. CV values are snapshotted
+before the shared output is cleared or written, including when an input is also
+the destination bus. Each voice has its own phase, pitch/gain slew and anti-alias
+selection. Persistent frequency caches and steady playback remain active.
+The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
+more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
+reserve the maximum ten states; only the specified voice pool is processed,
+and parameter metadata includes only the specified CV inputs.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
 or a channel number to control every enabled voice with MIDI instead. In MIDI
 mode, Pitch CV inputs and manual Pitch are ignored; shared Fine tune and Level
-still apply. Assign outputs on the Voice pages to enable up to four MIDI voices;
-only Voice 1 has an output assigned by default. An assigned output with no held
-note is silent after its release fade.
+still apply. The Voices specification determines the 1–10-note MIDI pool. Unassigned MIDI
+voices remain silent; when no notes are held, the shared output is silent after
+release fades finish.
 
 Note On uses an idle voice first, then a releasing voice, then steals the oldest
 held note. Repeated Note On for an already-held key retriggers that voice. Note
@@ -158,8 +161,7 @@ stolen key does not stop its replacement. About 5 ms attack/release fades reduce
 clicks. A stolen voice fades out before starting its new pitch from silence.
 Velocity does not change loudness. Sustain, pitch bend and aftertouch are not
 handled. All Notes Off releases notes on its channel; All Sound Off silences them
-immediately. Changing MIDI Channel clears held notes, as does disabling a voice's
-output. MIDI allocation adds only small voice states, without extra waveform
+immediately. Changing MIDI Channel clears held notes, as does setting shared Output to None. MIDI allocation adds only small voice states, without extra waveform
 tables or FFT work.
 
 With N segments there are N level parameters named Boundary 00, Boundary 01,
@@ -167,8 +169,8 @@ etc., and N independently named Curve parameters. One Waveform page lists them
 in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
 and so on, ending with Curve N and Boundary 00. Each interior boundary appears
 once and is still shared by its neighboring segments in the custom editor.
-One editable parameter supplies both endpoint rows. There are always six plugin pages
-(Oscillator, Voice 1, Voice 2, Voice 3, Voice 4, Waveform), plus the NT's own Common page, for every segment
+One editable parameter supplies both endpoint rows. There are always three plugin pages
+(Oscillator, Routings, Waveform), plus the NT's own Common page, for every segment
 count. This avoids the firmware's page-count issue at high segment counts.
 All numeric shape parameters are host-visible;
 dedicated segment modulation routing is deferred. Ordinary parameter values are
@@ -298,8 +300,12 @@ nominal, not a hard peak limit. Asymmetric waves can have DC offset.
 
 ## Build and test
 
-Segments is now the only setup specification; Anti-alias tables has been removed.
-The audio bank is fixed at six tables without changing parameter indices.
+The audio bank is fixed at six tables. Voices is the second specification,
+with range 1–10 and default 1. The shared-output version changes the routing
+parameter layout and MIDI Channel index; recreate or respecify earlier
+multi-output instances and review their routing/MIDI settings. Shape and global
+synthesis parameter indices through Fold Limit are unchanged. Per-voice output
+routings are not migrated.
 
 This shared-boundary prototype changes the host parameter layout from the earlier
 independent Start/End version. Recreate existing Wavesmith instances after loading
@@ -318,14 +324,22 @@ The four waveform-boundary triggers are appended after Zero Curves, again
 preserving earlier indices and defaulting to zero.
 Fold Limit is appended after the waveform-boundary triggers, preserving all
 earlier parameter indices and defaulting to the previous folding range of 2.
-Voice 1 reuses the original routing parameter indices, now allowing Output None.
-Voices 2–4 append their routing parameters after Fold Limit and default to disabled,
-preserving previous single-voice presets and all waveform/trigger parameter indices.
+Shared Output/Output mode and Voice 1 Pitch CV reuse the original indices.
+MIDI Channel follows Fold Limit, then the remaining configured Voice N Pitch CV
+parameters are appended. All CV inputs default to None.
 Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
 presets stored a raw 0–100 percentage value; those warp position values now use the
 new 0–255 units and may need readjustment.
 
 From the repository's devcontainer:
+
+Instance state is initialized field by field in its final allocation through the
+API's safe `RegionInitializer` and `initialize_region!` macro. This avoids large
+whole-state temporaries on the firmware stack. Both the direct-initialization
+diagnostic and the integrated safe version saved successfully on hardware after
+the ordinary constructor crashed. All Rust plugins now use required direct state
+and preallocated-region initialization hooks. Wavesmith continues to forbid unsafe
+code. This changes no parameters or preset data.
 
 ```sh
 make plugins/wavesmith.o

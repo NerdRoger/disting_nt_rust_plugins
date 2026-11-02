@@ -13,9 +13,11 @@ enum Mode {
     MissingParameter,
     BadPage,
     BadState,
-    BadVoice,
+    BadRegion,
     TooManyParameters,
     NoParameters,
+    UninitializedState,
+    UninitializedRegion,
 }
 std::thread_local! { static MODE: Cell<Mode> = const { Cell::new(Mode::Valid) }; }
 std::thread_local! {
@@ -27,7 +29,7 @@ std::thread_local! {
 struct Example;
 impl Plugin for Example {
     type State = u32;
-    type Voice = u32;
+    type Region = u32;
     type StateMemory = Sram;
     const GUID: u32 = 1;
     const NAME: &'static CStr = c"Framework test";
@@ -54,7 +56,7 @@ impl Plugin for Example {
                 parameters: 0,
                 pages: 0,
                 page_indices: 0,
-                voices: 0,
+                regions: 0,
             });
         }
         Some(Configuration {
@@ -65,17 +67,36 @@ impl Plugin for Example {
             },
             pages: 1,
             page_indices: 1,
-            voices: 2,
+            regions: 2,
         })
     }
-    fn create(_: &[i32], _: u32) -> Option<u32> {
-        (!MODE.with(|mode| matches!(mode.get(), Mode::BadState))).then_some(123)
-    }
-    fn create_voice(_: &[i32], index: usize) -> Option<u32> {
-        if index == 1 && MODE.with(|mode| matches!(mode.get(), Mode::BadVoice)) {
+    fn initialize_state(
+        destination: &mut RegionInitializer<'_, u32>,
+        _: &[i32],
+        _: u32,
+    ) -> Option<()> {
+        if MODE.with(|mode| matches!(mode.get(), Mode::UninitializedState)) {
+            return Some(());
+        }
+        if MODE.with(|mode| matches!(mode.get(), Mode::BadState)) {
             return None;
         }
-        Some(index as u32)
+        destination.set(123);
+        Some(())
+    }
+    fn initialize_region(
+        destination: &mut RegionInitializer<'_, u32>,
+        _: &[i32],
+        index: usize,
+    ) -> Option<()> {
+        if MODE.with(|mode| matches!(mode.get(), Mode::UninitializedRegion)) {
+            return Some(());
+        }
+        if index == 1 && MODE.with(|mode| matches!(mode.get(), Mode::BadRegion)) {
+            return None;
+        }
+        destination.set(index as u32);
+        Some(())
     }
     fn metadata(_: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
         if MODE.with(|mode| matches!(mode.get(), Mode::NoParameters)) {
@@ -111,7 +132,7 @@ std::thread_local! {
 struct AllCallbacks<const ENABLED: bool>;
 impl<const ENABLED: bool> Plugin for AllCallbacks<ENABLED> {
     type State = [u8; 8];
-    type Voice = ();
+    type Region = ();
     type StateMemory = Sram;
     const GUID: u32 = 2;
     const NAME: &'static CStr = c"All callbacks";
@@ -130,13 +151,23 @@ impl<const ENABLED: bool> Plugin for AllCallbacks<ENABLED> {
             parameters: 3,
             pages: 0,
             page_indices: 0,
-            voices: 0,
+            regions: 0,
         })
     }
-    fn create(_: &[i32], _: u32) -> Option<Self::State> {
-        Some([0xa5; 8])
+    fn initialize_state(
+        destination: &mut RegionInitializer<'_, Self::State>,
+        _: &[i32],
+        _: u32,
+    ) -> Option<()> {
+        destination.fill(0xa5);
+        Some(())
     }
-    fn create_voice(_: &[i32], _: usize) -> Option<()> {
+    fn initialize_region(
+        destination: &mut RegionInitializer<'_, ()>,
+        _: &[i32],
+        _: usize,
+    ) -> Option<()> {
+        destination.set(());
         Some(())
     }
     fn metadata(_: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
@@ -331,7 +362,7 @@ fn zero_parameters_accept_a_null_host_value_pointer() {
     assert!(unsafe { (*base).v }.is_null());
     let mut context = unsafe { Context::<u32, u32, Audio>::admit(base) };
     let data = context.processing();
-    assert!(data.parameters.is_empty() && data.voices.is_empty());
+    assert!(data.parameters.is_empty() && data.regions.is_empty());
     assert_eq!(*data.state, 123);
 }
 
@@ -427,17 +458,17 @@ fn poisoned_host_storage_is_initialized_and_metadata_is_owned() {
     }
     let mut context = unsafe { Context::<u32, u32, Audio>::admit(base) };
     assert_eq!(*context.state(), 123);
-    assert_eq!(context.voices(), &[0, 1]);
+    assert_eq!(context.regions(), &[0, 1]);
     assert_eq!(context.read_parameters().value(0), Some(7));
     {
         let data = context.processing();
         *data.state = 321;
-        data.voices[1] = 99;
+        data.regions[1] = 99;
         assert_eq!(data.parameters.value(0), Some(7));
         assert_eq!(data.parameters.len(), 1);
     }
     assert_eq!(*context.state(), 321);
-    assert_eq!(context.voices(), &[0, 99]);
+    assert_eq!(context.regions(), &[0, 99]);
     unsafe {
         let pages = &*(*base).parameter_pages;
         assert_eq!(pages.num_pages, 1);
@@ -472,8 +503,8 @@ fn allocation_regions_are_aligned_disjoint_and_within_the_requirement() {
         ),
         (layout.indices, config.page_indices, 1),
         (
-            layout.voices,
-            core::mem::size_of::<u32>() * config.voices,
+            layout.regions,
+            core::mem::size_of::<u32>() * config.regions,
             core::mem::align_of::<u32>(),
         ),
     ];
@@ -490,7 +521,7 @@ fn allocation_regions_are_aligned_disjoint_and_within_the_requirement() {
             ..config
         },
         Configuration {
-            voices: usize::MAX,
+            regions: usize::MAX,
             ..config
         },
     ] {
@@ -529,7 +560,9 @@ fn failed_safe_plugin_initialization_is_never_published() {
         Mode::MissingParameter,
         Mode::BadPage,
         Mode::BadState,
-        Mode::BadVoice,
+        Mode::UninitializedState,
+        Mode::UninitializedRegion,
+        Mode::BadRegion,
         Mode::TooManyParameters,
     ] {
         let allocation = Allocation::new();
@@ -592,4 +625,96 @@ fn definition_construction_validates_scalar_bounds_enum_capacity_and_io_ranges()
         core::mem::size_of::<Definition>(),
         core::mem::size_of::<NtParameter>()
     );
+}
+
+#[test]
+fn direct_initializer_writes_all_fields_without_touching_guards() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Fields {
+        flag: bool,
+        count: u32,
+        values: [f32; 3],
+    }
+    #[repr(C)]
+    struct Guarded {
+        before: u64,
+        state: MaybeUninit<Fields>,
+        after: u64,
+    }
+    let mut memory = Guarded {
+        before: 0xa5a5a5a5,
+        state: MaybeUninit::uninit(),
+        after: 0x5a5a5a5a,
+    };
+    let mut destination = unsafe { RegionInitializer::new(memory.state.as_mut_ptr()) };
+    assert!(!destination.initialized);
+    crate::initialize_region!(
+        &mut destination,
+        Fields {
+            flag: true,
+            count: 42,
+            values: [1.0, 2.0, 3.0]
+        }
+    );
+    assert!(destination.initialized);
+    let actual = unsafe { memory.state.assume_init() };
+    assert_eq!(
+        actual,
+        Fields {
+            flag: true,
+            count: 42,
+            values: [1.0, 2.0, 3.0]
+        }
+    );
+    assert_eq!((memory.before, memory.after), (0xa5a5a5a5, 0x5a5a5a5a));
+}
+
+#[test]
+fn direct_initializer_supports_packed_state_fields() {
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct Packed {
+        first: u8,
+        second: u32,
+    }
+    let mut memory = MaybeUninit::<Packed>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(memory.as_mut_ptr()) };
+    crate::initialize_region!(
+        &mut destination,
+        Packed {
+            first: 7,
+            second: 123456
+        }
+    );
+    assert!(destination.initialized);
+    let state = unsafe { memory.assume_init() };
+    let (first, second) = (state.first, state.second);
+    assert_eq!((first, second), (7, 123456));
+}
+
+#[test]
+fn array_initializers_write_final_elements_and_support_empty_arrays() {
+    #[repr(C)]
+    struct Guarded {
+        before: u32,
+        values: MaybeUninit<[u32; 4]>,
+        after: u32,
+    }
+    let mut memory = Guarded {
+        before: 0xa5a5a5a5,
+        values: MaybeUninit::uninit(),
+        after: 0x5a5a5a5a,
+    };
+    let mut destination = unsafe { RegionInitializer::new(memory.values.as_mut_ptr()) };
+    destination.fill_with(|index| (index * index) as u32);
+    assert!(destination.initialized);
+    assert_eq!(unsafe { memory.values.assume_init() }, [0, 1, 4, 9]);
+    destination.fill(7);
+    assert_eq!(unsafe { memory.values.assume_init() }, [7; 4]);
+    assert_eq!((memory.before, memory.after), (0xa5a5a5a5, 0x5a5a5a5a));
+    let mut empty = MaybeUninit::<[u32; 0]>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(empty.as_mut_ptr()) };
+    destination.fill_with(|_| panic!("empty array initializer called"));
+    assert!(destination.initialized);
+    assert_eq!(unsafe { empty.assume_init() }, []);
 }

@@ -1,6 +1,6 @@
 //! Allocation-free plugin framework. All ABI and host-memory admission stays here.
 //!
-//! A context is neither Clone nor Copy. State/voice borrows and parameter setter
+//! A context is neither Clone nor Copy. State/region borrows and parameter setter
 //! capabilities borrow that same context, so safe code cannot keep a state borrow
 //! across a setter that synchronously reenters the plugin.
 use super::{
@@ -28,7 +28,7 @@ pub struct Configuration {
     pub parameters: usize,
     pub pages: usize,
     pub page_indices: usize,
-    pub voices: usize,
+    pub regions: usize,
 }
 
 /// Factory-wide DRAM requested during scan/loading, shared by all instances.
@@ -57,11 +57,178 @@ pub struct Specification {
     pub kind: i32,
 }
 
+/// Exclusive initializer for a preallocated region of RAM holding an object.
+/// Use [`crate::initialize_region!`] to write struct fields without a whole-state
+/// temporary. Scalars use `set`; arrays use `fill` or `fill_with`. Success without
+/// initializing the destination makes construction fail safely.
+///
+/// Whole-struct setters are deliberately unavailable:
+/// ```compile_fail
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct State { data: [u32; 1024] }
+/// fn aggregate_setter(destination: &mut RegionInitializer<'_, State>) {
+///     destination.set(State { data: [0; 1024] });
+/// }
+/// ```
+pub struct RegionInitializer<'a, S: Copy> {
+    destination: *mut S,
+    initialized: bool,
+    lifetime: PhantomData<&'a mut MaybeUninit<S>>,
+}
+
+impl<S: Copy> RegionInitializer<'_, S> {
+    // SAFETY: caller supplies exclusive aligned storage for S for this lifetime.
+    unsafe fn new(destination: *mut S) -> Self {
+        Self {
+            destination,
+            initialized: false,
+            lifetime: PhantomData,
+        }
+    }
+
+    fn write_value(&mut self, value: S) {
+        // SAFETY: the framework owns the destination; S has no Drop resources.
+        unsafe {
+            self.destination.write(value);
+        }
+        self.initialized = true;
+    }
+
+    #[doc(hidden)]
+    pub fn __destination(&mut self) -> *mut S {
+        self.destination
+    }
+
+    /// # Safety
+    /// Every field of the destination must have been initialized with a valid
+    /// value. Used by initialize_region! after its exhaustive field writes.
+    #[doc(hidden)]
+    pub unsafe fn __finish(&mut self) {
+        self.initialized = true;
+    }
+}
+
+// Only scalar values expose a value-taking setter; aggregates must use the
+// exhaustive field macro or element-by-element array initializer below.
+macro_rules! scalar_initializers {
+    ($($scalar:ty),* $(,)?) => {$(
+        impl RegionInitializer<'_, $scalar> {
+            pub fn set(&mut self, value: $scalar) { self.write_value(value); }
+        }
+    )*};
+}
+scalar_initializers!(
+    (),
+    bool,
+    char,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    f32,
+    f64
+);
+
+impl<T: Copy, const N: usize> RegionInitializer<'_, [T; N]> {
+    /// Initialize array elements directly, without creating a temporary array.
+    pub fn fill(&mut self, value: T) {
+        self.fill_with(|_| value);
+    }
+    pub fn fill_with(&mut self, mut value: impl FnMut(usize) -> T) {
+        for index in 0..N {
+            // SAFETY: framework owns an aligned allocation for all N elements.
+            unsafe {
+                self.destination.cast::<T>().add(index).write(value(index));
+            }
+        }
+        self.initialized = true;
+    }
+}
+
+/// Initialize a struct directly in a preallocated region of RAM. All fields
+/// must be listed exactly once, as in an ordinary struct literal. The API owns
+/// the raw writes; callers can continue to forbid unsafe code.
+///
+/// ```
+/// #![forbid(unsafe_code)]
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct State { a: u32, b: bool }
+/// fn initialize(destination: &mut RegionInitializer<'_, State>) {
+///     distingnt_api::initialize_region!(destination, State { a: 42, b: true });
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct State { a: u32, b: u32 }
+/// fn incomplete(destination: &mut RegionInitializer<'_, State>) {
+///     distingnt_api::initialize_region!(destination, State { a: 1 });
+/// }
+/// ```
+///
+/// ```compile_fail
+/// #![forbid(unsafe_code)]
+/// #[derive(Clone, Copy)]
+/// struct State { a: u32 }
+/// struct Fake;
+/// impl Fake {
+///     fn __destination(&mut self) -> *mut State { core::ptr::null_mut() }
+///     fn __finish(&mut self) {}
+/// }
+/// fn forged_destination(fake: &mut Fake) {
+///     distingnt_api::initialize_region!(fake, State { a: 1 });
+/// }
+/// ```
+#[macro_export]
+macro_rules! initialize_region {
+    ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? }) => {{
+        // An exhaustive pattern checks omissions/duplicates without building S.
+        let _ = |value: $state| { let $state { $($field: _),* } = value; };
+        let initializer: &mut $crate::api::plugin::RegionInitializer<'_, $state> = &mut *$destination;
+        let pointer: *mut $state = initializer.__destination();
+        // SAFETY: typed exclusive destination, every field checked above, each
+        // expression yields that field's type. Failure/panic never publishes it.
+        // Unaligned writes also support repr(packed) state structs safely.
+        $(unsafe { ::core::ptr::addr_of_mut!((*pointer).$field).write_unaligned($value); })*
+        unsafe { initializer.__finish(); }
+    }};
+}
+
 /// Callback state contains values only: no destructor is silently lost when the
 /// C++ host reclaims SRAM. Copy is a constraint, not a per-callback copying policy.
+/// Both direct-initialization hooks are mandatory. A plugin cannot rely on
+/// a value-returning construction fallback:
+/// ```compile_fail
+/// use distingnt_api::api::plugin::{Plugin, Configuration, Metadata, Specification};
+/// use distingnt_api::api::state_memory::Sram;
+/// struct MissingInitializers;
+/// impl Plugin for MissingInitializers {
+///     type State = ();
+///     type Region = ();
+///     type StateMemory = Sram;
+///     const GUID: u32 = 1;
+///     const NAME: &'static core::ffi::CStr = c"Missing initializers";
+///     const DESCRIPTION: &'static core::ffi::CStr = c"";
+///     const TAGS: u32 = 0;
+///     const SPECIFICATIONS: &'static [Specification] = &[];
+///     fn configuration(_: &[i32]) -> Option<Configuration> { None }
+///     fn metadata(_: &[i32], _: &mut Metadata<'_>) -> Option<()> { Some(()) }
+/// }
+/// ```
 pub trait Plugin: Sized + 'static {
     type State: Copy + 'static;
-    type Voice: Copy + 'static;
+    type Region: Copy + 'static;
     type StateMemory: StateMemory<Self::State>;
     const GUID: u32;
     const NAME: &'static CStr;
@@ -91,60 +258,71 @@ pub trait Plugin: Sized + 'static {
     fn initialise(_: StaticMemory<'_>) {}
 
     fn configuration(specifications: &[i32]) -> Option<Configuration>;
-    fn create(specifications: &[i32], sample_rate: u32) -> Option<Self::State>;
-    fn create_voice(specifications: &[i32], index: usize) -> Option<Self::Voice>;
+    /// Initialize state directly in its final allocation. Required for every
+    /// plugin; use initialize_region! for structs, set for scalars, fill for arrays.
+    fn initialize_state(
+        destination: &mut RegionInitializer<'_, Self::State>,
+        specifications: &[i32],
+        sample_rate: u32,
+    ) -> Option<()>;
+    /// Initialize one preallocated region in its final SRAM allocation.
+    fn initialize_region(
+        destination: &mut RegionInitializer<'_, Self::Region>,
+        specifications: &[i32],
+        index: usize,
+    ) -> Option<()>;
     fn metadata(specifications: &[i32], metadata: &mut Metadata<'_>) -> Option<()>;
     fn parameter_changed(
-        _: &mut Context<'_, Self::State, Self::Voice, Audio, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
         _: i32,
     ) {
     }
     fn step(
-        _: &mut Context<'_, Self::State, Self::Voice, Audio, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
         _: &mut [f32],
         _: usize,
     ) {
     }
     fn draw(
-        _: &mut Context<'_, Self::State, Self::Voice, Ui, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>,
         _: Canvas<'_>,
     ) -> bool {
         false
     }
     fn custom_ui(
-        _: &mut Context<'_, Self::State, Self::Voice, Ui, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>,
         _: &NtUiData,
     ) {
     }
     /// Return the currently overridden controls, within the CUSTOM_UI mask.
     fn has_custom_ui(
-        _: &mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
     ) -> u32 {
         Self::CUSTOM_UI
     }
-    fn setup_ui(_: &mut Context<'_, Self::State, Self::Voice, Ui, Self::StateMemory>) -> NtFloat3 {
+    fn setup_ui(_: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>) -> NtFloat3 {
         [0.5; 3]
     }
     fn serialise(
-        _: &mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
         _: &mut JsonWriter<'_>,
     ) {
     }
     fn deserialise(
-        _: &mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
         _: &mut JsonReader<'_>,
     ) -> bool {
         true
     }
     fn prefix(
-        _: &mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
         _: i32,
         _: &mut [c_char],
     ) -> i32 {
         0
     }
     fn parameter_string(
-        _: &mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
         _: i32,
         _: i32,
         _: &mut [c_char],
@@ -152,12 +330,12 @@ pub trait Plugin: Sized + 'static {
         0
     }
     fn midi_realtime(
-        _: &mut Context<'_, Self::State, Self::Voice, Audio, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
         _: u8,
     ) {
     }
     fn midi_message(
-        _: &mut Context<'_, Self::State, Self::Voice, Audio, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
         _: u8,
         _: u8,
         _: u8,
@@ -174,13 +352,13 @@ pub trait Plugin: Sized + 'static {
     /// ```compile_fail
     /// use distingnt_api::api::{plugin::{Plugin, Context}, parameters::ReadOnly};
     /// fn retain<P: Plugin>(
-    ///     context: &mut Context<'_, P::State, P::Voice, ReadOnly, P::StateMemory>,
+    ///     context: &mut Context<'_, P::State, P::Region, ReadOnly, P::StateMemory>,
     /// ) -> &'static mut [u8] {
     ///     P::string_parameter_buffer(context, 0).unwrap()
     /// }
     /// ```
     fn string_parameter_buffer<'a>(
-        _: &'a mut Context<'_, Self::State, Self::Voice, ReadOnly, Self::StateMemory>,
+        _: &'a mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
         _: i32,
     ) -> Option<&'a mut [u8]> {
         None
@@ -193,8 +371,8 @@ struct Storage<S: Copy, M: StateMemory<S>> {
     base: NtAlgorithm,
     pages: NtParameterPages,
     parameter_count: usize,
-    voice_count: usize,
-    voice_offset: usize,
+    region_count: usize,
+    region_offset: usize,
     state: M::Slot,
 }
 
@@ -204,7 +382,7 @@ pub struct Context<'callback, S: Copy, V: Copy, Mode, M: StateMemory<S> = Sram> 
 }
 pub struct Processing<'a, S, V> {
     pub state: &'a mut S,
-    pub voices: &'a mut [V],
+    pub regions: &'a mut [V],
     pub parameters: ParameterValues<'a>,
 }
 impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
@@ -239,30 +417,30 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
         // SAFETY: this exclusive context borrow excludes other safe state access.
         unsafe { &mut *M::pointer(ptr::addr_of_mut!((*self.raw).state)) }
     }
-    fn voice_pointer(&self) -> *mut V {
-        // SAFETY: the checked layout stores an aligned in-allocation voice offset.
-        unsafe { self.raw.cast::<u8>().add((*self.raw).voice_offset).cast() }
+    fn region_pointer(&self) -> *mut V {
+        // SAFETY: the checked layout stores an aligned in-allocation region offset.
+        unsafe { self.raw.cast::<u8>().add((*self.raw).region_offset).cast() }
     }
     #[inline]
-    pub fn voices(&self) -> &[V] {
-        // SAFETY: registration initializes exactly voice_count elements.
-        unsafe { slice::from_raw_parts(self.voice_pointer(), (*self.raw).voice_count) }
+    pub fn regions(&self) -> &[V] {
+        // SAFETY: registration initializes exactly region_count elements.
+        unsafe { slice::from_raw_parts(self.region_pointer(), (*self.raw).region_count) }
     }
     #[inline]
-    pub fn voices_mut(&mut self) -> &mut [V] {
+    pub fn regions_mut(&mut self) -> &mut [V] {
         // SAFETY: the exclusive context borrow excludes all aliases to this region.
-        unsafe { slice::from_raw_parts_mut(self.voice_pointer(), (*self.raw).voice_count) }
+        unsafe { slice::from_raw_parts_mut(self.region_pointer(), (*self.raw).region_count) }
     }
-    /// Borrows state and voices together without calling or borrowing the host.
+    /// Borrows state and regions together without calling or borrowing the host.
     #[inline]
     pub fn processing(&mut self) -> Processing<'_, S, V> {
-        // SAFETY: state, voice storage, definitions and host v are disjoint.
+        // SAFETY: state, region storage, definitions and host v are disjoint.
         // The exclusive context borrow prevents creating a setter until these
         // references have expired; these references cannot escape the callback.
         unsafe {
             Processing {
                 state: &mut *M::pointer(ptr::addr_of_mut!((*self.raw).state)),
-                voices: slice::from_raw_parts_mut(self.voice_pointer(), (*self.raw).voice_count),
+                regions: slice::from_raw_parts_mut(self.region_pointer(), (*self.raw).region_count),
                 parameters: ParameterValues::new(
                     if (*self.raw).parameter_count == 0 {
                         &[]
@@ -389,7 +567,7 @@ struct InstanceLayout {
     parameters: usize,
     pages: usize,
     indices: usize,
-    voices: usize,
+    regions: usize,
 }
 impl InstanceLayout {
     fn new<S: Copy, V: Copy, M: StateMemory<S>>(config: Configuration) -> Option<Self> {
@@ -405,8 +583,8 @@ impl InstanceLayout {
         let (layout, indices) = layout
             .extend(Layout::array::<u8>(config.page_indices).ok()?)
             .ok()?;
-        let (allocation, voices) = layout
-            .extend(Layout::array::<V>(config.voices).ok()?)
+        let (allocation, regions) = layout
+            .extend(Layout::array::<V>(config.regions).ok()?)
             .ok()?;
         if allocation.size() > u32::MAX as usize || M::dtc_size() > u32::MAX as usize {
             return None;
@@ -416,7 +594,7 @@ impl InstanceLayout {
             parameters,
             pages,
             indices,
-            voices,
+            regions,
         })
     }
 }
@@ -576,7 +754,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
     }
     pub fn alignment(specs: &[i32]) -> Option<usize> {
         Some(
-            InstanceLayout::new::<P::State, P::Voice, P::StateMemory>(P::configuration(specs)?)?
+            InstanceLayout::new::<P::State, P::Region, P::StateMemory>(P::configuration(specs)?)?
                 .allocation
                 .align(),
         )
@@ -690,7 +868,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
             .and_then(|config| {
                 Some((
                     config,
-                    InstanceLayout::new::<P::State, P::Voice, P::StateMemory>(config)?,
+                    InstanceLayout::new::<P::State, P::Region, P::StateMemory>(config)?,
                 ))
             })
         {
@@ -719,7 +897,8 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         let Some(config) = P::configuration(specs) else {
             return ptr::null_mut();
         };
-        let Some(layout) = InstanceLayout::new::<P::State, P::Voice, P::StateMemory>(config) else {
+        let Some(layout) = InstanceLayout::new::<P::State, P::Region, P::StateMemory>(config)
+        else {
             return ptr::null_mut();
         };
         let (ram, bytes, parameter_count) = unsafe {
@@ -738,32 +917,23 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         {
             return ptr::null_mut();
         }
-        let Some(state) = P::create(specs, super::sample_rate()) else {
-            return ptr::null_mut();
-        };
-        // SAFETY: host-owned DTC is exclusively available during construction.
-        // The sealed placement implementation checks size/alignment if required.
-        let state = unsafe { P::StateMemory::initialize(state, (*mem).dtc, (*req).dtc as usize) };
-        let Some(state) = state else {
-            return ptr::null_mut();
-        };
         let raw = ram.cast::<Storage<P::State, P::StateMemory>>();
         // SAFETY: checked aligned allocation layout, exclusively available here.
-        let (parameters, pages, indices, voices) = unsafe {
+        let (parameters, pages, indices, regions) = unsafe {
             (
                 ram.add(layout.parameters).cast::<NtParameter>(),
                 ram.add(layout.pages).cast::<NtParameterPage>(),
                 ram.add(layout.indices),
-                ram.add(layout.voices).cast::<P::Voice>(),
+                ram.add(layout.regions).cast::<P::Region>(),
             )
         };
-        for index in 0..config.voices {
-            let Some(voice) = P::create_voice(specs, index) else {
+        for index in 0..config.regions {
+            // SAFETY: each disjoint aligned region slot is initialized in place.
+            let mut destination = unsafe { RegionInitializer::new(regions.add(index)) };
+            if P::initialize_region(&mut destination, specs, index).is_none()
+                || !destination.initialized
+            {
                 return ptr::null_mut();
-            };
-            // SAFETY: each disjoint aligned voice slot is initialized once.
-            unsafe {
-                ptr::write(voices.add(index), voice);
             }
         }
         let mut metadata = Metadata {
@@ -782,28 +952,45 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         let Some(page_count) = metadata.finish() else {
             return ptr::null_mut();
         };
-        // SAFETY: all used metadata is initialized and construction borrows end
-        // before publishing pointers. State/voice types cannot own Drop resources.
+        // SAFETY: checked exclusive construction allocation. The initializer
+        // never exposes uninitialized S and success requires every field written.
+        let initialized = unsafe {
+            P::StateMemory::initialize_at(
+                ptr::addr_of_mut!((*raw).state),
+                (*mem).dtc,
+                (*req).dtc as usize,
+                |destination| {
+                    let mut writer = RegionInitializer::new(destination);
+                    P::initialize_state(&mut writer, specs, super::sample_rate())?;
+                    writer.initialized.then_some(())
+                },
+            )
+        };
+        if initialized.is_none() {
+            return ptr::null_mut();
+        }
+        // SAFETY: disjoint checked fields; publish only after state and metadata
+        // initialization succeed. No whole-Storage value is placed on the stack.
         unsafe {
             ptr::write(
-                raw,
-                Storage {
-                    base: NtAlgorithm {
-                        parameters,
-                        parameter_pages: ptr::addr_of!((*raw).pages),
-                        v: ptr::null(),
-                        v_including_common: ptr::null(),
-                    },
-                    pages: NtParameterPages {
-                        num_pages: page_count as u32,
-                        pages,
-                    },
-                    parameter_count: config.parameters,
-                    voice_count: config.voices,
-                    voice_offset: layout.voices,
-                    state,
+                ptr::addr_of_mut!((*raw).base),
+                NtAlgorithm {
+                    parameters,
+                    parameter_pages: ptr::addr_of!((*raw).pages),
+                    v: ptr::null(),
+                    v_including_common: ptr::null(),
                 },
             );
+            ptr::write(
+                ptr::addr_of_mut!((*raw).pages),
+                NtParameterPages {
+                    num_pages: page_count as u32,
+                    pages,
+                },
+            );
+            ptr::write(ptr::addr_of_mut!((*raw).parameter_count), config.parameters);
+            ptr::write(ptr::addr_of_mut!((*raw).region_count), config.regions);
+            ptr::write(ptr::addr_of_mut!((*raw).region_offset), layout.regions);
         }
         raw.cast()
     }

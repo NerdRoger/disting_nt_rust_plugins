@@ -98,7 +98,7 @@ fn pot_turn(context: &mut Callback<'_, Ui>, pot: Pot, movement: PotMovement) -> 
         (Pot::Left, EditMode::CenterWidth) => (cp::CENTER, range_min, range_max),
         (Pot::Right, EditMode::CenterWidth) => (cp::WIDTH, 0.0, state.range as f32),
     };
-    let p = context.voices().get(selected)?.offset() + local;
+    let p = context.regions().get(selected)?.offset() + local;
     let value = movement.apply(context.read_parameters().scaled(p)?, min, max);
     context.parameters().set(p, (value * 1000.0) as i16)?;
     context.state_mut().ui.show_help();
@@ -131,17 +131,17 @@ pub(super) fn draw(
     let visible = drawing::visible_channels(context.state().num_channels.get(), display.selected);
     let top = visible.start;
     for ch in visible {
-        let offset = context.voices().get(ch)?.offset();
+        let offset = context.regions().get(ch)?.offset();
         let channel = drawing::ChannelDisplay {
             index: ch,
             left: context.read_parameters().scaled(offset + cp::LEFT)?,
             right: context.read_parameters().scaled(offset + cp::RIGHT)?,
-            value: context.voices().get(ch)?.current_value(),
+            value: context.regions().get(ch)?.current_value(),
         };
         drawing::draw_channel(painter, &display, channel, top);
     }
     let statistics = if context.state().ui.help_visible() {
-        let offset = context.voices().get(display.selected)?.offset();
+        let offset = context.regions().get(display.selected)?.offset();
         Some([
             context.read_parameters().scaled(offset + cp::LEFT)?,
             context.read_parameters().scaled(offset + cp::RIGHT)?,

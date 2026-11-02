@@ -579,6 +579,15 @@ pub struct Block {
 }
 
 impl Block {
+    pub fn initialize(destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>) {
+        distingnt_api::initialize_region!(
+            destination,
+            Block {
+                data: [Complex { re: 0.0, im: 0.0 }; SIZE],
+            }
+        );
+    }
+    #[cfg(test)]
     pub const ZERO: Self = Self {
         data: [Complex { re: 0.0, im: 0.0 }; SIZE],
     };
