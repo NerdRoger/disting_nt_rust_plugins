@@ -1,0 +1,19 @@
+name: Wavesmith Build
+
+on:
+  push:
+    tags:
+      - 'wavesmith/v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/rust-plugins.yml
+    with:
+      plugin_name: Wavesmith
+      artifact_file: wavesmith.o
+      artifact_base_name: wavesmith

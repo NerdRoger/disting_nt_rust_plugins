@@ -64,15 +64,16 @@ Builds follow the same plugin-specific tag convention as the C++ repository:
 | --- | --- | --- |
 | Window Comparator | `window-comparator/v*` | `window-comparator/v0.1.0` |
 | Monosynth | `monosynth/v*` | `monosynth/v0.1.0` |
+| Wavesmith | `wavesmith/v*` | `wavesmith/v0.1.0` |
 
 Push the desired version tag to GitHub to build that plugin. Ordinary branch
 pushes and pull requests do not trigger builds. Each plugin's workflow also
 supports manual runs from the Actions tab.
 
-Both entry workflows call `.github/workflows/rust-plugins.yml`, which checks out
+All three entry workflows call `.github/workflows/rust-plugins.yml`, which checks out
 the pinned API submodule, builds the devcontainer with a shared GitHub Container
 Registry (GHCR) layer cache, checks formatting, builds the selected plugin and
-runs the test suite. Both plugins and version tags use the same cache; the first
+runs the test suite. All plugins and version tags use the same cache; the first
 build populates it, and later builds reuse unchanged layers.
 Dockerfile changes invalidate the affected cached layers on the next build.
 
