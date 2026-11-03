@@ -1,4 +1,4 @@
-//! Global values above the graph and a permanent, mode-aware two-row help footer.
+//! Global values above the graph and a permanent, mode-aware encoder help footer.
 #![forbid(unsafe_code)]
 use super::*;
 use distingnt_api::api::drawing::{Alignment, Shape, TextSize};
@@ -120,7 +120,12 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 _ => (Some(LEVEL), 0, 100),
             },
             EditMode::Segment => (
-                editor_parameter(context.state().count, selected, field),
+                editor_parameter(
+                    context.state().count,
+                    selected,
+                    field,
+                    context.state().voice_count,
+                ),
                 -100,
                 100,
             ),
@@ -135,6 +140,32 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
         let value = parameter
             .and_then(|p| context.read_parameters().value(p))
             .unwrap_or(0);
+        let pressed = data.controls as u32 & button != 0 && data.last_buttons as u32 & button == 0;
+        if pressed && !locked {
+            if let Some(parameter) = parameter {
+                let reset_value = context.read_parameters().definition(parameter).map(|d| {
+                    if mode == EditMode::Segment && pot != 1 {
+                        0
+                    } else {
+                        d.default
+                    }
+                });
+                if let Some(reset_value) = reset_value {
+                    // Reset the actual host parameter and rebase pickup at the
+                    // current physical position. Holding/releasing cannot undo it.
+                    {
+                        let ui = &mut context.state_mut().ui;
+                        ui.previous[pot] = data.pots[pot];
+                        ui.residual[pot] = 0.0;
+                        ui.last_written[pot] = reset_value;
+                    }
+                    if value != reset_value {
+                        let _ = context.parameters().set(parameter, reset_value);
+                    }
+                    continue;
+                }
+            }
+        }
         let updated = {
             let ui = &mut context.state_mut().ui;
             let enabled = ui.primed
@@ -249,7 +280,11 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     // retain a precompiled non-PIC divide-by-zero panic helper.
     let n = state.count.max(2);
     let parameters = context.read_parameters();
-    let source = read_wave(n, |index| parameters.value(index));
+    let source = read_wave(
+        n,
+        |index| parameters.value(index),
+        context.state().voice_count,
+    );
     canvas.shape(Shape::Rectangle, 0, 0, 255, 63, 0);
     canvas.shape(Shape::Rectangle, 0, 0, 255, 12, 2);
     let header_color = 15;
@@ -258,14 +293,21 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
             (
                 2,
                 b"Left ",
-                editor_parameter(n, selected, 0).unwrap_or(seam_parameter(n)),
+                editor_parameter(n, selected, 0, context.state().voice_count)
+                    .unwrap_or(seam_parameter(n, context.state().voice_count)),
                 0,
             ),
-            (102, b"Curve ", curve_parameter(n, selected), 0),
+            (
+                102,
+                b"Curve ",
+                curve_parameter(n, selected, context.state().voice_count),
+                0,
+            ),
             (
                 190,
                 b"Right ",
-                editor_parameter(n, selected, 1).unwrap_or(seam_parameter(n)),
+                editor_parameter(n, selected, 1, context.state().voice_count)
+                    .unwrap_or(seam_parameter(n, context.state().voice_count)),
                 0,
             ),
         ],
@@ -376,23 +418,8 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     // Match the comparator's permanent footer reservation and separator.
     canvas.shape(Shape::Rectangle, 0, 50, 255, 63, 0);
     canvas.shape(Shape::Line, 0, 50, 255, 50, 15);
-    let help = match state.ui.mode {
-        EditMode::Segment => [c"L: Start", c"C: Curve", c"R: End"],
-        EditMode::Warp => [c"L: Warp Pos", c"C: Warp Amt", c"R: Smooth"],
-        EditMode::Tuning => [c"L: Pitch", c"C: Fine", c"R: Level"],
-    };
-    for (x, label) in [2, 91, 193].into_iter().zip(help) {
-        text(&mut canvas, x, 57, label);
+    if state.ui.mode == EditMode::Segment {
+        text(&mut canvas, 42, 64, c"Turn: Select");
     }
-    text(&mut canvas, 2, 64, c"Enc L: Segment");
-    text(
-        &mut canvas,
-        139,
-        64,
-        match state.ui.mode {
-            EditMode::Segment => c"R click: Warp",
-            EditMode::Warp => c"R click: Pitch",
-            EditMode::Tuning => c"R click: Segment",
-        },
-    );
+    text(&mut canvas, 159, 64, c"Push: Mode");
 }

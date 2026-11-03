@@ -10,6 +10,12 @@ Use the NT's respecification workflow to change either count.
 
 - Left encoder: select segment. In Segment mode, selection wraps from the last
   segment to the first and from the first to the last, including larger turns.
+- Press a potentiometer to reset its current control. In Segment mode, boundary
+  presses zero the selected endpoint and the curve press restores its default
+  zero curve. Warp and Tuning controls use their declared parameter defaults.
+  The starting waveform's nonzero boundary defaults are unchanged. Reset occurs
+  once per press; pickup resumes from the current physical position.
+  MIDI-disabled Pitch stays inactive.
 - Right encoder press: cycle Segment → Warp → Tuning → Segment.
 - Segment mode (initial): left pot edits the selected segment's starting boundary
   level, centre pot edits its curve, right pot edits its ending boundary level.
@@ -18,7 +24,7 @@ Use the NT's respecification workflow to change either count.
   whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
 - Warp mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
   (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
-  and Pitch remain available on the Oscillator parameter page.
+  and Pitch remain available on parameter pages.
 - Tuning mode: left pot edits Pitch (MIDI note 0–127), centre pot edits Fine tune
   (−100 to +100 cents), right pot edits Level (0–100%). The top row displays
   these three values instead of the warp controls. Pitch is displayed as a note
@@ -36,8 +42,9 @@ bar (2). Warp and Tuning modes hide the segment selection and boundary handles.
 The waveform stays at full brightness in all modes to preserve its antialiasing
 range. Segment mode restores the selected
 segment's shading and handles. The help
-footer shows the current pot assignments and the mode a right-encoder click will
-select. Switching modes preserves the selected segment and parameter values;
+footer contains one row of encoder hints: Push: Mode on the right in every mode,
+and Turn: Select on the left only in Segment mode. Pot assignments are shown
+only in the header. Switching modes preserves the selected segment and parameter values;
 smart pickup resumes from the current knob positions without a value jump.
 
 Pots use the C++ plugins' smart soft takeover: the remaining virtual range is
@@ -66,7 +73,7 @@ Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curv
 ±100 at the default Fold Limit of 2. Both endpoints remain exact. Folding is
 continuous reflection, not clipping.
 
-Fold Limit is a global 0–2 parameter (default 2) on the Oscillator page.
+Fold Limit is a global 0–2 parameter (default 2) on the Shape page.
 At zero, Curve still bends the segment using a quadratic Bezier control point
 bounded by the global amplitude rails; it introduces no folds or hard clipping.
 At limits 1–2, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
@@ -100,9 +107,14 @@ zero it reads a separate creative-smoothing table, preserving the boundary level
 
 ## Parameters and routing
 
-Oscillator page: MIDI Channel (Off, All, or 1–16), Pitch (MIDI note number, default A3/220 Hz), Fine tune in cents,
-Smoothing, Fold Limit, Level (default 50%, up to nominal ±5 V at 100%), eight shape triggers,
-Warp Position and Warp Amount. The warp controls are ordinary modulatable host parameters.
+Oscillator page: MIDI Channel (Off, All, or 1–16), Pitch (MIDI note number,
+default A3/220 Hz), Fine tune in cents, and Level (default 50%, up to nominal
+±5 V at 100%).
+
+Shape follows Output, in this order: Warp Position, Warp Amount, Smoothing,
+Fold Limit, Sine Boundaries, Triangle Boundaries, Square Boundaries, Sawtooth
+Boundaries, Zero Curves, Randomize Curves, Randomize Boundaries, Randomize All.
+The warp controls are ordinary modulatable host parameters. The underlying parameter list follows the same order as the pages.
 
 - Randomize All replaces every boundary level and segment curve with
   pseudorandom values from −100% to +100%.
@@ -127,7 +139,8 @@ to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
 triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
 and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
-The Routings page contains shared Output and Output mode (add/replace).
+The Output page follows Oscillator and contains shared Output and Output mode
+(add/replace).
 Each configured voice has its own Voice 1, Voice 2, etc. page, containing Pitch CV,
 Transpose, and Fine tune in that order. Parameter names are shared; the API's
 parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
@@ -179,9 +192,9 @@ etc., and N independently named Curve parameters. One Waveform page lists them
 in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
 and so on, ending with Curve N and Boundary 00. Each interior boundary appears
 once and is still shared by its neighboring segments in the custom editor.
-One editable parameter supplies both endpoint rows. There are three shared
-pages (Oscillator, Routings, Waveform) plus one page per configured voice and
-the NT's own Common page. Segment count does not add pages; the maximum is 13
+One editable parameter supplies both endpoint rows. There are four shared
+pages (Oscillator, Output, Shape, Waveform) plus one page per configured voice and
+the NT's own Common page. Segment count does not add pages; the maximum is 14
 plugin pages with ten voices. This avoids the firmware's page-count issue at
 high segment counts.
 All numeric shape parameters are host-visible;
@@ -312,40 +325,18 @@ nominal, not a hard peak limit. Asymmetric waves can have DC offset.
 
 ## Build and test
 
-The audio bank is fixed at six tables. Voices is the second specification,
-with range 1–10 and default 1. The shared-output version changes the routing
-parameter layout and MIDI Channel index; recreate or respecify earlier
-multi-output instances and review their routing/MIDI settings. Shape and global
-synthesis parameter indices through Fold Limit are unchanged. Per-voice output
-routings are not migrated.
+The audio bank is fixed at six tables. Voices ranges from 1–10 and defaults to 1.
+The page order is Oscillator, Output, Shape, Voice 1 through Voice N, Waveform.
+Underlying parameter ordinals now follow that same order: 18 shared controls,
+three parameters per configured voice, then interleaved boundary/curve values.
+Boundary 00 is one shared seam parameter shown again at the end of Waveform.
 
-This shared-boundary prototype changes the host parameter layout from the earlier
-independent Start/End version. Recreate existing Wavesmith instances after loading
-the updated plugin; saved shapes from the earlier layout are not migrated.
-The single Waveform page retains the shared-boundary version's parameter indices
-and values; it only changes how the host displays them.
-Randomize is appended after the existing parameters, preserving their indices.
-Boundary 00 reuses the former fixed-zero parameter, so this change also preserves
-existing parameter indices and defaults to the previous zero seam.
-Warp Position and Warp Amount are appended after Randomize; all earlier parameter indices
-are unchanged. Their defaults preserve the original equal-width shape.
-Randomize is now named Randomize All at the same parameter index. Randomize
-Boundaries, Randomize Curves, and Zero Curves are appended after the warp
-parameters, preserving all earlier indices and defaulting to zero.
-The four waveform-boundary triggers are appended after Zero Curves, again
-preserving earlier indices and defaulting to zero.
-Fold Limit is appended after the waveform-boundary triggers, preserving all
-earlier parameter indices and defaulting to the previous folding range of 2.
-Shared Output/Output mode and Voice 1 Pitch CV reuse the original indices.
-MIDI Channel follows Fold Limit, then the remaining configured Voice N Pitch CV
-parameters are appended. All CV inputs default to None. Each voice's Transpose
-and Fine tune pair is appended after all existing CV parameters, preserving the
-previous parameter indices. Moving CV/tuning controls to per-voice pages and
-using parameter UI prefixes changes only presentation, preserving parameter
-indices and values. Zero offsets preserve the existing tuning.
-Warp Position is unitless: 0 and 255 mark the waveform edges. Earlier prototype
-presets stored a raw 0–100 percentage value; those warp position values now use the
-new 0–255 units and may need readjustment.
+This revision changes parameter ordinals. Recreate earlier instances/presets and
+review CV-to-parameter mappings; old ordinal-based values/mappings are not
+migrated automatically. Changing segment count now preserves the indices of
+shared controls, voices, and remaining waveform controls. Changing voice count
+preserves shared controls and remaining voice controls, but shifts the waveform
+block; it does not solve arbitrary respecification across both counts.
 
 From the repository's devcontainer:
 

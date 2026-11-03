@@ -41,7 +41,7 @@ fn parameter_prefix(instance: &Instance, parameter: i32) -> String {
 // Resolve editor controls against the live instance's segment count.
 fn segment_parameter(segment: usize, field: usize) -> usize {
     let n = CURRENT_SEGMENTS.with(|current| current.get());
-    editor_parameter(n, segment, field).expect("invalid editor control")
+    editor_parameter(n, segment, field, 1).expect("invalid editor control")
 }
 
 struct Instance {
@@ -70,7 +70,7 @@ impl Instance {
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
             assert_eq!(
                 req.num_parameters as usize,
-                GLOBALS + n as usize * 2 + 11 + voices as usize * 3
+                GLOBALS + n as usize * 2 + voices as usize * 3
             );
             assert!(
                 req.sram
@@ -195,28 +195,63 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
     for n in 2..=32 {
         let instance = Instance::new(n);
         unsafe {
-            assert_eq!((*(*instance.base).parameter_pages).num_pages as usize, 4);
+            assert_eq!((*(*instance.base).parameter_pages).num_pages as usize, 5);
             assert_eq!(
-                editor_parameter(n as usize, 0, 0),
-                Some(seam_parameter(n as usize))
+                editor_parameter(n as usize, 0, 0, 1),
+                Some(seam_parameter(n as usize, 1))
             );
             assert_eq!(
-                editor_parameter(n as usize, n as usize - 1, 1),
-                Some(seam_parameter(n as usize))
+                editor_parameter(n as usize, n as usize - 1, 1, 1),
+                Some(seam_parameter(n as usize, 1))
             );
-            let wave = read_wave(n as usize, |p| instance.values.get(p).copied());
+            let wave = read_wave(n as usize, |p| instance.values.get(p).copied(), 1);
             assert_eq!(wave.segment_sample(0, 0.0), 0.0);
             assert_eq!(wave.segment_sample(n as usize - 1, 1.0), 0.0);
             let pages = &*(*instance.base).parameter_pages;
+            let oscillator = &*pages.pages;
+            assert_eq!(CStr::from_ptr(oscillator.name), c"Oscillator");
+            assert_eq!(
+                core::slice::from_raw_parts(oscillator.params, oscillator.num_params as usize),
+                &[
+                    midi_channel_parameter(n as usize) as u8,
+                    PITCH as u8,
+                    FINE as u8,
+                    LEVEL as u8
+                ]
+            );
+            let shape = &*pages.pages.add(2);
+            assert_eq!(CStr::from_ptr(shape.name), c"Shape");
+            let expected_names = [
+                c"Warp Position",
+                c"Warp Amount",
+                c"Smoothing",
+                c"Fold Limit",
+                c"Sine Boundaries",
+                c"Triangle Boundaries",
+                c"Square Boundaries",
+                c"Sawtooth Boundaries",
+                c"Zero Curves",
+                c"Randomize Curves",
+                c"Randomize Boundaries",
+                c"Randomize All",
+            ];
+            let rows = core::slice::from_raw_parts(shape.params, shape.num_params as usize);
+            assert_eq!(rows.len(), expected_names.len());
+            for (&index, name) in rows.iter().zip(expected_names) {
+                assert_eq!(
+                    CStr::from_ptr((*(*instance.base).parameters.add(index as usize)).name),
+                    name
+                );
+            }
             let oscillator_group = (*pages.pages).group;
             let routing_group = (*pages.pages.add(1)).group;
-            let page = &*pages.pages.add(3);
+            let page = &*pages.pages.add(4);
             assert_eq!(CStr::from_ptr(page.name), c"Waveform");
             assert_ne!(page.group, 0);
             assert_ne!(page.group, oscillator_group);
             assert_ne!(page.group, routing_group);
             let routing = &*pages.pages.add(1);
-            assert_eq!(CStr::from_ptr(routing.name), c"Routings");
+            assert_eq!(CStr::from_ptr(routing.name), c"Output");
             assert_eq!(
                 core::slice::from_raw_parts(routing.params, routing.num_params as usize),
                 &[OUTPUT as u8, OUTPUT_MODE as u8]
@@ -231,18 +266,21 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert!(factory().parameter_ui_prefix.is_some());
             assert_eq!(page.num_params as usize, n as usize * 2 + 1);
             let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
-            assert_eq!(rows[0] as usize, seam_parameter(n as usize));
+            assert_eq!(rows[0] as usize, seam_parameter(n as usize, 1));
             for segment in 0..n as usize {
                 assert_eq!(
                     rows[segment * 2 + 1] as usize,
-                    curve_parameter(n as usize, segment)
+                    curve_parameter(n as usize, segment, 1)
                 );
                 assert_eq!(
                     rows[segment * 2 + 2] as usize,
-                    editor_parameter(n as usize, segment, 1).unwrap_or(seam_parameter(n as usize))
+                    editor_parameter(n as usize, segment, 1, 1)
+                        .unwrap_or(seam_parameter(n as usize, 1))
                 );
             }
-            let seam = *(*instance.base).parameters.add(seam_parameter(n as usize));
+            let seam = *(*instance.base)
+                .parameters
+                .add(seam_parameter(n as usize, 1));
             assert_eq!((seam.min, seam.max, seam.default), (-100, 100, 0));
             assert_eq!(CStr::from_ptr(seam.name), c"Boundary 00");
             let mut references = std::vec![0; instance.values.len()];
@@ -255,10 +293,10 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 }
             }
             for boundary in 1..n as usize {
-                let p = boundary_parameter(boundary);
+                let p = boundary_parameter(boundary, 1);
                 assert_eq!(references[p], 1);
-                assert_eq!(editor_parameter(n as usize, boundary - 1, 1), Some(p));
-                assert_eq!(editor_parameter(n as usize, boundary, 0), Some(p));
+                assert_eq!(editor_parameter(n as usize, boundary - 1, 1, 1), Some(p));
+                assert_eq!(editor_parameter(n as usize, boundary, 0, 1), Some(p));
                 let d = *(*instance.base).parameters.add(p);
                 assert_eq!((d.min, d.max), (-100, 100));
                 assert_eq!(
@@ -267,20 +305,20 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 );
             }
             for segment in 0..n as usize {
-                assert_eq!(references[curve_parameter(n as usize, segment)], 1);
+                assert_eq!(references[curve_parameter(n as usize, segment, 1)], 1);
             }
-            assert_eq!(references[seam_parameter(n as usize)], 2);
+            assert_eq!(references[seam_parameter(n as usize, 1)], 2);
             assert_eq!(references[randomize_parameter(n as usize)], 1);
             let midi = midi_channel_parameter(n as usize);
             assert_eq!(references[midi], 1);
-            assert_eq!(midi, GLOBALS + n as usize * 2 + 11);
+            assert_eq!(midi, 0);
             let d = *(*instance.base).parameters.add(midi);
             assert_eq!((d.min, d.max, d.default, d.unit), (0, 17, 0, UNIT_ENUM));
             assert_eq!(CStr::from_ptr(*d.enum_strings), c"Off");
             assert_eq!(CStr::from_ptr(*d.enum_strings.add(1)), c"All");
             assert_eq!(CStr::from_ptr(*d.enum_strings.add(17)), c"16");
             let fold = fold_limit_parameter(n as usize);
-            assert_eq!(fold, randomize_parameter(n as usize) + 10);
+            assert_eq!(fold, 9);
             assert_eq!(references[fold], 1);
             let d = *(*instance.base).parameters.add(fold);
             assert_eq!(CStr::from_ptr(d.name), c"Fold Limit");
@@ -358,9 +396,11 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
             instance.change(centroid_parameter(n), 94);
             instance.change(strength_parameter(n), -68);
             instance.change(fold_limit_parameter(n), 1);
-            let mut boundaries = std::vec![seam_parameter(n)];
-            boundaries.extend((1..n).map(boundary_parameter));
-            let curves: Vec<_> = (0..n).map(|segment| curve_parameter(n, segment)).collect();
+            let mut boundaries = std::vec![seam_parameter(n, 1)];
+            boundaries.extend((1..n).map(|boundary| boundary_parameter(boundary, 1)));
+            let curves: Vec<_> = (0..n)
+                .map(|segment| curve_parameter(n, segment, 1))
+                .collect();
             for (i, &parameter) in boundaries.iter().enumerate() {
                 instance.change(parameter, (i as i16 * 3) - 40);
             }
@@ -415,9 +455,9 @@ fn shape_trigger_edges_are_independent() {
         instance.change(trigger, 1);
     }
     let boundary_values: Vec<_> = (1..8)
-        .map(|i| instance.values[boundary_parameter(i)])
+        .map(|i| instance.values[boundary_parameter(i, 1)])
         .collect();
-    instance.change(curve_parameter(8, 0), 73);
+    instance.change(curve_parameter(8, 0, 1), 73);
     let before = instance.values.clone();
     for trigger in [all, boundaries, curves, zero] {
         instance.change(trigger, 1);
@@ -425,16 +465,17 @@ fn shape_trigger_edges_are_independent() {
     assert_eq!(instance.values, before);
     instance.change(curves, 0);
     instance.change(curves, 1);
-    assert!((0..8).any(|i| instance.values[curve_parameter(8, i)] != before[curve_parameter(8, i)]));
+    assert!((0..8)
+        .any(|i| instance.values[curve_parameter(8, i, 1)] != before[curve_parameter(8, i, 1)]));
     assert_eq!(
         (1..8)
-            .map(|i| instance.values[boundary_parameter(i)])
+            .map(|i| instance.values[boundary_parameter(i, 1)])
             .collect::<Vec<_>>(),
         boundary_values
     );
     instance.change(zero, 0);
     instance.change(zero, 1);
-    assert!((0..8).all(|i| instance.values[curve_parameter(8, i)] == 0));
+    assert!((0..8).all(|i| instance.values[curve_parameter(8, i, 1)] == 0));
 }
 
 #[test]
@@ -446,10 +487,10 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
         instance.change(centroid_parameter(n), 94);
         instance.change(strength_parameter(n), -68);
         for i in 0..n {
-            instance.change(curve_parameter(n, i), 20 + i as i16);
+            instance.change(curve_parameter(n, i, 1), 20 + i as i16);
         }
-        let boundaries: Vec<_> = std::iter::once(seam_parameter(n))
-            .chain((1..n).map(boundary_parameter))
+        let boundaries: Vec<_> = std::iter::once(seam_parameter(n, 1))
+            .chain((1..n).map(|boundary| boundary_parameter(boundary, 1)))
             .collect();
         for (kind, shape) in [
             dsp::BoundaryShape::Sine,
@@ -476,7 +517,7 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
             }
             // Holding this trigger high must not reapply the shape, even with
             // other waveform triggers already held high from earlier iterations.
-            instance.change(seam_parameter(n), 73);
+            instance.change(seam_parameter(n, 1), 73);
             let held = instance.values.clone();
             for trigger in shape_triggers(n).into_iter().skip(4).take(kind + 1) {
                 instance.change(trigger, 1);
@@ -484,7 +525,7 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
             assert_eq!(instance.values, held);
             instance.change(trigger, 0);
             instance.change(trigger, 1);
-            assert_eq!(instance.values[seam_parameter(n)], -100);
+            assert_eq!(instance.values[seam_parameter(n, 1)], -100);
         }
     }
 }
@@ -495,6 +536,8 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
         let mut instance = Instance::new(n);
         let n = n as usize;
         let trigger = randomize_parameter(n);
+        let shape_start = seam_parameter(n, 1);
+        let shape_end = shape_start + n * 2;
         instance.change(SMOOTHING, 43);
         instance.change(centroid_parameter(n), 37);
         instance.change(strength_parameter(n), -68);
@@ -504,11 +547,15 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
         assert_eq!(first[centroid_parameter(n)], 37);
         assert_eq!(first[strength_parameter(n)], -68);
         assert_ne!(
-            &first[GLOBALS..seam_parameter(n)],
-            &before[GLOBALS..seam_parameter(n)]
+            &first[shape_start..shape_end],
+            &before[shape_start..shape_end]
         );
-        assert_eq!(&first[..GLOBALS], &before[..GLOBALS]);
-        assert!(first[GLOBALS..=seam_parameter(n)]
+        for index in 0..first.len() {
+            if !(shape_start..shape_end).contains(&index) && index != trigger {
+                assert_eq!(first[index], before[index]);
+            }
+        }
+        assert!(first[shape_start..shape_end]
             .iter()
             .all(|v| (-100..=100).contains(v)));
         instance.change(trigger, 1);
@@ -517,11 +564,11 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
         assert_eq!(&instance.values[..trigger], &first[..trigger]);
         instance.change(trigger, 1);
         assert_ne!(
-            &instance.values[GLOBALS..seam_parameter(n)],
-            &first[GLOBALS..seam_parameter(n)]
+            &instance.values[shape_start..shape_end],
+            &first[shape_start..shape_end]
         );
-        let wave = read_wave(n, |p| instance.values.get(p).copied());
-        let seam = instance.values[seam_parameter(n)] as f32 * 0.01;
+        let wave = read_wave(n, |p| instance.values.get(p).copied(), 1);
+        let seam = instance.values[seam_parameter(n, 1)] as f32 * 0.01;
         assert_eq!(wave.segment_sample(0, 0.0), seam);
         assert_eq!(wave.segment_sample(n - 1, 1.0), seam);
         for boundary in 1..n {
@@ -544,7 +591,7 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
     for n in [2, 7, 32] {
         let mut instance = Instance::new(n);
         let n = n as usize;
-        let seam = seam_parameter(n);
+        let seam = seam_parameter(n, 1);
         instance.change(seam, 25);
         instance.event([0.5; 3], [0, 0]);
         instance.event([0.508, 0.5, 0.5], [0, 0]);
@@ -592,12 +639,12 @@ fn both_pots_edit_the_same_shared_boundary_from_neighboring_segments() {
 
     instance.event([0.508, 0.5, 0.508], [-1, 0]);
     assert_eq!(instance.values[segment_parameter(2, 1)], after_left);
-    let wave = read_wave(8, |p| instance.values.get(p).copied());
+    let wave = read_wave(8, |p| instance.values.get(p).copied(), 1);
     assert_eq!(wave.segment_sample(2, 1.0), wave.segment_sample(3, 0.0));
 
     // Direct host/preset/modulation writes use that same single source of truth.
     instance.change(boundary, -83);
-    let wave = read_wave(8, |p| instance.values.get(p).copied());
+    let wave = read_wave(8, |p| instance.values.get(p).copied(), 1);
     assert_eq!(wave.segment_sample(2, 1.0), -0.83);
     assert_eq!(wave.segment_sample(3, 0.0), -0.83);
 }
@@ -608,17 +655,17 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
         let mut instance = Instance::new(n);
         for boundary in 1..n as usize {
             instance.change(
-                boundary_parameter(boundary),
+                boundary_parameter(boundary, 1),
                 (boundary * 37 % 201) as i16 - 100,
             );
         }
         for segment in 0..n as usize {
             instance.change(
-                curve_parameter(n as usize, segment),
+                curve_parameter(n as usize, segment, 1),
                 if segment % 2 == 0 { -100 } else { 100 },
             );
         }
-        let wave = read_wave(n as usize, |p| instance.values.get(p).copied());
+        let wave = read_wave(n as usize, |p| instance.values.get(p).copied(), 1);
         for boundary in 1..n as usize {
             assert_eq!(
                 wave.segment_sample(boundary - 1, 1.0),
@@ -644,7 +691,7 @@ fn configurable_voices_have_shared_routing_and_grouped_voice_pages() {
         for voices in 1..=VOICE_COUNT {
             let instance = Instance::with_voices(n, voices as i32);
             let config = Wavesmith::configuration(&[n, voices as i32]).unwrap();
-            assert_eq!(config.pages, voices + 3);
+            assert_eq!(config.pages, voices + 4);
             assert_eq!(
                 config.regions * core::mem::size_of::<dsp::Block>(),
                 24 * 1024
@@ -654,22 +701,31 @@ fn configurable_voices_have_shared_routing_and_grouped_voice_pages() {
                 let routing = &*pages.pages.add(1);
                 let rows = core::slice::from_raw_parts(routing.params, routing.num_params as usize);
                 assert_eq!(rows, &[OUTPUT as u8, OUTPUT_MODE as u8]);
-                let group = (*pages.pages.add(2)).group;
+                let group = (*pages.pages.add(3)).group;
                 assert_ne!(group, 0);
                 assert_ne!(group, routing.group);
                 assert_ne!(group, (*pages.pages).group);
-                assert_ne!(group, (*pages.pages.add(voices + 2)).group);
+                assert_ne!(group, (*pages.pages.add(voices + 3)).group);
                 let mut seen = std::vec![0; instance.values.len()];
+                let mut next_ordinal = 0;
                 for i in 0..pages.num_pages as usize {
                     let page = &*pages.pages.add(i);
                     for &p in core::slice::from_raw_parts(page.params, page.num_params as usize) {
+                        if seen[p as usize] == 0 {
+                            assert_eq!(
+                                p as usize, next_ordinal,
+                                "ordinal must match first appearance in menu order"
+                            );
+                            next_ordinal += 1;
+                        }
                         seen[p as usize] += 1;
                     }
                 }
+                assert_eq!(next_ordinal, instance.values.len());
                 for (p, references) in seen.into_iter().enumerate() {
                     assert_eq!(
                         references,
-                        if p == seam_parameter(n as usize) {
+                        if p == seam_parameter(n as usize, voices) {
                             2
                         } else {
                             1
@@ -677,7 +733,7 @@ fn configurable_voices_have_shared_routing_and_grouped_voice_pages() {
                     );
                 }
                 for voice in 0..voices {
-                    let page = &*pages.pages.add(voice + 2);
+                    let page = &*pages.pages.add(voice + 3);
                     assert_eq!(
                         CStr::from_ptr(page.name).to_str().unwrap(),
                         std::format!("Voice {}", voice + 1)
@@ -961,7 +1017,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
 #[test]
 fn only_bright_editor_trace_is_drawn_with_or_without_smoothing() {
     let mut instance = Instance::new(7);
-    instance.change(curve_parameter(7, 2), 100);
+    instance.change(curve_parameter(7, 2, 1), 100);
     let mut samples = [0.0; LAST_BUS * 64];
     let mut original = None;
     for smoothing in [0, 75, 0] {
@@ -995,7 +1051,7 @@ fn only_bright_editor_trace_is_drawn_with_or_without_smoothing() {
 #[test]
 fn pitch_changes_do_not_change_the_displayed_waveform() {
     let mut instance = Instance::new(32);
-    instance.change(curve_parameter(32, 0), 100);
+    instance.change(curve_parameter(32, 0, 1), 100);
     let mut samples = [0.0; LAST_BUS * 64];
     for _ in 0..64 {
         instance.render(&mut samples);
@@ -1101,7 +1157,7 @@ fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
     for strength in [-100, 100] {
         instance.change(strength_parameter(8), strength);
         instance.change(SMOOTHING, 50);
-        let wave = read_wave(8, |p| instance.values.get(p).copied());
+        let wave = read_wave(8, |p| instance.values.get(p).copied(), 1);
         let left = (wave.boundary_position(2) * 255.0) as i32;
         let right = (wave.boundary_position(3) * 255.0) as i32;
         let mut samples = [0.0; LAST_BUS * 64];
@@ -1175,11 +1231,12 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
                 .iter()
                 .any(|(_, y, value)| *y == 10 && value == expected));
         }
-        for expected in ["L: Pitch", "C: Fine", "R: Level", "R click: Segment"] {
-            assert!(text
-                .iter()
-                .any(|(_, y, value)| *y >= 57 && value == expected));
-        }
+        let footer: Vec<_> = text
+            .iter()
+            .filter(|(_, y, _)| *y >= 50)
+            .map(|(_, _, value)| value.as_str())
+            .collect();
+        assert_eq!(footer, ["Push: Mode"]);
     });
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[15; 3]));
     SHAPES.with(|shapes| {
@@ -1232,7 +1289,7 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
         assert!(text
             .borrow()
             .iter()
-            .any(|(_, _, value)| value == "R click: Warp"))
+            .any(|(_, _, value)| value == "Push: Mode"))
     });
     SHAPES.with(|shapes| {
         assert_eq!(
@@ -1252,7 +1309,7 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
         let mut instance = Instance::new(n);
         let n = n as usize;
         for segment in 0..n {
-            instance.change(curve_parameter(n, segment), segment as i16 * 3 - 50);
+            instance.change(curve_parameter(n, segment, 1), segment as i16 * 3 - 50);
         }
         instance.event([0.5; 3], [0, 0]);
         let before = instance.values.clone();
@@ -1262,7 +1319,8 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
             instance.event([0.508; 3], [delta, 0]);
             assert_eq!(instance.values, before);
             instance.draw();
-            let expected = std::format!("Curve {}", before[curve_parameter(n, selected as usize)]);
+            let expected =
+                std::format!("Curve {}", before[curve_parameter(n, selected as usize, 1)]);
             TEXT.with(|text| {
                 assert!(text
                     .borrow()
@@ -1271,7 +1329,7 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
             });
         }
         instance.event([0.508, 0.517, 0.508], [0, 0]);
-        let edited = curve_parameter(n, selected as usize);
+        let edited = curve_parameter(n, selected as usize, 1);
         assert!(instance.values[edited] > before[edited]);
         for p in 0..before.len() {
             if p != edited {
@@ -1290,9 +1348,9 @@ fn segment_header_shows_selected_left_curve_and_right_values_with_background() {
         for selected in [0, n / 2, n - 1] {
             instance.event([0.5; 3], [(selected - previous) as i8, 0]);
             previous = selected;
-            instance.change(editor_parameter(n, selected, 0).unwrap(), -100);
-            instance.change(curve_parameter(n, selected), -37);
-            instance.change(editor_parameter(n, selected, 1).unwrap(), 100);
+            instance.change(editor_parameter(n, selected, 0, 1).unwrap(), -100);
+            instance.change(curve_parameter(n, selected, 1), -37);
+            instance.change(editor_parameter(n, selected, 1, 1).unwrap(), 100);
             instance.draw();
             TEXT.with(|text| {
                 for (x, expected) in [(2, "Left -100"), (102, "Curve -37"), (190, "Right 100")] {
@@ -1398,12 +1456,13 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         );
     });
     TEXT.with(|text| {
-        for expected in ["L: Warp Pos", "C: Warp Amt", "R: Smooth", "R click: Pitch"] {
-            assert!(text
-                .borrow()
-                .iter()
-                .any(|(_, y, s)| *y >= 57 && s == expected));
-        }
+        let text = text.borrow();
+        let footer: Vec<_> = text
+            .iter()
+            .filter(|(_, y, _)| *y >= 50)
+            .map(|(_, _, value)| value.as_str())
+            .collect();
+        assert_eq!(footer, ["Push: Mode"]);
     });
     for step in 1..=40 {
         instance.event([0.8 + step as f32 * 0.005; 3], [0, 0]);
@@ -1415,10 +1474,10 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     assert_eq!(instance.values[centroid_parameter(8)], 255);
     assert_eq!(instance.values[LEVEL], 30);
     assert_eq!(instance.values[PITCH], 40);
-    let first_shape = instance.values[GLOBALS..trigger].to_vec();
-    assert_eq!(first_shape, before[GLOBALS..trigger]);
+    let first_shape = instance.values[seam_parameter(8, 1)..].to_vec();
+    assert_eq!(first_shape, before[seam_parameter(8, 1)..]);
     instance.event([1.0; 3], [0, 0]);
-    assert_eq!(&instance.values[GLOBALS..trigger], &first_shape);
+    assert_eq!(&instance.values[seam_parameter(8, 1)..], &first_shape);
     for step in (0..200).rev() {
         instance.event([step as f32 * 0.005; 3], [0, 0]);
     }
@@ -1426,7 +1485,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     assert_eq!(instance.values[strength_parameter(8)], -100);
     assert_eq!(instance.values[trigger], 0);
     assert_eq!(instance.values[centroid_parameter(8)], 0);
-    assert_eq!(&instance.values[GLOBALS..trigger], &first_shape);
+    assert_eq!(&instance.values[seam_parameter(8, 1)..], &first_shape);
     assert_eq!(instance.values[PITCH], 40);
     // Slow motion must accumulate instead of disappearing in integer rounding.
     for step in 1..=100 {
@@ -1452,7 +1511,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     assert_eq!(instance.values, before_switch);
     instance.event_buttons([0.5; 3], [0, 0], 0, ENCODER_BUTTON_R);
     instance.draw();
-    TEXT.with(|text| assert!(text.borrow().iter().any(|(_, _, s)| s == "R click: Warp")));
+    TEXT.with(|text| assert!(text.borrow().iter().any(|(_, _, s)| s == "Push: Mode")));
     SHAPES.with(|shapes| {
         let shapes = shapes.borrow();
         assert!(!shapes.contains(&(SHAPE_RECTANGLE, 0, 0, 255, 7)));
@@ -1489,14 +1548,14 @@ fn editor_selection_relative_pots_and_permanent_footer() {
     let mut instance = Instance::new(32);
     instance.event([0.5; 3], [0, 0]);
     instance.event([0.51; 3], [0, 1]);
-    assert_eq!(editor_parameter(32, 0, 0), Some(seam_parameter(32)));
+    assert_eq!(editor_parameter(32, 0, 0, 1), Some(seam_parameter(32, 1)));
     assert!(instance.values[segment_parameter(0, 2)] > 0);
     assert_eq!(instance.values[SMOOTHING], 0);
     instance.event([0.51; 3], [31, 0]);
     let previous = instance.values[segment_parameter(31, 0)];
     instance.event([0.52; 3], [0, 0]);
     assert!(instance.values[segment_parameter(31, 0)] > previous);
-    assert_eq!(editor_parameter(32, 31, 1), Some(seam_parameter(32)));
+    assert_eq!(editor_parameter(32, 31, 1, 1), Some(seam_parameter(32, 1)));
     let mut samples = [0.0; LAST_BUS * 64];
     for _ in 0..200 {
         instance.render(&mut samples);
@@ -1504,18 +1563,13 @@ fn editor_selection_relative_pots_and_permanent_footer() {
     instance.draw();
     TEXT.with(|text| {
         let text = text.borrow();
-        for expected in [
-            "L: Start",
-            "C: Curve",
-            "R: End",
-            "Enc L: Segment",
-            "R click: Warp",
-        ] {
+        for expected in ["Turn: Select", "Push: Mode"] {
             assert!(text.iter().any(|(_, y, s)| *y >= 57 && s == expected));
         }
-        assert_eq!(text.len(), 8);
+        assert_eq!(text.len(), 5);
+        assert!(text.iter().all(|(_, y, _)| *y != 57));
         for (x, prefix, field) in [(2, "Left", 0), (102, "Curve", 2), (190, "Right", 1)] {
-            let value = instance.values[editor_parameter(32, 31, field).unwrap()];
+            let value = instance.values[editor_parameter(32, 31, field, 1).unwrap()];
             let expected = std::format!("{prefix} {value}");
             assert!(text
                 .iter()
@@ -1704,7 +1758,7 @@ fn persistence_metadata(instance: &Instance) -> Vec<String> {
             }
         }
         let pages = &*(*instance.base).parameter_pages;
-        assert_eq!(pages.num_pages as usize, instance.voice_count + 3);
+        assert_eq!(pages.num_pages as usize, instance.voice_count + 4);
         for i in 0..pages.num_pages as usize {
             let page = &*pages.pages.add(i);
             let name = CStr::from_ptr(page.name).to_str().unwrap();
@@ -1747,7 +1801,11 @@ fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activ
         for block in 0..400 {
             if block % 16 == 0 {
                 instance.change(
-                    curve_parameter(segments as usize, block / 16 % segments as usize),
+                    curve_parameter(
+                        segments as usize,
+                        block / 16 % segments as usize,
+                        voices as usize,
+                    ),
                     (block as i16 % 201) - 100,
                 );
                 instance.change(
@@ -1893,7 +1951,7 @@ fn voice_prefixes_cover_only_voice_parameters_and_respect_small_buffers() {
         PITCH as i32,
         FINE as i32,
         midi_channel_parameter(8) as i32,
-        seam_parameter(8) as i32,
+        seam_parameter(8, 10) as i32,
         -1,
         i32::MAX,
     ] {
@@ -1918,4 +1976,90 @@ fn voice_prefixes_cover_only_voice_parameters_and_respect_small_buffers() {
             }
         }
     }
+}
+
+#[test]
+fn pot_push_resets_current_control_once_per_press_and_preserves_pickup() {
+    for (segments, voices) in [(2, 1), (8, 1), (32, 10)] {
+        for selected in [0, segments - 1] {
+            for mode in 0..3 {
+                for pot in 0..3 {
+                    let mut instance = Instance::with_voices(segments, voices);
+                    instance.event([0.8; 3], [selected as i8, 0]);
+                    for _ in 0..mode {
+                        instance.click_right([0.8; 3]);
+                    }
+                    let n = segments as usize;
+                    let parameter = match mode {
+                        0 => {
+                            editor_parameter(n, selected as usize, [0, 2, 1][pot], voices as usize)
+                                .unwrap()
+                        }
+                        1 => [centroid_parameter(n), strength_parameter(n), SMOOTHING][pot],
+                        _ => [PITCH, FINE, LEVEL][pot],
+                    };
+                    let definition = unsafe { *(*instance.base).parameters.add(parameter) };
+                    let reset_value = if mode == 0 && pot != 1 {
+                        0
+                    } else {
+                        definition.default
+                    };
+                    let changed = if reset_value == definition.min {
+                        definition.max
+                    } else {
+                        definition.min
+                    };
+                    instance.change(parameter, changed);
+                    let mut expected = instance.values.clone();
+                    expected[parameter] = reset_value;
+                    let button = [POT_BUTTON_L, POT_BUTTON_C, POT_BUTTON_R][pot];
+                    let mut pots = [0.8; 3];
+                    pots[pot] = 0.805;
+                    instance.event_buttons(pots, [0, 0], button, 0);
+                    assert_eq!(instance.values, expected);
+                    // A held button must not repeatedly overwrite external edits.
+                    instance.change(parameter, changed);
+                    instance.event_buttons(pots, [0, 0], button, button);
+                    assert_eq!(instance.values[parameter], changed);
+                    instance.event_buttons(pots, [0, 0], 0, button);
+                    assert_eq!(instance.values[parameter], changed);
+                    instance.event_buttons(pots, [0, 0], button, 0);
+                    assert_eq!(instance.values, expected);
+                    // Releasing at a different position must not cause a jump.
+                    pots[pot] = 0.9;
+                    instance.event_buttons(pots, [0, 0], 0, button);
+                    instance.event(pots, [0, 0]);
+                    assert_eq!(instance.values, expected);
+                    unsafe {
+                        let mask = factory().has_custom_ui.unwrap()(instance.base);
+                        assert_eq!(
+                            mask & (POT_BUTTON_L | POT_BUTTON_C | POT_BUTTON_R),
+                            POT_BUTTON_L | POT_BUTTON_C | POT_BUTTON_R
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
+    let mut instance = Instance::new(8);
+    instance.change(PITCH, 100);
+    instance.change(FINE, 50);
+    instance.change(LEVEL, 80);
+    instance.change(midi_channel_parameter(8), 1);
+    instance.event([0.8; 3], [0, 0]);
+    instance.click_right([0.8; 3]);
+    instance.click_right([0.8; 3]);
+    let buttons = POT_BUTTON_L | POT_BUTTON_C | POT_BUTTON_R;
+    instance.event_buttons([0.8; 3], [0, 0], buttons, 0);
+    assert_eq!(instance.values[PITCH], 100);
+    assert_eq!(instance.values[FINE], 0);
+    assert_eq!(instance.values[LEVEL], 50);
+    instance.event_buttons([0.8; 3], [0, 0], 0, buttons);
+    instance.change(midi_channel_parameter(8), 0);
+    instance.event_buttons([0.8; 3], [0, 0], POT_BUTTON_L, 0);
+    assert_eq!(instance.values[PITCH], 57);
 }

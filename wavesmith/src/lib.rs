@@ -17,14 +17,17 @@ use distingnt_api::api::{
 };
 use distingnt_api::*;
 
-const OUTPUT: usize = 0;
-const OUTPUT_MODE: usize = 1;
-const PITCH: usize = 2;
-const FINE: usize = 3;
-const PITCH_CV: usize = 4;
-const SMOOTHING: usize = 5;
-const LEVEL: usize = 6;
-const GLOBALS: usize = 7;
+// Parameter ordinals follow page order: Oscillator, Output, Shape, voices,
+// then interleaved waveform boundaries/curves. Shared controls have fixed indices.
+const MIDI_CHANNEL: usize = 0;
+const PITCH: usize = 1;
+const FINE: usize = 2;
+const LEVEL: usize = 3;
+const OUTPUT: usize = 4;
+const OUTPUT_MODE: usize = 5;
+const SMOOTHING: usize = 8;
+const GLOBALS: usize = 18;
+const PITCH_CV: usize = GLOBALS;
 const VOICE_COUNT: usize = 10; // Maximum; only the specified pool is processed.
 const VOICE_PAGE_NAMES: [&CStr; VOICE_COUNT] = [
     c"Voice 1",
@@ -45,24 +48,17 @@ static MIDI_CHANNELS: EnumStrings<18> = EnumStrings::new([
     c"Off", c"All", c"1", c"2", c"3", c"4", c"5", c"6", c"7", c"8", c"9", c"10", c"11", c"12",
     c"13", c"14", c"15", c"16",
 ]);
-fn midi_channel_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 11
+const fn midi_channel_parameter(_: usize) -> usize {
+    MIDI_CHANNEL
 }
-
-fn voice_pitch_parameter(n: usize, voice: usize) -> usize {
-    if voice == 0 {
-        PITCH_CV
-    } else {
-        randomize_parameter(n) + 11 + voice
-    }
+const fn voice_pitch_parameter(_: usize, voice: usize) -> usize {
+    PITCH_CV + voice * 3
 }
-
-// Append tuning after the existing MIDI/CV parameters to preserve their indices.
-fn voice_transpose_parameter(n: usize, voices: usize, voice: usize) -> usize {
-    randomize_parameter(n) + 11 + voices + voice * 2
+const fn voice_transpose_parameter(_: usize, _: usize, voice: usize) -> usize {
+    GLOBALS + voice * 3 + 1
 }
-fn voice_fine_parameter(n: usize, voices: usize, voice: usize) -> usize {
-    voice_transpose_parameter(n, voices, voice) + 1
+const fn voice_fine_parameter(_: usize, _: usize, voice: usize) -> usize {
+    GLOBALS + voice * 3 + 2
 }
 
 fn voice_count(specs: &[i32]) -> Option<usize> {
@@ -75,52 +71,38 @@ fn count(specs: &[i32]) -> Option<usize> {
     (2..=32).contains(&value).then_some(value)
 }
 
-const fn boundary_parameter(boundary: usize) -> usize {
-    GLOBALS + boundary - 1
+const fn boundary_parameter(boundary: usize, voices: usize) -> usize {
+    GLOBALS + voices * 3 + boundary * 2
 }
-
-const fn curve_parameter(n: usize, segment: usize) -> usize {
-    GLOBALS + n - 1 + segment
+const fn curve_parameter(_: usize, segment: usize, voices: usize) -> usize {
+    boundary_parameter(segment, voices) + 1
 }
-
-const fn seam_parameter(n: usize) -> usize {
-    GLOBALS + n * 2 - 1
+const fn seam_parameter(_: usize, voices: usize) -> usize {
+    boundary_parameter(0, voices)
 }
-
-const fn randomize_parameter(n: usize) -> usize {
-    GLOBALS + n * 2
+const fn centroid_parameter(_: usize) -> usize {
+    6
 }
-
-const fn centroid_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 1
+const fn strength_parameter(_: usize) -> usize {
+    7
 }
-const fn strength_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 2
+const fn fold_limit_parameter(_: usize) -> usize {
+    9
 }
-const fn randomize_boundaries_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 3
+const fn zero_curves_parameter(_: usize) -> usize {
+    14
 }
-const fn randomize_curves_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 4
+const fn randomize_curves_parameter(_: usize) -> usize {
+    15
 }
-const fn zero_curves_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 5
+const fn randomize_boundaries_parameter(_: usize) -> usize {
+    16
 }
-const fn fold_limit_parameter(n: usize) -> usize {
-    randomize_parameter(n) + 10
+const fn randomize_parameter(_: usize) -> usize {
+    17
 }
-
-fn shape_triggers(n: usize) -> [usize; 8] {
-    [
-        randomize_parameter(n),
-        randomize_boundaries_parameter(n),
-        randomize_curves_parameter(n),
-        zero_curves_parameter(n),
-        randomize_parameter(n) + 6,
-        randomize_parameter(n) + 7,
-        randomize_parameter(n) + 8,
-        randomize_parameter(n) + 9,
-    ]
+fn shape_triggers(_: usize) -> [usize; 8] {
+    [17, 16, 15, 14, 10, 11, 12, 13]
 }
 
 fn random_level(seed: &mut u32) -> i16 {
@@ -130,23 +112,25 @@ fn random_level(seed: &mut u32) -> i16 {
     (*seed % 201) as i16 - 100
 }
 
-fn editor_parameter(n: usize, segment: usize, field: usize) -> Option<usize> {
+fn editor_parameter(n: usize, segment: usize, field: usize, voices: usize) -> Option<usize> {
     if segment >= n {
         return None;
     }
     match field {
-        0 if segment == 0 => Some(seam_parameter(n)),
-        1 if segment + 1 == n => Some(seam_parameter(n)),
-        0 if segment > 0 => Some(boundary_parameter(segment)),
-        1 if segment + 1 < n => Some(boundary_parameter(segment + 1)),
-        2 => Some(curve_parameter(n, segment)),
+        0 if segment == 0 => Some(seam_parameter(n, voices)),
+        1 if segment + 1 == n => Some(seam_parameter(n, voices)),
+        0 if segment > 0 => Some(boundary_parameter(segment, voices)),
+        1 if segment + 1 < n => Some(boundary_parameter(segment + 1, voices)),
+        2 => Some(curve_parameter(n, segment, voices)),
         _ => None,
     }
 }
 
-fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
+fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>, voices: usize) -> dsp::Wave {
     let mut wave = dsp::Wave::new(n);
-    wave.boundaries[0] = value(seam_parameter(n)).unwrap_or(0).clamp(-100, 100);
+    wave.boundaries[0] = value(seam_parameter(n, voices))
+        .unwrap_or(0)
+        .clamp(-100, 100);
     wave.smoothing = value(SMOOTHING).unwrap_or(0).clamp(0, 100);
     wave.centroid = value(centroid_parameter(n))
         .unwrap_or(dsp::CENTROID_DEFAULT)
@@ -156,10 +140,14 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
         .unwrap_or(dsp::DEFAULT_FOLD_LIMIT)
         .clamp(0, dsp::MAX_FOLDS);
     for i in 1..n.min(dsp::MAX_SEGMENTS + 1) {
-        wave.boundaries[i] = value(boundary_parameter(i)).unwrap_or(0).clamp(-100, 100);
+        wave.boundaries[i] = value(boundary_parameter(i, voices))
+            .unwrap_or(0)
+            .clamp(-100, 100);
     }
     for i in 0..n.min(dsp::MAX_SEGMENTS) {
-        wave.curves[i] = value(curve_parameter(n, i)).unwrap_or(0).clamp(-100, 100);
+        wave.curves[i] = value(curve_parameter(n, i, voices))
+            .unwrap_or(0)
+            .clamp(-100, 100);
     }
     wave
 }
@@ -312,7 +300,15 @@ impl Plugin for Wavesmith {
             kind: TYPE_GENERIC,
         },
     ];
-    const CUSTOM_UI: u32 = POT_L | POT_C | POT_R | ENCODER_L | ENCODER_R | ENCODER_BUTTON_R;
+    const CUSTOM_UI: u32 = POT_L
+        | POT_C
+        | POT_R
+        | POT_BUTTON_L
+        | POT_BUTTON_C
+        | POT_BUTTON_R
+        | ENCODER_L
+        | ENCODER_R
+        | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
     const MIDI: bool = true;
     const PARAMETER_TEXT: bool = true;
@@ -320,9 +316,9 @@ impl Plugin for Wavesmith {
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let n = count(specs)?;
         Some(Configuration {
-            parameters: GLOBALS + n * 2 + 11 + voice_count(specs)? * 3,
-            pages: 3 + voice_count(specs)?,
-            page_indices: GLOBALS + n * 2 + 12 + voice_count(specs)? * 3,
+            parameters: GLOBALS + n * 2 + voice_count(specs)? * 3,
+            pages: 4 + voice_count(specs)?,
+            page_indices: GLOBALS + n * 2 + 1 + voice_count(specs)? * 3,
             regions: dsp::blocks(dsp::DEFAULT_TABLES),
         })
     }
@@ -367,19 +363,22 @@ impl Plugin for Wavesmith {
 
     fn metadata(specs: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
         let n = count(specs)?;
-        for (i, d) in [
-            definition(c"Output", 0, LAST_BUS as i16, 13, UNIT_AUDIO_OUTPUT),
-            definition(c"Output mode", 0, 1, 0, UNIT_OUTPUT_MODE),
-            definition(c"Pitch", 0, 127, 57, UNIT_MIDI_NOTE),
-            definition(c"Fine tune", -100, 100, 0, UNIT_CENTS),
-            definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT),
-            definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT),
-            definition(c"Level", 0, 100, 50, UNIT_PERCENT),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            metadata.set_parameter(i, d?)?;
+        let voices = voice_count(specs)?;
+        for (index, d) in [
+            (
+                OUTPUT,
+                definition(c"Output", 0, LAST_BUS as i16, 13, UNIT_AUDIO_OUTPUT),
+            ),
+            (
+                OUTPUT_MODE,
+                definition(c"Output mode", 0, 1, 0, UNIT_OUTPUT_MODE),
+            ),
+            (PITCH, definition(c"Pitch", 0, 127, 57, UNIT_MIDI_NOTE)),
+            (FINE, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)),
+            (SMOOTHING, definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT)),
+            (LEVEL, definition(c"Level", 0, 100, 50, UNIT_PERCENT)),
+        ] {
+            metadata.set_parameter(index, d?)?;
         }
         metadata.add_page(
             c"Oscillator",
@@ -388,31 +387,34 @@ impl Plugin for Wavesmith {
                 midi_channel_parameter(n) as u8,
                 PITCH as u8,
                 FINE as u8,
+                LEVEL as u8,
+            ],
+        )?;
+        metadata.add_page(c"Output", 2, &[OUTPUT as u8, OUTPUT_MODE as u8])?;
+        metadata.add_page(
+            c"Shape",
+            3,
+            &[
+                centroid_parameter(n) as u8,
+                strength_parameter(n) as u8,
                 SMOOTHING as u8,
                 fold_limit_parameter(n) as u8,
-                LEVEL as u8,
-                randomize_parameter(n) as u8,
-                randomize_boundaries_parameter(n) as u8,
-                randomize_curves_parameter(n) as u8,
-                zero_curves_parameter(n) as u8,
                 shape_triggers(n)[4] as u8,
                 shape_triggers(n)[5] as u8,
                 shape_triggers(n)[6] as u8,
                 shape_triggers(n)[7] as u8,
-                centroid_parameter(n) as u8,
-                strength_parameter(n) as u8,
+                zero_curves_parameter(n) as u8,
+                randomize_curves_parameter(n) as u8,
+                randomize_boundaries_parameter(n) as u8,
+                randomize_parameter(n) as u8,
             ],
         )?;
-        let voices = voice_count(specs)?;
-        metadata.add_page(c"Routings", 2, &[OUTPUT as u8, OUTPUT_MODE as u8])?;
         for (voice, &page_name) in VOICE_PAGE_NAMES.iter().take(voices).enumerate() {
             let cv = voice_pitch_parameter(n, voice);
-            if voice > 0 {
-                metadata.set_parameter(
-                    cv,
-                    definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT)?,
-                )?;
-            }
+            metadata.set_parameter(
+                cv,
+                definition(c"Pitch CV", 0, LAST_BUS as i16, 0, UNIT_CV_INPUT)?,
+            )?;
             let transpose = voice_transpose_parameter(n, voices, voice);
             let fine = voice_fine_parameter(n, voices, voice);
             metadata.set_parameter(
@@ -421,23 +423,23 @@ impl Plugin for Wavesmith {
             )?;
             metadata.set_parameter(fine, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)?)?;
             // Shared group retains the selected parameter row between voices.
-            metadata.add_page(page_name, 3, &[cv as u8, transpose as u8, fine as u8])?;
+            metadata.add_page(page_name, 4, &[cv as u8, transpose as u8, fine as u8])?;
         }
         for (i, name) in BOUNDARY_NAMES.iter().enumerate().take(n - 1) {
             metadata.set_parameter(
-                boundary_parameter(i + 1),
+                boundary_parameter(i + 1, voices),
                 definition(name, -100, 100, dsp::default_level(i + 1, n), UNIT_PERCENT)?,
             )?;
         }
         for (i, name) in CURVE_NAMES.iter().enumerate().take(n) {
             metadata.set_parameter(
-                curve_parameter(n, i),
+                curve_parameter(n, i, voices),
                 definition(name, -100, 100, 0, UNIT_PERCENT)?,
             )?;
         }
         // Both ends of the cycle reference the same editable seam boundary.
         metadata.set_parameter(
-            seam_parameter(n),
+            seam_parameter(n, voices),
             definition(c"Boundary 00", -100, 100, 0, UNIT_PERCENT)?,
         )?;
         for (parameter, name) in shape_triggers(n).into_iter().zip([
@@ -491,18 +493,19 @@ impl Plugin for Wavesmith {
         // Segment count does not add pages; even ten voices stay below 32 pages.
         // Walk the shape in time order, repeating Boundary 00 at the end.
         let mut indices = [0u8; dsp::MAX_SEGMENTS * 2 + 1];
-        *indices.first_mut()? = seam_parameter(n) as u8;
+        *indices.first_mut()? = seam_parameter(n, voices) as u8;
         for segment in 0..n {
-            *indices.get_mut(segment * 2 + 1)? = curve_parameter(n, segment) as u8;
+            *indices.get_mut(segment * 2 + 1)? = curve_parameter(n, segment, voices) as u8;
             *indices.get_mut(segment * 2 + 2)? =
-                editor_parameter(n, segment, 1).unwrap_or(seam_parameter(n)) as u8;
+                editor_parameter(n, segment, 1, voices).unwrap_or(seam_parameter(n, voices)) as u8;
         }
-        metadata.add_page(c"Waveform", 4, indices.get(..n * 2 + 1)?)?;
+        metadata.add_page(c"Waveform", 5, indices.get(..n * 2 + 1)?)?;
         Some(())
     }
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         let n = context.state().count;
+        let voices = context.state().voice_count;
         if parameter == midi_channel_parameter(n) as i32 {
             sync_midi_parameter_graying(context);
             let setting = context
@@ -544,10 +547,10 @@ impl Plugin for Wavesmith {
             };
             let _ = context
                 .parameters()
-                .set(seam_parameter(n), dsp::preset_boundary(shape, 0, n));
+                .set(seam_parameter(n, voices), dsp::preset_boundary(shape, 0, n));
             for boundary in 1..n {
                 let _ = context.parameters().set(
-                    boundary_parameter(boundary),
+                    boundary_parameter(boundary, voices),
                     dsp::preset_boundary(shape, boundary, n),
                 );
             }
@@ -559,11 +562,12 @@ impl Plugin for Wavesmith {
         if trigger == 0 || trigger == 1 {
             let _ = context
                 .parameters()
-                .set(seam_parameter(n), random_level(&mut seed));
+                .set(seam_parameter(n, voices), random_level(&mut seed));
             for boundary in 1..n {
-                let _ = context
-                    .parameters()
-                    .set(boundary_parameter(boundary), random_level(&mut seed));
+                let _ = context.parameters().set(
+                    boundary_parameter(boundary, voices),
+                    random_level(&mut seed),
+                );
             }
         }
         if trigger == 0 || trigger == 2 || trigger == 3 {
@@ -573,7 +577,9 @@ impl Plugin for Wavesmith {
                 } else {
                     random_level(&mut seed)
                 };
-                let _ = context.parameters().set(curve_parameter(n, segment), value);
+                let _ = context
+                    .parameters()
+                    .set(curve_parameter(n, segment, voices), value);
             }
         }
         context.state_mut().random_seed = seed;
@@ -626,9 +632,10 @@ impl Plugin for Wavesmith {
 
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
         sync_midi_parameter_graying(context);
+        let voices = context.state().voice_count;
         let n = context.state().count.clamp(2, 32);
         let p = context.read_parameters();
-        let wave = read_wave(n, |index| p.value(index));
+        let wave = read_wave(n, |index| p.value(index), voices);
         let note = p.value(PITCH).unwrap_or(57).clamp(0, 127) as f32;
         let fine = p.value(FINE).unwrap_or(0).clamp(-100, 100) as f32 / 1200.0;
         let level = p.value(LEVEL).unwrap_or(50).clamp(0, 100) as f32 * 0.01;
