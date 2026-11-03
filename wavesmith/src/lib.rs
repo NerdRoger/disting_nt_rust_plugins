@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 mod dsp;
+mod levels;
 mod midi;
 mod ui;
 
@@ -149,6 +150,11 @@ struct State {
     engine: dsp::Engine,
     oscillators: [dsp::Oscillator; VOICE_COUNT],
     midi: midi::MidiState,
+    levels: levels::LevelControl,
+    level: levels::Level,
+    mode_transition: levels::ModeTransition,
+    mix: [f32; levels::CHUNK],
+    voice_mix: [f32; levels::CHUNK],
     count: usize,
     voice_count: usize,
     sample_rate: f32,
@@ -162,6 +168,8 @@ impl State {
     fn set_midi_channel(&mut self, setting: u8) {
         if self.midi.set_channel(setting) {
             self.oscillators = [dsp::Oscillator::new(); VOICE_COUNT];
+            self.levels.restart_for_mode_change();
+            self.mode_transition.start();
         }
     }
 }
@@ -341,6 +349,11 @@ impl Plugin for Wavesmith {
                 engine: dsp::Engine::new(n, rate),
                 oscillators: [dsp::Oscillator::new(); VOICE_COUNT],
                 midi: midi::MidiState::new(rate),
+                levels: levels::LevelControl::new(rate),
+                level: levels::Level::new(),
+                mode_transition: levels::ModeTransition::new(rate),
+                mix: [0.0; levels::CHUNK],
+                voice_mix: [0.0; levels::CHUNK],
                 count: n,
                 voice_count: voices,
                 sample_rate: rate as f32,
@@ -377,7 +390,16 @@ impl Plugin for Wavesmith {
             (PITCH, definition(c"Pitch", 0, 127, 57, UNIT_MIDI_NOTE)),
             (FINE, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)),
             (SMOOTHING, definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT)),
-            (LEVEL, definition(c"Level", 0, 100, 50, UNIT_PERCENT)),
+            (
+                LEVEL,
+                definition(
+                    c"Level",
+                    levels::LEVEL_MIN,
+                    0,
+                    levels::LEVEL_DEFAULT,
+                    UNIT_DB_MIN_INF,
+                ),
+            ),
         ] {
             metadata.set_parameter(index, d?)?;
         }
@@ -628,7 +650,7 @@ impl Plugin for Wavesmith {
         let wave = read_wave(n, |index| p.value(index), voices);
         let note = p.value(PITCH).unwrap_or(57).clamp(0, 127) as f32;
         let fine = p.value(FINE).unwrap_or(0).clamp(-100, 100) as f32 / 1200.0;
-        let level = p.value(LEVEL).unwrap_or(50).clamp(0, 100) as f32 * 0.01;
+        let level_db = p.value(LEVEL).unwrap_or(levels::LEVEL_DEFAULT);
         let midi_setting = p.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) as u8;
         let Some(mut buses) = AudioBuses::new(samples, frames) else {
             return;
@@ -667,6 +689,7 @@ impl Plugin for Wavesmith {
         }
         let processing = context.processing();
         let state = processing.state;
+        let level = state.level.amplitude(level_db);
         let memory = processing.regions;
         state.set_midi_channel(midi_setting);
         let mut enabled = [false; VOICE_COUNT];
@@ -707,41 +730,81 @@ impl Plugin for Wavesmith {
         }
         state.engine.request(wave);
         state.engine.advance(memory);
-        // Clear once, then mix every configured voice without normalization.
-        if output_enabled && replace {
-            buses.fill(output_bus, 0.0);
-        }
-        let gate_step = state.midi.gate_step;
-        for ((oscillator, midi), &frequency) in state
-            .oscillators
-            .iter_mut()
-            .zip(state.midi.voices.iter_mut())
-            .zip(&pitches)
-            .take(state.voice_count)
-        {
-            if !output_enabled || frequency == 0.0 {
-                continue;
-            }
-            let Some(output) = buses.bus_mut(output_bus) else {
-                continue;
-            };
-            oscillator.prepare(frequency, state.sample_rate, level);
-            if (midi_setting == 0 || midi.gate_is_steady())
-                && oscillator.render_steady(&state.engine, memory, output)
-            {
-                continue;
-            }
-            for (frame, sample) in output.iter_mut().enumerate() {
-                let gate = if midi_setting == 0 {
-                    1.0
-                } else {
-                    midi.next_gain(gate_step)
-                };
-                if gate == 0.0 {
-                    break;
+        if output_enabled {
+            if let Some(output) = buses.bus_mut(output_bus) {
+                let gate_step = state.midi.gate_step;
+                for (chunk_index, output) in output.chunks_mut(levels::CHUNK).enumerate() {
+                    let length = output.len();
+                    let mix = &mut state.mix[..length];
+                    mix.fill(0.0);
+                    let voice_mix = &mut state.voice_mix[..length];
+                    let mut voice_power = 0.0;
+                    let mut gate_power = 0.0;
+                    for ((oscillator, midi), &frequency) in state
+                        .oscillators
+                        .iter_mut()
+                        .zip(state.midi.voices.iter_mut())
+                        .zip(&pitches)
+                        .take(state.voice_count)
+                    {
+                        if frequency == 0.0 {
+                            continue;
+                        }
+                        voice_mix.fill(0.0);
+                        oscillator.prepare(frequency, state.sample_rate, level);
+                        if (midi_setting == 0 || midi.gate_is_steady())
+                            && oscillator.render_steady(&state.engine, memory, voice_mix)
+                        {
+                            gate_power += length as f32;
+                        } else {
+                            for (frame, sample) in voice_mix.iter_mut().enumerate() {
+                                let gate = if midi_setting == 0 {
+                                    1.0
+                                } else {
+                                    midi.next_gain(gate_step)
+                                };
+                                if gate == 0.0 {
+                                    break;
+                                }
+                                gate_power += gate * gate;
+                                *sample = gate
+                                    * oscillator.tick_prepared(
+                                        &state.engine,
+                                        memory,
+                                        chunk_index * levels::CHUNK + frame,
+                                    );
+                            }
+                        }
+                        for (sum, &sample) in mix.iter_mut().zip(voice_mix.iter()) {
+                            *sum += sample;
+                            voice_power += sample * sample;
+                        }
+                    }
+                    // Protect only Wavesmith's contribution; Add mode preserves
+                    // upstream bus audio exactly, including any existing peaks.
+                    state.levels.process(
+                        mix,
+                        voice_power,
+                        gate_power / length as f32,
+                        if level > 0.0 {
+                            levels::PEAK_CEILING
+                        } else {
+                            0.0
+                        },
+                    );
+                    state.mode_transition.apply(mix);
+                    for (out, &sample) in output.iter_mut().zip(mix.iter()) {
+                        if replace {
+                            *out = sample;
+                        } else {
+                            *out += sample;
+                        }
+                    }
                 }
-                *sample += gate * oscillator.tick_prepared(&state.engine, memory, frame);
             }
+        } else {
+            state.levels.reset();
+            state.mode_transition.silence();
         }
         // Shared edit time advances once per block even when every output is
         // None, so silent editing cannot stall an unfinished crossfade/build.

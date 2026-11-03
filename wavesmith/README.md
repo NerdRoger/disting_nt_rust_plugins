@@ -26,7 +26,8 @@ Use the NT's respecification workflow to change either count.
   (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
   and Pitch remain available on parameter pages.
 - Tuning mode: left pot edits Pitch (MIDI note 0–127), centre pot edits Fine tune
-  (−100 to +100 cents), right pot edits Level (0–100%). The top row displays
+  (−100 to +100 cents), right pot edits Level (−60 to 0 dB, default −6 dB).
+  The bottom position is displayed as −inf and mutes the output. The top row displays
   these three values instead of the warp controls. Pitch is displayed as a note
   name and octave matching the NT (36 = C2, 37 = C#2), while its stored value
   remains a MIDI note number.
@@ -108,7 +109,7 @@ zero it reads a separate creative-smoothing table, preserving the boundary level
 ## Parameters and routing
 
 Oscillator page: MIDI Channel (Off, All, or 1–16), Pitch (MIDI note number,
-default A3/220 Hz), Fine tune in cents, and Level (default 50%, up to nominal
+default A3/220 Hz), Fine tune in cents, and Level (default −6 dB, up to nominal
 ±5 V at 100%).
 
 Shape follows Output, in this order: Warp Position, Warp Amount, Smoothing,
@@ -150,9 +151,49 @@ to +100 cents. Both offsets default to zero. Output routing remains shared.
 Output defaults to bus 13 / physical output 1. Output None disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
 shared waveform rebuilding and edit fades can still finish while silent.
-An enabled output sums every configured voice without normalization or limiting.
-Replace clears the destination once before mixing the whole pool; Add preserves
-the existing bus signal. Level is applied to each voice as before.
+An enabled output mixes all configured voices through automatic RMS level control.
+The controller compares the mix's measured energy with the average measured energy
+of its voices, aiming for a chord near a single voice's RMS level. MIDI voices
+are weighted by their squared attack/release gates, so a barely audible new note
+does not suddenly halve the reference. A minimum weight of one preserves the
+natural envelope of a single note. CV voices each have full weight. This
+accounts for correlated unison voices as well as independently pitched notes;
+there is no fixed division by the configured voice count. Level remains applied
+to the voices, so the loudness reference follows Level and the current waveform.
+Level uses the NT's dB/minus-infinity unit: integer steps from −60 through 0 dB,
+with −60 displayed as −inf and mapped to true zero gain. Other values use
+10^(dB/20), with the conversion cached across blocks until Level changes.
+Pot press restores −6 dB. The custom Tuning header displays Level with a dB suffix,
+or −inf for mute. Parameter ordering is unchanged, but saved percentage values
+are not converted automatically: review Level after loading an older preset
+(0 now means full level, not mute). New instances default to −6 dB.
+
+The RMS detector and gain reduction use a 50 ms response; gain recovery takes
+about one second. Gain never exceeds unity, and silence holds the controller
+until the voice pool becomes idle, avoiding boosted quiet signals or release tails.
+These are energy measurements, not frequency-weighted perceptual loudness (LUFS).
+
+A final peak protector analyzes preallocated 16-sample mix chunks and limits
+Wavesmith's contribution to a fixed +/-5 V, independently of Level. At Level −6 dB,
+a single voice's nominal +/-2.51 V swing therefore leaves 6 dB of peak headroom;
+Level is the loudness control, not the limiter threshold. Level 0 dB leaves less
+headroom and can still need limiting. Peak attenuation holds for 20 ms and
+recovers over about 200 ms rather than following individual waveform troughs. Short peak-protection gain reductions can still be
+audible, and peak-heavy chords can settle below the desired RMS level. The
+controller is tuned to reduce pumping; device listening tests remain necessary.
+It adds no FFTs, table buffers, audio delay or parameter/specification changes.
+Two 16-sample arrays and a small controller are initialized directly in the
+host-allocated state; the steady oscillator and pitch caches remain in use.
+
+Replace writes only the controlled mix. Add preserves the existing bus signal
+and adds the controlled Wavesmith contribution; unrelated upstream audio can
+still make the final bus exceed the ceiling. Output None and MIDI Channel
+changes restart the controller. MIDI Channel changes also apply a 20 ms output
+transition from the last emitted sample to the new normalized mix, avoiding a
+step when changing between MIDI and continuous CV playback. The first audible
+chunk acquires the new attenuation immediately instead of starting the full CV
+pool at unity gain. The transition affects only Wavesmith's contribution in Add
+mode and adds no audio buffers or steady-state latency.
 
 In CV mode every configured voice plays continuously. Its pitch is shared Pitch
 plus Pitch CV, shared Fine tune, voice Transpose, and voice Fine tune. A Pitch CV
@@ -324,7 +365,8 @@ This keeps
 large temporaries off the firmware stack. No memory allocation or locks occur
 during audio rendering. There is no automatic whole-wave shift or normalization.
 Smoothed shapes can ring beyond their requested levels; ±5 V at full Level is
-nominal, not a hard peak limit. Asymmetric waves can have DC offset.
+nominal for the source tables; the final mix protector enforces the +/-5 V
+contribution ceiling. Asymmetric waves can have DC offset.
 
 ## Build and test
 

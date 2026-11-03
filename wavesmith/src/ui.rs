@@ -243,6 +243,28 @@ fn number(canvas: &mut Canvas<'_>, x: i32, prefix: &[u8], value: i16, color: i32
     );
 }
 
+fn level_db(canvas: &mut Canvas<'_>, x: i32, value: i16, color: i32) {
+    let mut buffer = [0u8; 32];
+    let text = if value <= levels::LEVEL_MIN {
+        c"Level -inf"
+    } else {
+        buffer[..6].copy_from_slice(b"Level ");
+        let Some(length) = distingnt_api::api::text::format_integer(&mut buffer[6..], value as i32)
+        else {
+            return;
+        };
+        let Some(suffix) = buffer.get_mut(6 + length..6 + length + 4) else {
+            return;
+        };
+        suffix.copy_from_slice(b" dB\0");
+        let Ok(text) = CStr::from_bytes_until_nul(&buffer) else {
+            return;
+        };
+        text
+    };
+    canvas.text(x, 10, text, color, Alignment::Left, TextSize::Normal);
+}
+
 fn pitch_note(canvas: &mut Canvas<'_>, x: i32, value: i16, color: i32) {
     // Match the NT's MIDI octave convention: 36 = C2, 37 = C#2.
     let note = value.clamp(0, 127) as usize;
@@ -305,7 +327,7 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
         EditMode::Tuning => [
             (2, b"Pitch ", PITCH, 57),
             (102, b"Fine ", FINE, 0),
-            (198, b"Level ", LEVEL, 50),
+            (180, b"Level ", LEVEL, levels::LEVEL_DEFAULT),
         ],
         EditMode::Warp => [
             (2, b"Warp Pos ", WARP_POSITION, dsp::WARP_POSITION_DEFAULT),
@@ -318,6 +340,8 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
         if parameter == PITCH {
             let midi = parameters.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) != 0;
             pitch_note(&mut canvas, x, value, if midi { 5 } else { header_color });
+        } else if parameter == LEVEL {
+            level_db(&mut canvas, x, value, header_color);
         } else {
             number(&mut canvas, x, prefix, value, header_color);
         }

@@ -881,7 +881,7 @@ fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
 }
 
 #[test]
-fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first() {
+fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
     const FRAMES: usize = 24;
     for voices in 1..=VOICE_COUNT {
         let mut mixed = Instance::with_voices(8, voices as i32);
@@ -890,6 +890,7 @@ fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first
         for voice in 0..voices {
             mixed.change(voice_pitch_parameter(voice), voice as i16 + 1);
         }
+        let mut control = levels::LevelControl::new(48000);
         let mut references: Vec<_> = (0..voices)
             .map(|_| {
                 let mut mono = Instance::new(8);
@@ -905,13 +906,30 @@ fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first
             }
             mixed.render(&mut samples);
             let mut expected = [0.0; FRAMES];
+            let mut powers = [0.0; FRAMES];
             for (voice, mono) in references.iter_mut().enumerate() {
                 let mut buffer = [0.0; LAST_BUS * FRAMES];
                 buffer[..FRAMES].fill(voice as f32 * 0.25);
                 mono.render(&mut buffer);
-                for (sum, &v) in expected.iter_mut().zip(&buffer[12 * FRAMES..13 * FRAMES]) {
+                for ((sum, power), &v) in expected
+                    .iter_mut()
+                    .zip(powers.iter_mut())
+                    .zip(&buffer[12 * FRAMES..13 * FRAMES])
+                {
                     *sum += v;
+                    *power += v * v;
                 }
+            }
+            for (chunk, powers) in expected
+                .chunks_mut(levels::CHUNK)
+                .zip(powers.chunks(levels::CHUNK))
+            {
+                control.process(
+                    chunk,
+                    powers.iter().sum(),
+                    voices as f32,
+                    levels::PEAK_CEILING,
+                );
             }
             for (&actual, &expected) in samples[..FRAMES].iter().zip(&expected) {
                 assert!(
@@ -928,20 +946,25 @@ fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first
 }
 
 #[test]
-fn configured_voices_sum_without_normalization_and_replace_clears_only_once() {
+fn configured_unison_voices_settle_near_mono_level_and_replace_preserves_other_buses() {
     let mut reference: Option<Vec<f32>> = None;
     for voices in 1..=VOICE_COUNT {
         let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         let mut samples = [0.0; LAST_BUS * 64];
-        for _ in 0..80 {
+        for _ in 0..1500 {
             samples.fill(2.0);
             instance.render(&mut samples);
         }
+        assert!(samples[..12 * 64].iter().all(|&v| v == 2.0));
+        assert!(samples[13 * 64..].iter().all(|&v| v == 2.0));
         let output = samples[12 * 64..13 * 64].to_vec();
+        assert!(output
+            .iter()
+            .all(|v| v.abs() <= levels::PEAK_CEILING + 0.000001));
         if let Some(mono) = &reference {
             for (&actual, &v) in output.iter().zip(mono) {
-                assert!((actual - v * voices as f32).abs() < 0.0001);
+                assert!((actual - v).abs() < 0.003);
             }
         } else {
             reference = Some(output);
@@ -975,7 +998,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
     assert!(samples[63 * 64..]
         .iter()
         .all(|v| v.is_finite() && v.abs() < 5.0));
-    instance.change(LEVEL, 0);
+    instance.change(LEVEL, levels::LEVEL_MIN);
     for _ in 0..100 {
         instance.render(&mut samples);
     }
@@ -1188,7 +1211,7 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
     instance.event([0.8; 3], [2, 0]);
     instance.change(PITCH, 57);
     instance.change(FINE, -25);
-    instance.change(LEVEL, 35);
+    instance.change(LEVEL, -9);
     instance.change(WARP_POSITION, 94);
     instance.change(WARP_AMOUNT, -68);
     instance.change(SMOOTHING, 43);
@@ -1199,7 +1222,7 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
     instance.draw();
     TEXT.with(|text| {
         let text = text.borrow();
-        for expected in ["Pitch A3", "Fine -25", "Level 35"] {
+        for expected in ["Pitch A3", "Fine -25", "Level -9 dB"] {
             assert!(text
                 .iter()
                 .any(|(_, y, value)| *y == 10 && value == expected));
@@ -1229,7 +1252,7 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
             instance.values[FINE],
             instance.values[LEVEL]
         ),
-        (127, 100, 100)
+        (127, 100, 0)
     );
     for step in (0..200).rev() {
         instance.event([step as f32 * 0.005; 3], [0, 0]);
@@ -1240,13 +1263,15 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
             instance.values[FINE],
             instance.values[LEVEL]
         ),
-        (0, -100, 0)
+        (0, -100, levels::LEVEL_MIN)
     );
     for step in 1..=100 {
         instance.event([step as f32 * 0.0002; 3], [0, 0]);
     }
     assert!(
-        instance.values[PITCH] > 0 && instance.values[FINE] > -100 && instance.values[LEVEL] > 0
+        instance.values[PITCH] > 0
+            && instance.values[FINE] > -100
+            && instance.values[LEVEL] > levels::LEVEL_MIN
     );
     for parameter in 0..before.len() {
         if ![PITCH, FINE, LEVEL].contains(&parameter) {
@@ -1385,7 +1410,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     let mut instance = Instance::new(8);
     instance.event([0.8; 3], [2, 0]);
     instance.change(SMOOTHING, 25);
-    instance.change(LEVEL, 30);
+    instance.change(LEVEL, -10);
     instance.change(WARP_POSITION, 25);
     instance.change(WARP_AMOUNT, 0);
     instance.change(PITCH, 40);
@@ -1444,7 +1469,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     let trigger = RANDOMIZE_ALL;
     assert_eq!(instance.values[trigger], 0);
     assert_eq!(instance.values[WARP_POSITION], 255);
-    assert_eq!(instance.values[LEVEL], 30);
+    assert_eq!(instance.values[LEVEL], -10);
     assert_eq!(instance.values[PITCH], 40);
     let first_shape = instance.values[seam_parameter(1)..].to_vec();
     assert_eq!(first_shape, before[seam_parameter(1)..]);
@@ -1584,6 +1609,14 @@ unsafe extern "C" fn NT_floatToString(buffer: *mut c_char, value: f32, _: i32) -
     text.len() as i32
 }
 #[no_mangle]
+unsafe extern "C" fn NT_intToString(buffer: *mut c_char, value: i32) -> i32 {
+    use std::string::ToString;
+    let text = value.to_string();
+    ptr::copy_nonoverlapping(text.as_ptr(), buffer.cast(), text.len());
+    *buffer.add(text.len()) = 0;
+    text.len() as i32
+}
+#[no_mangle]
 unsafe extern "C" fn NT_algorithmIndex(_: *const NtAlgorithm) -> i32 {
     0
 }
@@ -1640,7 +1673,7 @@ unsafe extern "C" fn NT_drawShapeF(kind: u8, x0: f32, y0: f32, x1: f32, y1: f32,
 }
 
 #[test]
-fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
+fn shared_midi_output_normalizes_independent_notes_with_the_existing_gate_fades() {
     for voices in [1, 4, 10] {
         let mut mixed = Instance::with_voices(8, voices);
         mixed.change(OUTPUT_MODE, 1);
@@ -1648,6 +1681,8 @@ fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
         for voice in 0..voices {
             mixed.midi(0x90, 60 + voice as u8, 100);
         }
+        let mut control = levels::LevelControl::new(48000);
+        control.restart_for_mode_change();
         let mut references: Vec<_> = (0..voices)
             .map(|voice| {
                 let mut mono = Instance::new(8);
@@ -1657,6 +1692,7 @@ fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
                 mono
             })
             .collect();
+        let mut reference_gate = 0.0f32;
         for block in 0..160 {
             if block == 120 {
                 for voice in 0..voices {
@@ -1669,12 +1705,39 @@ fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
             let mut samples = [0.0; LAST_BUS * 24];
             mixed.render(&mut samples);
             let mut expected = [0.0; 24];
+            let mut powers = [0.0; 24];
             for mono in &mut references {
                 let mut buffer = [0.0; LAST_BUS * 24];
                 mono.render(&mut buffer);
-                for (sum, &v) in expected.iter_mut().zip(&buffer[12 * 24..13 * 24]) {
+                for ((sum, power), &v) in expected
+                    .iter_mut()
+                    .zip(powers.iter_mut())
+                    .zip(&buffer[12 * 24..13 * 24])
+                {
                     *sum += v;
+                    *power += v * v;
                 }
+            }
+            let mut weights = [0.0; 24];
+            for weight in &mut weights {
+                reference_gate = if block < 120 {
+                    (reference_gate + 1.0 / 240.0).min(1.0)
+                } else {
+                    (reference_gate - 1.0 / 240.0).max(0.0)
+                };
+                *weight = voices as f32 * reference_gate * reference_gate;
+            }
+            for ((chunk, powers), weights) in expected
+                .chunks_mut(levels::CHUNK)
+                .zip(powers.chunks(levels::CHUNK))
+                .zip(weights.chunks(levels::CHUNK))
+            {
+                control.process(
+                    chunk,
+                    powers.iter().sum(),
+                    weights.iter().sum::<f32>() / weights.len() as f32,
+                    levels::PEAK_CEILING,
+                );
             }
             for (&actual, &expected) in samples[12 * 24..13 * 24].iter().zip(&expected) {
                 assert!((actual - expected).abs() < 0.00001);
@@ -1850,7 +1913,7 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
     }
     assert_eq!(instance.values[PITCH], 69);
     assert!(instance.values[FINE] > 0);
-    assert!(instance.values[LEVEL] > 50);
+    assert!(instance.values[LEVEL] > levels::LEVEL_DEFAULT);
     instance.draw();
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[5, 15, 15]));
     instance.change(MIDI_CHANNEL, 0);
@@ -2013,7 +2076,7 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     let mut instance = Instance::new(8);
     instance.change(PITCH, 100);
     instance.change(FINE, 50);
-    instance.change(LEVEL, 80);
+    instance.change(LEVEL, -2);
     instance.change(MIDI_CHANNEL, 1);
     instance.event([0.8; 3], [0, 0]);
     instance.click_right([0.8; 3]);
@@ -2022,7 +2085,7 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     instance.event_buttons([0.8; 3], [0, 0], buttons, 0);
     assert_eq!(instance.values[PITCH], 100);
     assert_eq!(instance.values[FINE], 0);
-    assert_eq!(instance.values[LEVEL], 50);
+    assert_eq!(instance.values[LEVEL], levels::LEVEL_DEFAULT);
     instance.event_buttons([0.8; 3], [0, 0], 0, buttons);
     instance.change(MIDI_CHANNEL, 0);
     instance.event_buttons([0.8; 3], [0, 0], POT_BUTTON_L, 0);
@@ -2066,4 +2129,114 @@ fn midi_bend_reaches_audio_per_channel_combines_with_fine_and_reuses_pitch_cache
     instance.render(&mut samples);
     assert_cached_octave(&instance, 0, 0.0); // CV mode unaffected.
     assert_cached_octave(&instance, 1, 50.0 / 1200.0);
+}
+
+#[test]
+fn normalized_add_mode_preserves_existing_bus_audio_exactly() {
+    let mut add = Instance::with_voices(8, 10);
+    let mut replace = Instance::with_voices(8, 10);
+    replace.change(OUTPUT_MODE, 1);
+    for _ in 0..500 {
+        let mut a = [0.0; LAST_BUS * 24];
+        let mut b = [0.0; LAST_BUS * 24];
+        a[12 * 24..13 * 24].fill(3.0);
+        add.render(&mut a);
+        replace.render(&mut b);
+        for (&a, &b) in a[12 * 24..13 * 24].iter().zip(&b[12 * 24..13 * 24]) {
+            assert!((a - (3.0 + b)).abs() < 0.000001);
+            assert!(b.abs() <= levels::PEAK_CEILING + 0.000001);
+        }
+    }
+}
+
+#[test]
+fn midi_to_cv_crossfades_without_a_step_or_full_pool_gain_burst() {
+    for mode in [0, 1] {
+        let mut instance = Instance::with_voices(8, 10);
+        instance.change(OUTPUT_MODE, mode);
+        for boundary in 0..8 {
+            instance.change(boundary_parameter(boundary, 10), 100);
+        }
+        instance.change(MIDI_CHANNEL, 1);
+        instance.midi(0x90, 69, 100);
+        let mut samples = [0.0; LAST_BUS * 24];
+        let baseline = if mode == 0 { 3.0 } else { 0.0 };
+        for _ in 0..160 {
+            samples.fill(baseline);
+            instance.render(&mut samples);
+        }
+        let previous = samples[13 * 24 - 1];
+        assert!((previous - baseline - 5.0 * levels::DEFAULT_GAIN).abs() < 0.0001);
+        instance.change(MIDI_CHANNEL, 0);
+        for block in 0..160 {
+            samples.fill(baseline);
+            instance.render(&mut samples);
+            let output = &samples[12 * 24..13 * 24];
+            if block == 0 {
+                assert_eq!(output[0], previous);
+            }
+            assert!(output
+                .iter()
+                .all(|v| (*v - baseline).abs() <= 5.0 * levels::DEFAULT_GAIN + 0.0001));
+        }
+        assert!((samples[13 * 24 - 1] - baseline - 5.0 * levels::DEFAULT_GAIN).abs() < 0.0001);
+        let previous = samples[13 * 24 - 1];
+        instance.change(MIDI_CHANNEL, 1);
+        samples.fill(baseline);
+        instance.render(&mut samples);
+        assert_eq!(samples[12 * 24], previous);
+        for _ in 0..60 {
+            samples.fill(baseline);
+            instance.render(&mut samples);
+        }
+        assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == baseline));
+    }
+}
+
+#[test]
+fn decibel_level_metadata_display_reset_and_rendered_amplitude_match() {
+    let mut instance = Instance::new(8);
+    let definition = unsafe { &*(*instance.base).parameters.add(LEVEL) };
+    assert_eq!(
+        (
+            definition.min,
+            definition.max,
+            definition.default,
+            definition.unit
+        ),
+        (levels::LEVEL_MIN, 0, levels::LEVEL_DEFAULT, UNIT_DB_MIN_INF)
+    );
+    instance.change(OUTPUT_MODE, 1);
+    for boundary in 0..8 {
+        instance.change(boundary_parameter(boundary, 1), 100);
+    }
+    instance.click_right([0.5; 3]);
+    instance.click_right([0.5; 3]);
+    let mut samples = [0.0; LAST_BUS * 24];
+    for db in [0, -6, -12, -59, levels::LEVEL_MIN] {
+        instance.change(LEVEL, db);
+        for _ in 0..1800 {
+            instance.render(&mut samples);
+        }
+        let expected = if db == levels::LEVEL_MIN {
+            0.0
+        } else {
+            5.0 * 10.0f32.powf(db as f32 / 20.0)
+        };
+        assert!((samples[13 * 24 - 1] - expected).abs() < 0.0001);
+        instance.draw();
+        let label = if db == levels::LEVEL_MIN {
+            String::from("Level -inf")
+        } else {
+            std::format!("Level {db} dB")
+        };
+        TEXT.with(|text| {
+            assert!(text
+                .borrow()
+                .iter()
+                .any(|&(x, y, ref value)| x == 180 && y == 10 && value == &label))
+        });
+    }
+    instance.event_buttons([0.5; 3], [0, 0], POT_BUTTON_R, 0);
+    assert_eq!(instance.values[LEVEL], -6);
 }
