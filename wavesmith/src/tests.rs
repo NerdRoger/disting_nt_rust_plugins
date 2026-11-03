@@ -2028,3 +2028,42 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     instance.event_buttons([0.8; 3], [0, 0], POT_BUTTON_L, 0);
     assert_eq!(instance.values[PITCH], 57);
 }
+
+#[test]
+fn midi_bend_reaches_audio_per_channel_combines_with_fine_and_reuses_pitch_cache() {
+    let mut instance = Instance::with_voices(8, 3);
+    instance.change(OUTPUT_MODE, 1);
+    instance.change(MIDI_CHANNEL, 1);
+    instance.change(FINE, 25);
+    instance.change(voice_fine_parameter(0), -25);
+    instance.change(voice_fine_parameter(1), 25);
+    instance.midi(0xe0, 0, 96); // Channel 1, +1 semitone, before Note On.
+    instance.midi(0x90, 69, 100);
+    instance.midi(0x90, 81, 100);
+    instance.midi(0x91, 69, 100);
+    let mut samples = [0.0; LAST_BUS * 24];
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 0, 1.0 / 12.0);
+    assert_cached_octave(&instance, 1, 1.0 + 1.0 / 12.0 + 50.0 / 1200.0);
+    assert_cached_octave(&instance, 2, 25.0 / 1200.0);
+    instance.midi(0xe1, 0, 0); // Channel 2, -2 semitones on held note.
+    instance.midi(0xe0, 1, 64); // Low byte matters: just above neutral.
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 0, 1.0 / (8192.0 * 6.0));
+    assert_cached_octave(&instance, 1, 1.0 + 1.0 / (8192.0 * 6.0) + 50.0 / 1200.0);
+    assert_cached_octave(&instance, 2, -2.0 / 12.0 + 25.0 / 1200.0);
+    let before = dsp::playback_work_counts().1;
+    for _ in 0..10 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(dsp::playback_work_counts().1, before);
+    instance.midi(0xe0, 0, 64);
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 0, 0.0);
+    instance.change(MIDI_CHANNEL, 0);
+    instance.change(PITCH, 69);
+    instance.midi(0xe0, 0, 0);
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 0, 0.0); // CV mode unaffected.
+    assert_cached_octave(&instance, 1, 50.0 / 1200.0);
+}

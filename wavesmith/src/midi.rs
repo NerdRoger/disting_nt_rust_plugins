@@ -9,6 +9,7 @@ pub struct NoteVoice {
     order: u8,
     held: bool,
     playing_note: u8,
+    playing_channel: u8,
     switching: bool,
     retune: bool,
     gain: f32,
@@ -22,6 +23,7 @@ impl NoteVoice {
             order: 0,
             held: false,
             playing_note: 0,
+            playing_channel: 0,
             switching: false,
             retune: false,
             gain: 0.0,
@@ -32,6 +34,9 @@ impl NoteVoice {
     }
     pub fn pitch(&self) -> u8 {
         self.playing_note
+    }
+    pub fn bend_octaves(&self, pitch_bends: &[f32; 16]) -> f32 {
+        pitch_bends[(self.playing_channel & 0x0f) as usize]
     }
     pub fn take_retune(&mut self) -> bool {
         core::mem::replace(&mut self.retune, false)
@@ -53,6 +58,9 @@ impl NoteVoice {
 pub struct MidiState {
     pub voices: [NoteVoice; VOICE_COUNT],
     pub gate_step: f32,
+    // Cached octave offsets per MIDI channel; center is zero. Retain bend
+    // before Note On and while the output is disabled, without retuning CV.
+    pub pitch_bends: [f32; 16],
     channel_setting: u8,
 }
 
@@ -62,6 +70,7 @@ impl MidiState {
             voices: [NoteVoice::new(); VOICE_COUNT],
             gate_step: 1.0 / (sample_rate / 200).max(1) as f32,
             channel_setting: 0,
+            pitch_bends: [0.0; 16],
         }
     }
     pub fn set_channel(&mut self, setting: u8) -> bool {
@@ -69,6 +78,7 @@ impl MidiState {
             return false;
         }
         self.channel_setting = setting;
+        self.pitch_bends = [0.0; 16];
         self.voices = [NoteVoice::new(); VOICE_COUNT];
         true
     }
@@ -106,6 +116,7 @@ impl MidiState {
             if voice.switching && voice.gain == 0.0 {
                 if voice.held {
                     voice.playing_note = voice.note;
+                    voice.playing_channel = voice.channel;
                     voice.retune = true;
                 }
                 voice.switching = false;
@@ -122,6 +133,12 @@ impl MidiState {
         }
         self.sync_enabled(enabled);
         match status & 0xf0 {
+            0xe0 => {
+                let value = ((data2 as i32) << 7) | data1 as i32;
+                // 14-bit unsigned bend: 8192 is neutral. Fixed +/-2 semitones;
+                // positive full scale is one MIDI unit short of +2 semitones.
+                self.pitch_bends[channel as usize] = (value - 8192) as f32 / (8192.0 * 6.0);
+            }
             0x90 if data2 != 0 => self.note_on(channel, data1, enabled),
             0x80 | 0x90 => {
                 if let Some(index) = self
@@ -190,6 +207,7 @@ impl MidiState {
             voice.switching = voice.gain > 0.0;
             if !voice.switching {
                 voice.playing_note = note;
+                voice.playing_channel = channel;
                 voice.retune = true;
             }
         }

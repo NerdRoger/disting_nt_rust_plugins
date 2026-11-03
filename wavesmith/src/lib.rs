@@ -677,6 +677,7 @@ impl Plugin for Wavesmith {
         }
         state.midi.sync_enabled(&enabled);
         state.midi.begin_block();
+        let pitch_bends = &state.midi.pitch_bends;
         for ((midi, oscillator), pitch) in state
             .midi
             .voices
@@ -693,8 +694,9 @@ impl Plugin for Wavesmith {
                     *pitch = 0.0;
                     continue;
                 }
-                let frequency = oscillator
-                    .frequency(((midi.pitch() as f32 - 69.0) / 12.0 + *pitch).clamp(-16.0, 16.0));
+                let octave =
+                    (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + *pitch;
+                let frequency = oscillator.frequency(octave.clamp(-16.0, 16.0));
                 if midi.take_retune() {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }

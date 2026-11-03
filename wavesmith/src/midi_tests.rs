@@ -149,3 +149,51 @@ fn every_configured_pool_uses_idle_voices_then_steals_only_its_oldest_note() {
             .all(|v| *v == NoteVoice::new()));
     }
 }
+
+#[test]
+fn pitch_bend_decodes_all_fourteen_bits_and_respects_channel_filter_and_reset() {
+    let mut midi = MidiState::new(48000);
+    let enabled = [true; VOICE_COUNT];
+    midi.message(0xe0, 0, 0, &enabled);
+    assert_eq!(midi.pitch_bends, [0.0; 16]); // MIDI Off.
+    midi.set_channel(3); // Channel 2 only.
+    midi.message(0xe0, 0, 0, &enabled);
+    assert_eq!(midi.pitch_bends, [0.0; 16]);
+    for value in [0u16, 8191, 8192, 8193, 12288, 16383] {
+        midi.message(0xe1, (value & 127) as u8, (value >> 7) as u8, &enabled);
+        let expected = (value as i32 - 8192) as f32 / (8192.0 * 6.0);
+        assert_eq!(midi.pitch_bends[1], expected);
+        assert_eq!(midi.pitch_bends[0], 0.0);
+    }
+    let before = midi.pitch_bends;
+    midi.message(0xe1, 128, 64, &enabled);
+    midi.message(0xe1, 0, 128, &enabled);
+    assert_eq!(midi.pitch_bends, before);
+    midi.set_channel(3); // An unchanged setting must preserve wheel position.
+    assert_eq!(midi.pitch_bends, before);
+    midi.set_channel(1);
+    assert_eq!(midi.pitch_bends, [0.0; 16]);
+}
+
+#[test]
+fn bend_follows_the_playing_channel_until_a_stolen_voice_finishes_fading() {
+    let mut midi = MidiState::new(48000);
+    midi.set_channel(1);
+    let mut enabled = [false; VOICE_COUNT];
+    enabled[0] = true;
+    midi.message(0xe0, 0, 0, &enabled);
+    midi.message(0xe1, 0, 96, &enabled);
+    midi.message(0x90, 60, 100, &enabled);
+    run_gate(&mut midi, 250);
+    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+    midi.message(0x91, 72, 100, &enabled);
+    assert_eq!(midi.voices[0].pitch(), 60);
+    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+    run_gate(&mut midi, 500);
+    assert_eq!(midi.voices[0].pitch(), 72);
+    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), 1.0 / 12.0);
+    midi.message(0x81, 72, 0, &enabled);
+    midi.message(0xe1, 0, 0, &enabled);
+    assert!(midi.voices[0].sounding());
+    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+}

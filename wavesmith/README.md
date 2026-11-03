@@ -182,8 +182,11 @@ held note. Repeated Note On for an already-held key retriggers that voice. Note
 Off and velocity-zero Note On release the matching channel/note; releasing a
 stolen key does not stop its replacement. About 5 ms attack/release fades reduce
 clicks. A stolen voice fades out before starting its new pitch from silence.
-Velocity does not change loudness. Sustain, pitch bend and aftertouch are not
-handled. All Notes Off releases notes on its channel; All Sound Off silences them
+Pitch bend uses the full 14-bit MIDI value with a fixed +/-2-semitone range.
+Bend is tracked independently per MIDI channel, affects held/releasing and new
+notes, and is reset when MIDI Channel changes. It combines with both fine-tune
+offsets; CV mode is unaffected. Bend-range RPN messages are not handled.
+Velocity does not change loudness. Sustain and aftertouch are not handled. All Notes Off releases notes on its channel; All Sound Off silences them
 immediately. Changing MIDI Channel clears held notes, as does setting shared Output to None. MIDI allocation adds only small voice states, without extra waveform
 tables or FFT work.
 
