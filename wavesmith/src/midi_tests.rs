@@ -197,3 +197,38 @@ fn bend_follows_the_playing_channel_until_a_stolen_voice_finishes_fading() {
     assert!(midi.voices[0].sounding());
     assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
 }
+
+#[test]
+fn sparse_active_pool_excludes_off_voices_and_steals_only_among_five_enabled_voices() {
+    let mut midi = MidiState::new(48000);
+    midi.set_channel(1);
+    let mut enabled = [false; VOICE_COUNT];
+    for voice in [1, 3, 5, 7, 9] {
+        enabled[voice] = true;
+    }
+    for note in 60..65 {
+        midi.message(0x90, note, 100, &enabled);
+    }
+    run_gate(&mut midi, 250);
+    for (voice, &on) in midi.voices.iter().zip(&enabled) {
+        assert_eq!(voice.held, on);
+    }
+    midi.message(0x90, 72, 100, &enabled);
+    assert_eq!(midi.voices[1].note, 72);
+    midi.message(0x80, 60, 0, &enabled);
+    assert!(midi.voices[1].held);
+    enabled[1] = false;
+    midi.release_disabled(&enabled);
+    assert!(!midi.voices[1].held);
+    run_gate(&mut midi, 500);
+    assert!(!midi.voices[1].sounding());
+    for note in 80..90 {
+        midi.message(0x90, note, 100, &enabled);
+    }
+    assert!(!midi.voices[1].held);
+    assert_eq!(midi.voices.iter().filter(|voice| voice.held).count(), 4);
+    midi.release_disabled(&[false; VOICE_COUNT]);
+    midi.message(0x90, 100, 100, &[false; VOICE_COUNT]);
+    run_gate(&mut midi, 250);
+    assert!(midi.voices.iter().all(|v| !v.sounding()));
+}

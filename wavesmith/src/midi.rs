@@ -89,6 +89,15 @@ impl MidiState {
             }
         }
     }
+    /// Remove disabled voices from allocation immediately while allowing their
+    /// existing note to finish the normal short release gate.
+    pub fn release_disabled(&mut self, enabled: &[bool; VOICE_COUNT]) {
+        for (index, &on) in enabled.iter().enumerate() {
+            if !on {
+                self.release(index);
+            }
+        }
+    }
     pub fn forget(&mut self, index: usize) {
         self.release(index);
         if let Some(voice) = self.voices.get_mut(index) {
@@ -131,7 +140,7 @@ impl MidiState {
         if self.channel_setting != 1 && self.channel_setting != channel + 2 {
             return;
         }
-        self.sync_enabled(enabled);
+        self.release_disabled(enabled);
         match status & 0xf0 {
             0xe0 => {
                 let value = ((data2 as i32) << 7) | data1 as i32;

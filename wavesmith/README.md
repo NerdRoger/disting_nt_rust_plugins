@@ -1,10 +1,12 @@
 # Wavesmith prototype
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
-Setup specifications are Segments (2–32, default 8) and Voices (1–10, default 1).
+The only setup specification is Segments (2–32, default 8). Every instance
+provides ten voices; Voice 1 defaults to Active On and Voices 2–10 to Off.
 Every instance uses six 256-sample anti-alias tables per bank. Configured voices
 share the same waveform and table banks. Shape edits work while audio plays.
-Use the NT's respecification workflow to change either count.
+Use the NT's respecification workflow to change the segment count; use each
+voice's Active parameter to change polyphony at any time.
 
 ## Controls
 
@@ -142,23 +144,30 @@ and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
 The Output page follows Oscillator and contains shared Output and Output mode
 (add/replace).
-Each configured voice has its own Voice 1, Voice 2, etc. page, containing Pitch CV,
-Transpose, and Fine tune in that order. Parameter names are shared; the API's
+Every instance has Voice 1 through Voice 10 pages, containing Pitch CV,
+Transpose, Fine tune, and Active in that order. Parameter names are shared; the API's
 parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
 a navigation group so switching voices retains the selected parameter row.
 Transpose ranges from -48 to +48 semitones; per-voice Fine tune ranges from -100
-to +100 cents. Both offsets default to zero. Output routing remains shared.
+to +100 cents. Both offsets default to zero. Active is an Off/On enum; only Voice 1 defaults to On.
+An Off voice is silent in CV mode and immediately excluded from MIDI allocation
+and voice stealing. Turning off a sounding voice uses a short approximately 5 ms
+fade; after that, its CV reads, pitch conversion and oscillator rendering stop.
+Re-enabling a MIDI voice makes it available for new notes without resuming an
+old held key. CV voices fade in when re-enabled. Active remains editable in
+both MIDI and CV modes and uses the same V1: through V10: parameter prefixes.
+Output routing remains shared.
 Output defaults to bus 13 / physical output 1. Output None disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
 shared waveform rebuilding and edit fades can still finish while silent.
-An enabled output mixes all configured voices through automatic RMS level control.
+An enabled output mixes all active voices through automatic RMS level control.
 The controller compares the mix's measured energy with the average measured energy
 of its voices, aiming for a chord near a single voice's RMS level. MIDI voices
 are weighted by their squared attack/release gates, so a barely audible new note
 does not suddenly halve the reference. A minimum weight of one preserves the
 natural envelope of a single note. CV voices each have full weight. This
 accounts for correlated unison voices as well as independently pitched notes;
-there is no fixed division by the configured voice count. Level remains applied
+there is no fixed division by ten. Level remains applied
 to the voices, so the loudness reference follows Level and the current waveform.
 Level uses the NT's dB/minus-infinity unit: integer steps from −60 through 0 dB,
 with −60 displayed as −inf and mapped to true zero gain. Other values use
@@ -195,7 +204,7 @@ chunk acquires the new attenuation immediately instead of starting the full CV
 pool at unity gain. The transition affects only Wavesmith's contribution in Add
 mode and adds no audio buffers or steady-state latency.
 
-In CV mode every configured voice plays continuously. Its pitch is shared Pitch
+In CV mode every active voice plays continuously. Its pitch is shared Pitch
 plus Pitch CV, shared Fine tune, voice Transpose, and voice Fine tune. A Pitch CV
 of None contributes zero volts, so voices can form manual chords with Transpose
 or detuned stacks with their Fine tune offsets. CV values are snapshotted
@@ -204,8 +213,8 @@ the destination bus. Each voice has its own phase, pitch/gain slew and anti-alia
 selection. Persistent frequency caches and steady playback remain active.
 The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
 more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
-reserve the maximum ten states; only the specified voice pool is processed,
-and parameter metadata includes only the specified CV inputs.
+reserve ten states; only active voices and short fading tails are processed.
+All ten voice pages and their parameters are always present.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
 or a channel number to control every enabled voice with MIDI instead. In MIDI
@@ -214,7 +223,8 @@ Fine tune, per-voice Fine tune, and Level still apply. The ignored parameters ar
 grayed out through the NT API while MIDI is enabled and restored when MIDI is
 Off, without changing their stored values. In the custom Tuning view, Pitch is
 dim and its pot is inactive in MIDI mode; Fine and Level remain editable.
-The Voices specification determines the 1–10-note MIDI pool. Unassigned MIDI
+The MIDI pool always has ten slots; Active controls which members can be
+allocated (for example, five On voices give five-note polyphony). Unassigned MIDI
 voices remain silent; when no notes are held, the shared output is silent after
 release fades finish.
 
@@ -237,9 +247,8 @@ in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
 and so on, ending with Curve N and Boundary 00. Each interior boundary appears
 once and is still shared by its neighboring segments in the custom editor.
 One editable parameter supplies both endpoint rows. There are four shared
-pages (Oscillator, Output, Shape, Waveform) plus one page per configured voice and
-the NT's own Common page. Segment count does not add pages; the maximum is 14
-plugin pages with ten voices. This avoids the firmware's page-count issue at
+pages (Oscillator, Output, Shape, Waveform) plus ten voice pages and the NT's
+own Common page. The plugin always has 14 pages, independently of segment count. This avoids the firmware's page-count issue at
 high segment counts.
 All numeric shape parameters are host-visible;
 dedicated segment modulation routing is deferred. Ordinary parameter values are
@@ -370,18 +379,18 @@ contribution ceiling. Asymmetric waves can have DC offset.
 
 ## Build and test
 
-The audio bank is fixed at six tables. Voices ranges from 1–10 and defaults to 1.
-The page order is Oscillator, Output, Shape, Voice 1 through Voice N, Waveform.
+The audio bank is fixed at six tables and the voice pool at ten slots.
+Only Voice 1 is active by default. Segments is the only specification.
+The page order is Oscillator, Output, Shape, Voice 1 through Voice 10, Waveform.
 Underlying parameter ordinals now follow that same order: 18 shared controls,
-three parameters per configured voice, then interleaved boundary/curve values.
+four parameters for each of ten voices, then interleaved boundary/curve values.
 Boundary 00 is one shared seam parameter shown again at the end of Waveform.
 
 This revision changes parameter ordinals. Recreate earlier instances/presets and
 review CV-to-parameter mappings; old ordinal-based values/mappings are not
 migrated automatically. Changing segment count now preserves the indices of
-shared controls, voices, and remaining waveform controls. Changing voice count
-preserves shared controls and remaining voice controls, but shifts the waveform
-block; it does not solve arbitrary respecification across both counts.
+shared controls, voices, and remaining waveform controls. The fixed voice pool
+means segment respecification cannot shift the waveform block's starting ordinal.
 
 From the repository's devcontainer:
 
@@ -402,3 +411,11 @@ Copy `plugins/wavesmith.o` to the NT's plugin folder using your normal deploymen
 procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
 independent segment-width editing, and per-boundary smoothing are deferred.
+
+There is no Voices specification. The 58 fixed shared/voice parameters precede
+all waveform boundaries and curves, which are appended as interleaved pairs.
+The total is 58 + 2 * Segments (62–122 parameters). Changing Segments preserves
+the identities and ordinals of all surviving controls. Removed segment values
+are discarded by the host; newly added segments receive their defaults.
+This is a one-time specification/layout change from older builds: review existing
+presets and CV mappings, especially presets saved with fewer than ten voices.

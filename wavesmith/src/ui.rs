@@ -121,12 +121,7 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 1 => FINE,
                 _ => LEVEL,
             }),
-            EditMode::Segment => editor_parameter(
-                context.state().count,
-                selected,
-                field,
-                context.state().voice_count,
-            ),
+            EditMode::Segment => editor_parameter(context.state().count, selected, field),
         };
         // Use the host definition for pickup bounds and resets so these stay
         // consistent with parameter-page editing as controls evolve.
@@ -293,11 +288,7 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     // retain a precompiled non-PIC divide-by-zero panic helper.
     let n = state.count.max(2);
     let parameters = context.read_parameters();
-    let source = read_wave(
-        n,
-        |index| parameters.value(index),
-        context.state().voice_count,
-    );
+    let source = read_wave(n, |index| parameters.value(index));
     canvas.shape(Shape::Rectangle, 0, 0, 255, 63, 0);
     canvas.shape(Shape::Rectangle, 0, 0, 255, 12, 2);
     let header_color = 15;
@@ -306,21 +297,14 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
             (
                 2,
                 b"Left ",
-                editor_parameter(n, selected, 0, context.state().voice_count)
-                    .unwrap_or(seam_parameter(context.state().voice_count)),
+                editor_parameter(n, selected, 0).unwrap_or(WAVEFORM_START),
                 0,
             ),
-            (
-                102,
-                b"Curve ",
-                curve_parameter(selected, context.state().voice_count),
-                0,
-            ),
+            (102, b"Curve ", curve_parameter(selected), 0),
             (
                 190,
                 b"Right ",
-                editor_parameter(n, selected, 1, context.state().voice_count)
-                    .unwrap_or(seam_parameter(context.state().voice_count)),
+                editor_parameter(n, selected, 1).unwrap_or(WAVEFORM_START),
                 0,
             ),
         ],
