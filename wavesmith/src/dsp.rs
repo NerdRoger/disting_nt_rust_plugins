@@ -4,8 +4,8 @@
 #![forbid(unsafe_code)]
 
 pub const SIZE: usize = 256;
-pub const CENTROID_MAX: i16 = 255;
-pub const CENTROID_DEFAULT: i16 = 128;
+pub const WARP_POSITION_MAX: i16 = 255;
+pub const WARP_POSITION_DEFAULT: i16 = 128;
 pub const MAX_FOLDS: i16 = 2;
 pub const DEFAULT_FOLD_LIMIT: i16 = 2;
 pub const DEFAULT_TABLES: usize = 6;
@@ -17,7 +17,7 @@ const TABLES_PER_BANK: usize = LEVELS + 1;
 // Pack two real-valued tables into each block's real/imaginary lanes.
 #[cfg(test)]
 const BANK_BLOCKS: usize = TABLES_PER_BANK;
-// One paired inverse FFT per callback, producing at most two audio tables.
+// Each paired inverse FFT produces at most two audio tables.
 const TABLES_PER_STEP: usize = 2;
 const TABLE_PAIR_STEPS: usize = 4;
 const HARMONICS_PER_STEP: usize = 4;
@@ -86,8 +86,8 @@ struct TableLayout {
 impl TableLayout {
     fn new(count: usize) -> Self {
         let count = count.clamp(1, MAX_TABLES);
-        // Refinements are nested: increasing the specification adds a table
-        // without discarding existing limits. Six matches the listening prototype.
+        // Nested refinements retain existing harmonic limits. Production uses six;
+        // other counts remain available to the DSP regression tests.
         let priority = [
             127, 1, 8, 32, 4, 2, 16, 64, 6, 12, 3, 48, 24, 96, 5, 10, 20, 40, 80, 112,
         ];
@@ -135,8 +135,8 @@ fn playback_levels(increment: f32) -> (usize, f32) {
 pub struct Wave {
     pub count: usize,
     pub smoothing: i16,
-    pub centroid: i16,
-    pub strength: i16,
+    pub warp_position: i16,
+    pub warp_amount: i16,
     pub fold_limit: i16,
     pub boundaries: [i16; MAX_SEGMENTS + 1],
     pub curves: [i16; MAX_SEGMENTS],
@@ -148,8 +148,8 @@ impl Wave {
         let mut wave = Self {
             count,
             smoothing: 0,
-            centroid: CENTROID_DEFAULT,
-            strength: 0,
+            warp_position: WARP_POSITION_DEFAULT,
+            warp_amount: 0,
             fold_limit: DEFAULT_FOLD_LIMIT,
             boundaries: [0; MAX_SEGMENTS + 1],
             curves: [0; MAX_SEGMENTS],
@@ -172,17 +172,18 @@ impl Wave {
         #[cfg(test)]
         tests::count_boundary_position();
         let x = boundary.min(self.count) as f32 / self.count.max(2) as f32;
-        if boundary == 0 || boundary >= self.count || self.strength == 0 {
+        if boundary == 0 || boundary >= self.count || self.warp_amount == 0 {
             return x;
         }
-        let center = self.centroid.clamp(0, CENTROID_MAX) as f32 / CENTROID_MAX as f32;
-        let amount = self.strength.clamp(-100, 100) as f32 * 0.0095;
+        let center =
+            self.warp_position.clamp(0, WARP_POSITION_MAX) as f32 / WARP_POSITION_MAX as f32;
+        let amount = self.warp_amount.clamp(-100, 100) as f32 * 0.0095;
         let extent = if x < center { center } else { 1.0 - center };
         if extent <= 0.0 {
             return x;
         }
         let distance = (x - center).abs() / extent;
-        // Monotone rational maps keep both edges and the centroid fixed. The
+        // Monotone rational maps keep both edges and the warp position fixed. The
         // 0.95 cap prevents zero-width segments even at full attraction/repulsion.
         let moved = if amount > 0.0 {
             distance / (1.0 - amount + amount * distance)
@@ -203,7 +204,7 @@ impl Wave {
     }
 
     fn segment_at(&self, phase: f32) -> (usize, f32) {
-        if self.strength == 0 {
+        if self.warp_amount == 0 {
             let position = phase * self.count as f32;
             let index = (position as usize).min(self.count - 1);
             return (index, position - index as f32);
@@ -223,7 +224,7 @@ impl Wave {
     }
 
     fn unwarped_phase(&self, phase: f32) -> f32 {
-        if self.strength == 0 {
+        if self.warp_amount == 0 {
             return phase;
         }
         let (index, t) = self.segment_at(phase);
@@ -424,7 +425,11 @@ fn audio_table_stage(wave: &Wave) -> usize {
         SOURCE_STEPS
             + 7
             + 2 * correction_steps(wave.count)
-            + if wave.strength != 0 { SAMPLE_STEPS } else { 0 }
+            + if wave.warp_amount != 0 {
+                SAMPLE_STEPS
+            } else {
+                0
+            }
     } else {
         SOURCE_STEPS
     }
@@ -966,7 +971,7 @@ impl Engine {
             self.basis_count = self.building.count;
         }
         if self.stage == 0 {
-            if self.building.strength != 0 {
+            if self.building.warp_amount != 0 {
                 prepare_geometry(&self.building, &mut twiddles.data);
             }
             self.sample_segment = 0;
@@ -979,7 +984,7 @@ impl Engine {
                 // stretch that completed shape before final anti-alias filtering.
                 let mut source = self.building;
                 if source.smoothing > 0 {
-                    source.strength = 0;
+                    source.warp_amount = 0;
                 }
                 let first = (self.stage - 1) * SAMPLES_PER_STEP;
                 #[cfg(test)]
@@ -992,7 +997,7 @@ impl Engine {
                     .take(SAMPLES_PER_STEP)
                 {
                     let phase = i as f32 / SIZE as f32;
-                    let sample = if source.strength == 0 {
+                    let sample = if source.warp_amount == 0 {
                         source.sample(phase)
                     } else {
                         let (segment, t) = cached_segment_at(
@@ -1070,7 +1075,9 @@ impl Engine {
                         return;
                     }
                 }
-                stage if self.building.strength != 0 && stage <= correction_end + SAMPLE_STEPS => {
+                stage
+                    if self.building.warp_amount != 0 && stage <= correction_end + SAMPLE_STEPS =>
+                {
                     let preview = (1 - self.active) * tables_per_bank + self.layout.count;
                     let first = (stage - correction_end - 1) * SAMPLES_PER_STEP;
                     if first == 0 {

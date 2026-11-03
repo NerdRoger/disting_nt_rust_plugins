@@ -240,10 +240,10 @@ fn cached_geometry_matches_reference_and_does_not_overlap_fft_or_smoothing_value
         engine.advance(&mut memory);
         let fixed = memory[TWIDDLES].data;
         let mut wave = Wave::new(n);
-        for centroid in [0, 1, 94, 128, 254, 255] {
-            wave.centroid = centroid;
-            for strength in [-100, -50, 50, 100] {
-                wave.strength = strength;
+        for warp_position in [0, 1, 94, 128, 254, 255] {
+            wave.warp_position = warp_position;
+            for warp_amount in [-100, -50, 50, 100] {
+                wave.warp_amount = warp_amount;
                 prepare_geometry(&wave, &mut memory[TWIDDLES].data);
                 for (a, b) in memory[TWIDDLES].data[..POSITION_CACHE].iter().zip(&fixed) {
                     assert_eq!(a.re, b.re);
@@ -264,18 +264,18 @@ fn cached_geometry_matches_reference_and_does_not_overlap_fft_or_smoothing_value
 }
 
 #[test]
-fn centroid_mapping_preserves_edges_order_and_segment_shapes_at_all_settings() {
+fn warp_position_mapping_preserves_edges_order_and_segment_shapes_at_all_settings() {
     for n in 2..=MAX_SEGMENTS {
         let mut wave = Wave::new(n);
         for i in 0..n {
             wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
             wave.curves[i] = (i * 31 % 201) as i16 - 100;
         }
-        for centroid in 0..=255 {
-            wave.centroid = centroid;
-            let center = centroid as f32 / 255.0;
-            for strength in [-100, -50, 0, 50, 100] {
-                wave.strength = strength;
+        for warp_position in 0..=255 {
+            wave.warp_position = warp_position;
+            let center = warp_position as f32 / 255.0;
+            for warp_amount in [-100, -50, 0, 50, 100] {
+                wave.warp_amount = warp_amount;
                 assert_eq!(wave.boundary_position(0), 0.0);
                 assert_eq!(wave.boundary_position(n), 1.0);
                 for i in 0..n {
@@ -283,9 +283,9 @@ fn centroid_mapping_preserves_edges_order_and_segment_shapes_at_all_settings() {
                     let end = wave.boundary_position(i + 1);
                     assert!(end > start && start >= 0.0 && end <= 1.0);
                     let original = i as f32 / n as f32;
-                    if strength == 0 {
+                    if warp_amount == 0 {
                         assert_eq!(start, original);
-                    } else if strength > 0 {
+                    } else if warp_amount > 0 {
                         assert!((start - center).abs() + 0.000001 >= (original - center).abs());
                     } else {
                         assert!((start - center).abs() <= (original - center).abs() + 0.000001);
@@ -294,7 +294,7 @@ fn centroid_mapping_preserves_edges_order_and_segment_shapes_at_all_settings() {
                         let phase = wave.segment_phase(i, t);
                         assert!(
                             (wave.sample(phase) - wave.segment_sample(i, t)).abs() < 0.002,
-                            "n {n} center {centroid} strength {strength} segment {i} t {t}"
+                            "n {n} center {warp_position} warp_amount {warp_amount} segment {i} t {t}"
                         );
                     }
                 }
@@ -314,10 +314,10 @@ fn redistributed_shape_drives_editor_and_final_audio_spectrum_with_smoothing() {
             wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
             wave.curves[i] = (i * 31 % 201) as i16 - 100;
         }
-        for centroid in [0, 94, 128, 255] {
-            wave.centroid = centroid;
-            for strength in [-100, -50, 50, 100] {
-                wave.strength = strength;
+        for warp_position in [0, 94, 128, 255] {
+            wave.warp_position = warp_position;
+            for warp_amount in [-100, -50, 50, 100] {
+                wave.warp_amount = warp_amount;
                 for smoothing in [0, 50, 100] {
                     wave.smoothing = smoothing;
                     finish_build(&mut engine, &mut memory, wave, 220.0);
@@ -478,8 +478,8 @@ fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
             let mut memory = [Block::ZERO; BLOCKS];
             let mut wave = Wave::new(n);
             wave.smoothing = smoothing;
-            wave.centroid = 37;
-            wave.strength = -70;
+            wave.warp_position = 37;
+            wave.warp_amount = -70;
             finish_build(&mut engine, &mut memory, wave, 440.0);
             let old_bank = engine.active;
             let old = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
@@ -536,7 +536,7 @@ fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_pat
             wave.smoothing = 40;
         }
         if block == 100 {
-            wave.strength = -70;
+            wave.warp_amount = -70;
             wave.fold_limit = 1;
         }
         shared.request(wave);
@@ -660,7 +660,7 @@ fn steady_block_playback_is_bit_exact_through_table_blends_pitch_level_changes_a
             if block == 130 || block == 600 {
                 wave.curves[0] = if block == 130 { 85 } else { -73 };
                 wave.smoothing = 40;
-                wave.strength = -50;
+                wave.warp_amount = -50;
             }
             engine.request(wave);
             engine.advance(&mut memory);
@@ -718,7 +718,7 @@ fn shared_rebuilds_and_crossfade_time_do_not_depend_on_enabled_voice_count() {
         let mut wave = Wave::new(32);
         wave.curves.fill(73);
         wave.smoothing = 50;
-        wave.strength = -70;
+        wave.warp_amount = -70;
         let callbacks = build_calls(&wave, LEVELS);
         FFT_COUNTS.with(|counter| counter.set((0, 0)));
         for callback in 0..callbacks + 5 {

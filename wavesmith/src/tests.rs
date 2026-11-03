@@ -198,11 +198,11 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert_eq!((*(*instance.base).parameter_pages).num_pages as usize, 5);
             assert_eq!(
                 editor_parameter(n as usize, 0, 0, 1),
-                Some(seam_parameter(n as usize, 1))
+                Some(seam_parameter(1))
             );
             assert_eq!(
                 editor_parameter(n as usize, n as usize - 1, 1, 1),
-                Some(seam_parameter(n as usize, 1))
+                Some(seam_parameter(1))
             );
             let wave = read_wave(n as usize, |p| instance.values.get(p).copied(), 1);
             assert_eq!(wave.segment_sample(0, 0.0), 0.0);
@@ -212,12 +212,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert_eq!(CStr::from_ptr(oscillator.name), c"Oscillator");
             assert_eq!(
                 core::slice::from_raw_parts(oscillator.params, oscillator.num_params as usize),
-                &[
-                    midi_channel_parameter(n as usize) as u8,
-                    PITCH as u8,
-                    FINE as u8,
-                    LEVEL as u8
-                ]
+                &[MIDI_CHANNEL as u8, PITCH as u8, FINE as u8, LEVEL as u8]
             );
             let shape = &*pages.pages.add(2);
             assert_eq!(CStr::from_ptr(shape.name), c"Shape");
@@ -258,29 +253,23 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             );
             assert_eq!(instance.values[OUTPUT], 13);
             assert_eq!(instance.values[OUTPUT_MODE], 0);
-            assert_eq!(instance.values[PITCH_CV], 0);
+            assert_eq!(instance.values[voice_pitch_parameter(0)], 0);
             assert_eq!(
-                CStr::from_ptr((*(*instance.base).parameters.add(PITCH_CV)).name),
+                CStr::from_ptr((*(*instance.base).parameters.add(voice_pitch_parameter(0))).name),
                 c"Pitch CV"
             );
             assert!(factory().parameter_ui_prefix.is_some());
             assert_eq!(page.num_params as usize, n as usize * 2 + 1);
             let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
-            assert_eq!(rows[0] as usize, seam_parameter(n as usize, 1));
+            assert_eq!(rows[0] as usize, seam_parameter(1));
             for segment in 0..n as usize {
-                assert_eq!(
-                    rows[segment * 2 + 1] as usize,
-                    curve_parameter(n as usize, segment, 1)
-                );
+                assert_eq!(rows[segment * 2 + 1] as usize, curve_parameter(segment, 1));
                 assert_eq!(
                     rows[segment * 2 + 2] as usize,
-                    editor_parameter(n as usize, segment, 1, 1)
-                        .unwrap_or(seam_parameter(n as usize, 1))
+                    editor_parameter(n as usize, segment, 1, 1).unwrap_or(seam_parameter(1))
                 );
             }
-            let seam = *(*instance.base)
-                .parameters
-                .add(seam_parameter(n as usize, 1));
+            let seam = *(*instance.base).parameters.add(seam_parameter(1));
             assert_eq!((seam.min, seam.max, seam.default), (-100, 100, 0));
             assert_eq!(CStr::from_ptr(seam.name), c"Boundary 00");
             let mut references = std::vec![0; instance.values.len()];
@@ -305,11 +294,11 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 );
             }
             for segment in 0..n as usize {
-                assert_eq!(references[curve_parameter(n as usize, segment, 1)], 1);
+                assert_eq!(references[curve_parameter(segment, 1)], 1);
             }
-            assert_eq!(references[seam_parameter(n as usize, 1)], 2);
-            assert_eq!(references[randomize_parameter(n as usize)], 1);
-            let midi = midi_channel_parameter(n as usize);
+            assert_eq!(references[seam_parameter(1)], 2);
+            assert_eq!(references[RANDOMIZE_ALL], 1);
+            let midi = MIDI_CHANNEL;
             assert_eq!(references[midi], 1);
             assert_eq!(midi, 0);
             let d = *(*instance.base).parameters.add(midi);
@@ -317,13 +306,13 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert_eq!(CStr::from_ptr(*d.enum_strings), c"Off");
             assert_eq!(CStr::from_ptr(*d.enum_strings.add(1)), c"All");
             assert_eq!(CStr::from_ptr(*d.enum_strings.add(17)), c"16");
-            let fold = fold_limit_parameter(n as usize);
+            let fold = FOLD_LIMIT;
             assert_eq!(fold, 9);
             assert_eq!(references[fold], 1);
             let d = *(*instance.base).parameters.add(fold);
             assert_eq!(CStr::from_ptr(d.name), c"Fold Limit");
             assert_eq!((d.min, d.max, d.default, d.unit), (0, 2, 2, UNIT_NONE));
-            for (index, name) in shape_triggers(n as usize).into_iter().zip([
+            for (index, name) in SHAPE_TRIGGERS.into_iter().zip([
                 c"Randomize All",
                 c"Randomize Boundaries",
                 c"Randomize Curves",
@@ -339,14 +328,8 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 assert_eq!((d.min, d.max, d.default, d.unit), (0, 1, 0, UNIT_NONE));
             }
             for (index, name, minimum, maximum, default) in [
-                (
-                    centroid_parameter(n as usize),
-                    c"Warp Position",
-                    0,
-                    255,
-                    128,
-                ),
-                (strength_parameter(n as usize), c"Warp Amount", -100, 100, 0),
+                (WARP_POSITION, c"Warp Position", 0, 255, 128),
+                (WARP_AMOUNT, c"Warp Amount", -100, 100, 0),
             ] {
                 assert_eq!(references[index], 1);
                 let d = *(*instance.base).parameters.add(index);
@@ -393,21 +376,19 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
             let mut instance = Instance::new(n);
             let n = n as usize;
             instance.change(SMOOTHING, 43);
-            instance.change(centroid_parameter(n), 94);
-            instance.change(strength_parameter(n), -68);
-            instance.change(fold_limit_parameter(n), 1);
-            let mut boundaries = std::vec![seam_parameter(n, 1)];
+            instance.change(WARP_POSITION, 94);
+            instance.change(WARP_AMOUNT, -68);
+            instance.change(FOLD_LIMIT, 1);
+            let mut boundaries = std::vec![seam_parameter(1)];
             boundaries.extend((1..n).map(|boundary| boundary_parameter(boundary, 1)));
-            let curves: Vec<_> = (0..n)
-                .map(|segment| curve_parameter(n, segment, 1))
-                .collect();
+            let curves: Vec<_> = (0..n).map(|segment| curve_parameter(segment, 1)).collect();
             for (i, &parameter) in boundaries.iter().enumerate() {
                 instance.change(parameter, (i as i16 * 3) - 40);
             }
             for (i, &parameter) in curves.iter().enumerate() {
                 instance.change(parameter, 20 + i as i16);
             }
-            let trigger = shape_triggers(n)[kind];
+            let trigger = SHAPE_TRIGGERS[kind];
             let before = instance.values.clone();
             instance.change(trigger, 1);
             let after = instance.values.clone();
@@ -450,14 +431,14 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
 #[test]
 fn shape_trigger_edges_are_independent() {
     let mut instance = Instance::new(8);
-    let [all, boundaries, curves, zero, ..] = shape_triggers(8);
+    let [all, boundaries, curves, zero, ..] = SHAPE_TRIGGERS;
     for trigger in [all, boundaries, curves, zero] {
         instance.change(trigger, 1);
     }
     let boundary_values: Vec<_> = (1..8)
         .map(|i| instance.values[boundary_parameter(i, 1)])
         .collect();
-    instance.change(curve_parameter(8, 0, 1), 73);
+    instance.change(curve_parameter(0, 1), 73);
     let before = instance.values.clone();
     for trigger in [all, boundaries, curves, zero] {
         instance.change(trigger, 1);
@@ -465,8 +446,7 @@ fn shape_trigger_edges_are_independent() {
     assert_eq!(instance.values, before);
     instance.change(curves, 0);
     instance.change(curves, 1);
-    assert!((0..8)
-        .any(|i| instance.values[curve_parameter(8, i, 1)] != before[curve_parameter(8, i, 1)]));
+    assert!((0..8).any(|i| instance.values[curve_parameter(i, 1)] != before[curve_parameter(i, 1)]));
     assert_eq!(
         (1..8)
             .map(|i| instance.values[boundary_parameter(i, 1)])
@@ -475,7 +455,7 @@ fn shape_trigger_edges_are_independent() {
     );
     instance.change(zero, 0);
     instance.change(zero, 1);
-    assert!((0..8).all(|i| instance.values[curve_parameter(8, i, 1)] == 0));
+    assert!((0..8).all(|i| instance.values[curve_parameter(i, 1)] == 0));
 }
 
 #[test]
@@ -484,12 +464,12 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
         let mut instance = Instance::new(n);
         let n = n as usize;
         instance.change(SMOOTHING, 43);
-        instance.change(centroid_parameter(n), 94);
-        instance.change(strength_parameter(n), -68);
+        instance.change(WARP_POSITION, 94);
+        instance.change(WARP_AMOUNT, -68);
         for i in 0..n {
-            instance.change(curve_parameter(n, i, 1), 20 + i as i16);
+            instance.change(curve_parameter(i, 1), 20 + i as i16);
         }
-        let boundaries: Vec<_> = std::iter::once(seam_parameter(n, 1))
+        let boundaries: Vec<_> = std::iter::once(seam_parameter(1))
             .chain((1..n).map(|boundary| boundary_parameter(boundary, 1)))
             .collect();
         for (kind, shape) in [
@@ -501,7 +481,7 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
         .into_iter()
         .enumerate()
         {
-            let trigger = shape_triggers(n)[4 + kind];
+            let trigger = SHAPE_TRIGGERS[4 + kind];
             let before = instance.values.clone();
             instance.change(trigger, 1);
             for (i, &parameter) in boundaries.iter().enumerate() {
@@ -517,15 +497,15 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
             }
             // Holding this trigger high must not reapply the shape, even with
             // other waveform triggers already held high from earlier iterations.
-            instance.change(seam_parameter(n, 1), 73);
+            instance.change(seam_parameter(1), 73);
             let held = instance.values.clone();
-            for trigger in shape_triggers(n).into_iter().skip(4).take(kind + 1) {
+            for trigger in SHAPE_TRIGGERS.into_iter().skip(4).take(kind + 1) {
                 instance.change(trigger, 1);
             }
             assert_eq!(instance.values, held);
             instance.change(trigger, 0);
             instance.change(trigger, 1);
-            assert_eq!(instance.values[seam_parameter(n, 1)], -100);
+            assert_eq!(instance.values[seam_parameter(1)], -100);
         }
     }
 }
@@ -535,17 +515,17 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
     for n in 2..=32 {
         let mut instance = Instance::new(n);
         let n = n as usize;
-        let trigger = randomize_parameter(n);
-        let shape_start = seam_parameter(n, 1);
+        let trigger = RANDOMIZE_ALL;
+        let shape_start = seam_parameter(1);
         let shape_end = shape_start + n * 2;
         instance.change(SMOOTHING, 43);
-        instance.change(centroid_parameter(n), 37);
-        instance.change(strength_parameter(n), -68);
+        instance.change(WARP_POSITION, 37);
+        instance.change(WARP_AMOUNT, -68);
         let before = instance.values.clone();
         instance.change(trigger, 1);
         let first = instance.values.clone();
-        assert_eq!(first[centroid_parameter(n)], 37);
-        assert_eq!(first[strength_parameter(n)], -68);
+        assert_eq!(first[WARP_POSITION], 37);
+        assert_eq!(first[WARP_AMOUNT], -68);
         assert_ne!(
             &first[shape_start..shape_end],
             &before[shape_start..shape_end]
@@ -568,7 +548,7 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
             &first[shape_start..shape_end]
         );
         let wave = read_wave(n, |p| instance.values.get(p).copied(), 1);
-        let seam = instance.values[seam_parameter(n, 1)] as f32 * 0.01;
+        let seam = instance.values[seam_parameter(1)] as f32 * 0.01;
         assert_eq!(wave.segment_sample(0, 0.0), seam);
         assert_eq!(wave.segment_sample(n - 1, 1.0), seam);
         for boundary in 1..n {
@@ -591,7 +571,7 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
     for n in [2, 7, 32] {
         let mut instance = Instance::new(n);
         let n = n as usize;
-        let seam = seam_parameter(n, 1);
+        let seam = seam_parameter(1);
         instance.change(seam, 25);
         instance.event([0.5; 3], [0, 0]);
         instance.event([0.508, 0.5, 0.5], [0, 0]);
@@ -661,7 +641,7 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
         }
         for segment in 0..n as usize {
             instance.change(
-                curve_parameter(n as usize, segment, 1),
+                curve_parameter(segment, 1),
                 if segment % 2 == 0 { -100 } else { 100 },
             );
         }
@@ -723,14 +703,7 @@ fn configurable_voices_have_shared_routing_and_grouped_voice_pages() {
                 }
                 assert_eq!(next_ordinal, instance.values.len());
                 for (p, references) in seen.into_iter().enumerate() {
-                    assert_eq!(
-                        references,
-                        if p == seam_parameter(n as usize, voices) {
-                            2
-                        } else {
-                            1
-                        }
-                    );
+                    assert_eq!(references, if p == seam_parameter(voices) { 2 } else { 1 });
                 }
                 for voice in 0..voices {
                     let page = &*pages.pages.add(voice + 3);
@@ -739,9 +712,9 @@ fn configurable_voices_have_shared_routing_and_grouped_voice_pages() {
                         std::format!("Voice {}", voice + 1)
                     );
                     assert_eq!(page.group, group);
-                    let cv = voice_pitch_parameter(n as usize, voice);
-                    let transpose = voice_transpose_parameter(n as usize, voices, voice);
-                    let fine = voice_fine_parameter(n as usize, voices, voice);
+                    let cv = voice_pitch_parameter(voice);
+                    let transpose = voice_transpose_parameter(voice);
+                    let fine = voice_fine_parameter(voice);
                     assert_eq!(
                         core::slice::from_raw_parts(page.params, page.num_params as usize),
                         &[cv as u8, transpose as u8, fine as u8]
@@ -776,9 +749,9 @@ fn stable_midi_and_cv_reuse_caches_for_only_the_configured_pool() {
         let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         for voice in 0..voices {
-            instance.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
+            instance.change(voice_pitch_parameter(voice), voice as i16 + 1);
         }
-        instance.change(midi_channel_parameter(8), 1);
+        instance.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
             instance.midi(0x90, 60 + voice as u8, 100);
         }
@@ -796,7 +769,7 @@ fn stable_midi_and_cv_reuse_caches_for_only_the_configured_pool() {
         instance.change(FINE, 10);
         instance.render(&mut samples);
         assert_eq!(dsp::playback_work_counts().1 - after.1, voices);
-        instance.change(midi_channel_parameter(8), 0);
+        instance.change(MIDI_CHANNEL, 0);
         for _ in 0..160 {
             instance.render(&mut samples);
         }
@@ -819,10 +792,10 @@ fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
     for voices in 1..=VOICE_COUNT {
         let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
-        instance.change(midi_channel_parameter(8), 2);
+        instance.change(MIDI_CHANNEL, 2);
         instance.change(PITCH, 0);
         for voice in 0..voices {
-            instance.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
+            instance.change(voice_pitch_parameter(voice), voice as i16 + 1);
         }
         let mut samples = [0.0; LAST_BUS * FRAMES];
         let before = dsp::oscillator_tick_count();
@@ -868,7 +841,7 @@ fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
         instance.render(&mut samples);
         assert_eq!(dsp::oscillator_tick_count(), before);
         assert!(samples[12 * FRAMES..13 * FRAMES].iter().all(|&v| v == 0.0));
-        instance.change(midi_channel_parameter(8), 0);
+        instance.change(MIDI_CHANNEL, 0);
         instance.change(PITCH, 57);
         samples.fill(0.0);
         instance.render(&mut samples);
@@ -881,7 +854,7 @@ fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
     for voices in 1..=VOICE_COUNT {
         let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
-        instance.change(midi_channel_parameter(8), 1);
+        instance.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
             instance.midi(0x90, 60 + voice as u8, 100);
         }
@@ -915,13 +888,13 @@ fn shared_cv_output_matches_sum_of_independent_voices_and_snapshots_inputs_first
         mixed.change(OUTPUT, 1); // Overwrites Voice 1's pitch input after snapshot.
         mixed.change(OUTPUT_MODE, 1);
         for voice in 0..voices {
-            mixed.change(voice_pitch_parameter(8, voice), voice as i16 + 1);
+            mixed.change(voice_pitch_parameter(voice), voice as i16 + 1);
         }
         let mut references: Vec<_> = (0..voices)
             .map(|_| {
                 let mut mono = Instance::new(8);
                 mono.change(OUTPUT_MODE, 1);
-                mono.change(PITCH_CV, 1);
+                mono.change(voice_pitch_parameter(0), 1);
                 mono
             })
             .collect();
@@ -987,7 +960,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
     }
     assert!(samples[..63 * 64].iter().all(|&v| v == 0.0));
     assert!(samples[63 * 64..].iter().any(|v| v.abs() > 0.1));
-    instance.change(PITCH_CV, 1);
+    instance.change(voice_pitch_parameter(0), 1);
     samples[..64].fill(1.0);
     instance.render(&mut samples);
     let before = samples[63 * 64..].to_vec();
@@ -1017,7 +990,7 @@ fn output_modes_routing_pitch_cv_and_live_shape_edits() {
 #[test]
 fn only_bright_editor_trace_is_drawn_with_or_without_smoothing() {
     let mut instance = Instance::new(7);
-    instance.change(curve_parameter(7, 2, 1), 100);
+    instance.change(curve_parameter(2, 1), 100);
     let mut samples = [0.0; LAST_BUS * 64];
     let mut original = None;
     for smoothing in [0, 75, 0] {
@@ -1051,7 +1024,7 @@ fn only_bright_editor_trace_is_drawn_with_or_without_smoothing() {
 #[test]
 fn pitch_changes_do_not_change_the_displayed_waveform() {
     let mut instance = Instance::new(32);
-    instance.change(curve_parameter(32, 0, 1), 100);
+    instance.change(curve_parameter(0, 1), 100);
     let mut samples = [0.0; LAST_BUS * 64];
     for _ in 0..64 {
         instance.render(&mut samples);
@@ -1150,12 +1123,12 @@ fn smart_pickup_reaches_both_stops_for_every_pot_after_segment_selection() {
 }
 
 #[test]
-fn centroid_marker_grid_and_handles_follow_redistributed_boundaries() {
+fn warp_position_marker_grid_and_handles_follow_redistributed_boundaries() {
     let mut instance = Instance::new(8);
     instance.event([0.5; 3], [2, 0]);
-    instance.change(centroid_parameter(8), 94);
-    for strength in [-100, 100] {
-        instance.change(strength_parameter(8), strength);
+    instance.change(WARP_POSITION, 94);
+    for warp_amount in [-100, 100] {
+        instance.change(WARP_AMOUNT, warp_amount);
         instance.change(SMOOTHING, 50);
         let wave = read_wave(8, |p| instance.values.get(p).copied(), 1);
         let left = (wave.boundary_position(2) * 255.0) as i32;
@@ -1216,8 +1189,8 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
     instance.change(PITCH, 57);
     instance.change(FINE, -25);
     instance.change(LEVEL, 35);
-    instance.change(centroid_parameter(8), 94);
-    instance.change(strength_parameter(8), -68);
+    instance.change(WARP_POSITION, 94);
+    instance.change(WARP_AMOUNT, -68);
     instance.change(SMOOTHING, 43);
     let before = instance.values.clone();
     instance.click_right([0.8; 3]);
@@ -1309,7 +1282,7 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
         let mut instance = Instance::new(n);
         let n = n as usize;
         for segment in 0..n {
-            instance.change(curve_parameter(n, segment, 1), segment as i16 * 3 - 50);
+            instance.change(curve_parameter(segment, 1), segment as i16 * 3 - 50);
         }
         instance.event([0.5; 3], [0, 0]);
         let before = instance.values.clone();
@@ -1319,8 +1292,7 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
             instance.event([0.508; 3], [delta, 0]);
             assert_eq!(instance.values, before);
             instance.draw();
-            let expected =
-                std::format!("Curve {}", before[curve_parameter(n, selected as usize, 1)]);
+            let expected = std::format!("Curve {}", before[curve_parameter(selected as usize, 1)]);
             TEXT.with(|text| {
                 assert!(text
                     .borrow()
@@ -1329,7 +1301,7 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
             });
         }
         instance.event([0.508, 0.517, 0.508], [0, 0]);
-        let edited = curve_parameter(n, selected as usize, 1);
+        let edited = curve_parameter(selected as usize, 1);
         assert!(instance.values[edited] > before[edited]);
         for p in 0..before.len() {
             if p != edited {
@@ -1349,7 +1321,7 @@ fn segment_header_shows_selected_left_curve_and_right_values_with_background() {
             instance.event([0.5; 3], [(selected - previous) as i8, 0]);
             previous = selected;
             instance.change(editor_parameter(n, selected, 0, 1).unwrap(), -100);
-            instance.change(curve_parameter(n, selected, 1), -37);
+            instance.change(curve_parameter(selected, 1), -37);
             instance.change(editor_parameter(n, selected, 1, 1).unwrap(), 100);
             instance.draw();
             TEXT.with(|text| {
@@ -1414,8 +1386,8 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
     instance.event([0.8; 3], [2, 0]);
     instance.change(SMOOTHING, 25);
     instance.change(LEVEL, 30);
-    instance.change(centroid_parameter(8), 25);
-    instance.change(strength_parameter(8), 0);
+    instance.change(WARP_POSITION, 25);
+    instance.change(WARP_AMOUNT, 0);
     instance.change(PITCH, 40);
     let before = instance.values.clone();
     instance.event_buttons([0.8; 3], [0, 0], ENCODER_BUTTON_R, 0);
@@ -1468,32 +1440,32 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         instance.event([0.8 + step as f32 * 0.005; 3], [0, 0]);
     }
     assert_eq!(instance.values[SMOOTHING], 100);
-    assert_eq!(instance.values[strength_parameter(8)], 100);
-    let trigger = randomize_parameter(8);
+    assert_eq!(instance.values[WARP_AMOUNT], 100);
+    let trigger = RANDOMIZE_ALL;
     assert_eq!(instance.values[trigger], 0);
-    assert_eq!(instance.values[centroid_parameter(8)], 255);
+    assert_eq!(instance.values[WARP_POSITION], 255);
     assert_eq!(instance.values[LEVEL], 30);
     assert_eq!(instance.values[PITCH], 40);
-    let first_shape = instance.values[seam_parameter(8, 1)..].to_vec();
-    assert_eq!(first_shape, before[seam_parameter(8, 1)..]);
+    let first_shape = instance.values[seam_parameter(1)..].to_vec();
+    assert_eq!(first_shape, before[seam_parameter(1)..]);
     instance.event([1.0; 3], [0, 0]);
-    assert_eq!(&instance.values[seam_parameter(8, 1)..], &first_shape);
+    assert_eq!(&instance.values[seam_parameter(1)..], &first_shape);
     for step in (0..200).rev() {
         instance.event([step as f32 * 0.005; 3], [0, 0]);
     }
     assert_eq!(instance.values[SMOOTHING], 0);
-    assert_eq!(instance.values[strength_parameter(8)], -100);
+    assert_eq!(instance.values[WARP_AMOUNT], -100);
     assert_eq!(instance.values[trigger], 0);
-    assert_eq!(instance.values[centroid_parameter(8)], 0);
-    assert_eq!(&instance.values[seam_parameter(8, 1)..], &first_shape);
+    assert_eq!(instance.values[WARP_POSITION], 0);
+    assert_eq!(&instance.values[seam_parameter(1)..], &first_shape);
     assert_eq!(instance.values[PITCH], 40);
     // Slow motion must accumulate instead of disappearing in integer rounding.
     for step in 1..=100 {
         instance.event([step as f32 * 0.0002; 3], [0, 0]);
     }
     assert!(instance.values[SMOOTHING] > 0);
-    assert!(instance.values[strength_parameter(8)] > -100);
-    assert!(instance.values[centroid_parameter(8)] > 0);
+    assert!(instance.values[WARP_AMOUNT] > -100);
+    assert!(instance.values[WARP_POSITION] > 0);
     assert_eq!(instance.values[PITCH], 40);
     instance.draw();
     TEXT.with(|text| {
@@ -1502,7 +1474,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
             && s == &std::format!("Smooth {}", instance.values[SMOOTHING])));
     });
     // Changing modes alongside pot movement re-primes pickup without edits.
-    instance.change(strength_parameter(8), 0);
+    instance.change(WARP_AMOUNT, 0);
     // Visit Tuning, then click again to return to Segment mode.
     instance.event_buttons([0.5; 3], [0, 0], ENCODER_BUTTON_R, 0);
     instance.event_buttons([0.5; 3], [0, 0], 0, ENCODER_BUTTON_R);
@@ -1548,14 +1520,14 @@ fn editor_selection_relative_pots_and_permanent_footer() {
     let mut instance = Instance::new(32);
     instance.event([0.5; 3], [0, 0]);
     instance.event([0.51; 3], [0, 1]);
-    assert_eq!(editor_parameter(32, 0, 0, 1), Some(seam_parameter(32, 1)));
+    assert_eq!(editor_parameter(32, 0, 0, 1), Some(seam_parameter(1)));
     assert!(instance.values[segment_parameter(0, 2)] > 0);
     assert_eq!(instance.values[SMOOTHING], 0);
     instance.event([0.51; 3], [31, 0]);
     let previous = instance.values[segment_parameter(31, 0)];
     instance.event([0.52; 3], [0, 0]);
     assert!(instance.values[segment_parameter(31, 0)] > previous);
-    assert_eq!(editor_parameter(32, 31, 1, 1), Some(seam_parameter(32, 1)));
+    assert_eq!(editor_parameter(32, 31, 1, 1), Some(seam_parameter(1)));
     let mut samples = [0.0; LAST_BUS * 64];
     for _ in 0..200 {
         instance.render(&mut samples);
@@ -1672,7 +1644,7 @@ fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
     for voices in [1, 4, 10] {
         let mut mixed = Instance::with_voices(8, voices);
         mixed.change(OUTPUT_MODE, 1);
-        mixed.change(midi_channel_parameter(8), 1);
+        mixed.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
             mixed.midi(0x90, 60 + voice as u8, 100);
         }
@@ -1680,7 +1652,7 @@ fn shared_midi_output_matches_independent_notes_with_the_existing_gate_fades() {
             .map(|voice| {
                 let mut mono = Instance::new(8);
                 mono.change(OUTPUT_MODE, 1);
-                mono.change(midi_channel_parameter(8), 1);
+                mono.change(MIDI_CHANNEL, 1);
                 mono.midi(0x90, 60 + voice as u8, 100);
                 mono
             })
@@ -1792,7 +1764,7 @@ fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activ
         }
         instance.change(OUTPUT, 13);
         instance.change(OUTPUT_MODE, 1);
-        instance.change(midi_channel_parameter(segments as usize), 1);
+        instance.change(MIDI_CHANNEL, 1);
         instance.change(SMOOTHING, 37);
         for voice in 0..voices {
             instance.midi(0x90, 48 + voice as u8, 100);
@@ -1801,17 +1773,10 @@ fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activ
         for block in 0..400 {
             if block % 16 == 0 {
                 instance.change(
-                    curve_parameter(
-                        segments as usize,
-                        block / 16 % segments as usize,
-                        voices as usize,
-                    ),
+                    curve_parameter(block / 16 % segments as usize, voices as usize),
                     (block as i16 % 201) - 100,
                 );
-                instance.change(
-                    strength_parameter(segments as usize),
-                    (block as i16 % 201) - 100,
-                );
+                instance.change(WARP_AMOUNT, (block as i16 % 201) - 100);
             }
             instance.render(&mut samples);
             instance.draw();
@@ -1826,30 +1791,30 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
         let mut instance = Instance::with_voices(8, voices);
         let voices = voices as usize;
         instance.change(PITCH, 69);
-        instance.change(voice_transpose_parameter(8, voices, 0), 7);
-        instance.change(voice_fine_parameter(8, voices, 0), -25);
+        instance.change(voice_transpose_parameter(0), 7);
+        instance.change(voice_fine_parameter(0), -25);
         let original = instance.values.clone();
         let mut samples = [0.0; LAST_BUS * 24];
         instance.render(&mut samples);
         let mut expected = std::vec![(PITCH, false)];
         for voice in 0..voices {
-            expected.push((voice_pitch_parameter(8, voice), false));
-            expected.push((voice_transpose_parameter(8, voices, voice), false));
+            expected.push((voice_pitch_parameter(voice), false));
+            expected.push((voice_transpose_parameter(voice), false));
         }
         GRAY_CALLS.with(|calls| assert_eq!(&*calls.borrow(), &expected));
         GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
         instance.render(&mut samples);
         GRAY_CALLS.with(|calls| assert!(calls.borrow().is_empty()));
-        instance.change(midi_channel_parameter(8), 1);
+        instance.change(MIDI_CHANNEL, 1);
         for item in &mut expected {
             item.1 = true;
         }
         GRAY_CALLS.with(|calls| assert_eq!(&*calls.borrow(), &expected));
         GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
-        instance.change(midi_channel_parameter(8), 4);
+        instance.change(MIDI_CHANNEL, 4);
         instance.render(&mut samples);
         GRAY_CALLS.with(|calls| assert!(calls.borrow().is_empty()));
-        instance.change(midi_channel_parameter(8), 0);
+        instance.change(MIDI_CHANNEL, 0);
         for item in &mut expected {
             item.1 = false;
         }
@@ -1862,7 +1827,7 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
 fn restored_midi_mode_grays_controls_on_first_audio_callback() {
     let mut instance = Instance::with_voices(32, 10);
     // Model a host restoring values before invoking any parameter notifications.
-    instance.values[midi_channel_parameter(32)] = 1;
+    instance.values[MIDI_CHANNEL] = 1;
     instance.render(&mut [0.0; LAST_BUS * 24]);
     GRAY_CALLS.with(|calls| {
         let calls = calls.borrow();
@@ -1876,7 +1841,7 @@ fn restored_midi_mode_grays_controls_on_first_audio_callback() {
 fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
     let mut instance = Instance::new(8);
     instance.change(PITCH, 69);
-    instance.change(midi_channel_parameter(8), 1);
+    instance.change(MIDI_CHANNEL, 1);
     instance.event([0.5; 3], [0, 0]);
     instance.click_right([0.5; 3]);
     instance.click_right([0.5; 3]);
@@ -1888,7 +1853,7 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
     assert!(instance.values[LEVEL] > 50);
     instance.draw();
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[5, 15, 15]));
-    instance.change(midi_channel_parameter(8), 0);
+    instance.change(MIDI_CHANNEL, 0);
     for pot in [0.555, 0.560, 0.565] {
         instance.event([pot; 3], [0, 0]);
     }
@@ -1914,30 +1879,30 @@ fn per_voice_tuning_adds_to_cv_root_and_fine_but_midi_ignores_transpose_and_cv()
     let mut instance = Instance::with_voices(8, 2);
     instance.change(PITCH, 69);
     instance.change(FINE, 25);
-    instance.change(voice_fine_parameter(8, 2, 0), -25);
-    instance.change(voice_fine_parameter(8, 2, 1), 25);
-    instance.change(voice_transpose_parameter(8, 2, 0), 12);
-    instance.change(voice_transpose_parameter(8, 2, 1), -12);
-    instance.change(voice_pitch_parameter(8, 0), 1);
-    instance.change(voice_pitch_parameter(8, 1), 2);
+    instance.change(voice_fine_parameter(0), -25);
+    instance.change(voice_fine_parameter(1), 25);
+    instance.change(voice_transpose_parameter(0), 12);
+    instance.change(voice_transpose_parameter(1), -12);
+    instance.change(voice_pitch_parameter(0), 1);
+    instance.change(voice_pitch_parameter(1), 2);
     let mut samples = [0.0; LAST_BUS * 24];
     samples[..24].fill(1.0);
     samples[24..48].fill(2.0);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 0, 2.0);
     assert_cached_octave(&instance, 1, 1.0 + 50.0 / 1200.0);
-    instance.change(midi_channel_parameter(8), 1);
+    instance.change(MIDI_CHANNEL, 1);
     instance.change(PITCH, 0);
     instance.midi(0x90, 69, 100);
     instance.midi(0x90, 81, 100);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 0, 0.0);
     assert_cached_octave(&instance, 1, 1.0 + 50.0 / 1200.0);
-    instance.change(voice_transpose_parameter(8, 2, 1), 48);
+    instance.change(voice_transpose_parameter(1), 48);
     samples[..48].fill(-5.0);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 1, 1.0 + 50.0 / 1200.0);
-    instance.change(voice_fine_parameter(8, 2, 1), -25);
+    instance.change(voice_fine_parameter(1), -25);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 1, 1.0);
 }
@@ -1950,8 +1915,8 @@ fn voice_prefixes_cover_only_voice_parameters_and_respect_small_buffers() {
         OUTPUT_MODE as i32,
         PITCH as i32,
         FINE as i32,
-        midi_channel_parameter(8) as i32,
-        seam_parameter(8, 10) as i32,
+        MIDI_CHANNEL as i32,
+        seam_parameter(10) as i32,
         -1,
         i32::MAX,
     ] {
@@ -1959,7 +1924,7 @@ fn voice_prefixes_cover_only_voice_parameters_and_respect_small_buffers() {
     }
     let mut context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
     for voice in [0, 9] {
-        let parameter = voice_transpose_parameter(8, 10, voice) as i32;
+        let parameter = voice_transpose_parameter(voice) as i32;
         let expected = std::format!("V{}:", voice + 1);
         for capacity in 0..=6 {
             let mut buffer = [0x55 as c_char; 8];
@@ -1995,7 +1960,7 @@ fn pot_push_resets_current_control_once_per_press_and_preserves_pickup() {
                             editor_parameter(n, selected as usize, [0, 2, 1][pot], voices as usize)
                                 .unwrap()
                         }
-                        1 => [centroid_parameter(n), strength_parameter(n), SMOOTHING][pot],
+                        1 => [WARP_POSITION, WARP_AMOUNT, SMOOTHING][pot],
                         _ => [PITCH, FINE, LEVEL][pot],
                     };
                     let definition = unsafe { *(*instance.base).parameters.add(parameter) };
@@ -2049,7 +2014,7 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     instance.change(PITCH, 100);
     instance.change(FINE, 50);
     instance.change(LEVEL, 80);
-    instance.change(midi_channel_parameter(8), 1);
+    instance.change(MIDI_CHANNEL, 1);
     instance.event([0.8; 3], [0, 0]);
     instance.click_right([0.8; 3]);
     instance.click_right([0.8; 3]);
@@ -2059,7 +2024,7 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     assert_eq!(instance.values[FINE], 0);
     assert_eq!(instance.values[LEVEL], 50);
     instance.event_buttons([0.8; 3], [0, 0], 0, buttons);
-    instance.change(midi_channel_parameter(8), 0);
+    instance.change(MIDI_CHANNEL, 0);
     instance.event_buttons([0.8; 3], [0, 0], POT_BUTTON_L, 0);
     assert_eq!(instance.values[PITCH], 57);
 }

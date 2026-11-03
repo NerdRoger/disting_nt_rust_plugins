@@ -98,7 +98,7 @@ native antialiased float-coordinate drawing API; this does not filter the audio.
 All three modes show the vertical segment dividers as one-pixel dots spaced three
 pixels apart, at brightness 1 (the lowest nonzero level). The horizontal zero
 axis stays solid at brightness 1, and the thicker warp position marker stays solid.
-This keeps warp position/strength changes visible with less prominent dividers.
+This keeps Warp Position/Warp Amount changes visible with less prominent dividers.
 Full-brightness boundary handles in Segment mode mark both
 ends of the selected segment above the curves. The bright trace is independent
 of pitch and the audio path's automatic

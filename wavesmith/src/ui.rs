@@ -94,6 +94,12 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
             state.ui.residual = [0.0; 3];
         }
     }
+    let midi = context
+        .read_parameters()
+        .value(MIDI_CHANNEL)
+        .unwrap_or(0)
+        .clamp(0, 17)
+        != 0;
     for (pot, (mask, button, field)) in [
         (POT_L, POT_BUTTON_L, 0),
         (POT_C, POT_BUTTON_C, 2),
@@ -104,66 +110,57 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
     {
         let selected = context.state().ui.selected;
         let mode = context.state().ui.mode;
-        let (parameter, min, max) = match mode {
-            EditMode::Warp => match pot {
-                0 => (
-                    Some(centroid_parameter(context.state().count)),
-                    0,
-                    dsp::CENTROID_MAX,
-                ),
-                1 => (Some(strength_parameter(context.state().count)), -100, 100),
-                _ => (Some(SMOOTHING), 0, 100),
-            },
-            EditMode::Tuning => match pot {
-                0 => (Some(PITCH), 0, 127),
-                1 => (Some(FINE), -100, 100),
-                _ => (Some(LEVEL), 0, 100),
-            },
-            EditMode::Segment => (
-                editor_parameter(
-                    context.state().count,
-                    selected,
-                    field,
-                    context.state().voice_count,
-                ),
-                -100,
-                100,
+        let parameter = match mode {
+            EditMode::Warp => Some(match pot {
+                0 => WARP_POSITION,
+                1 => WARP_AMOUNT,
+                _ => SMOOTHING,
+            }),
+            EditMode::Tuning => Some(match pot {
+                0 => PITCH,
+                1 => FINE,
+                _ => LEVEL,
+            }),
+            EditMode::Segment => editor_parameter(
+                context.state().count,
+                selected,
+                field,
+                context.state().voice_count,
             ),
         };
-        let midi = context
-            .read_parameters()
-            .value(midi_channel_parameter(context.state().count))
-            .unwrap_or(0)
-            .clamp(0, 17)
-            != 0;
-        let locked = parameter.is_none() || (parameter == Some(PITCH) && midi);
+        // Use the host definition for pickup bounds and resets so these stay
+        // consistent with parameter-page editing as controls evolve.
+        let range = parameter.and_then(|p| {
+            context
+                .read_parameters()
+                .definition(p)
+                .map(|d| (d.min, d.max, d.default))
+        });
+        let (min, max, default) = range.unwrap_or((-100, 100, 0));
+        let locked = range.is_none() || (parameter == Some(PITCH) && midi);
         let value = parameter
             .and_then(|p| context.read_parameters().value(p))
             .unwrap_or(0);
         let pressed = data.controls as u32 & button != 0 && data.last_buttons as u32 & button == 0;
         if pressed && !locked {
             if let Some(parameter) = parameter {
-                let reset_value = context.read_parameters().definition(parameter).map(|d| {
-                    if mode == EditMode::Segment && pot != 1 {
-                        0
-                    } else {
-                        d.default
-                    }
-                });
-                if let Some(reset_value) = reset_value {
-                    // Reset the actual host parameter and rebase pickup at the
-                    // current physical position. Holding/releasing cannot undo it.
-                    {
-                        let ui = &mut context.state_mut().ui;
-                        ui.previous[pot] = data.pots[pot];
-                        ui.residual[pot] = 0.0;
-                        ui.last_written[pot] = reset_value;
-                    }
-                    if value != reset_value {
-                        let _ = context.parameters().set(parameter, reset_value);
-                    }
-                    continue;
+                let reset_value = if mode == EditMode::Segment && pot != 1 {
+                    0
+                } else {
+                    default
+                };
+                // Reset the actual host parameter and rebase pickup at the
+                // current physical position. Holding/releasing cannot undo it.
+                {
+                    let ui = &mut context.state_mut().ui;
+                    ui.previous[pot] = data.pots[pot];
+                    ui.residual[pot] = 0.0;
+                    ui.last_written[pot] = reset_value;
                 }
+                if value != reset_value {
+                    let _ = context.parameters().set(parameter, reset_value);
+                }
+                continue;
             }
         }
         let updated = {
@@ -193,13 +190,7 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
             };
             ui.previous[pot] = data.pots[pot];
             if let Some(updated) = updated {
-                // Binary triggers switch halfway through the remaining travel
-                // rather than requiring the pot to reach its physical stop.
-                let whole = if max == 1 {
-                    (updated + 0.5) as i16
-                } else {
-                    updated as i16
-                };
+                let whole = updated as i16;
                 ui.residual[pot] = updated - whole as f32;
                 ui.last_written[pot] = whole;
                 Some(whole)
@@ -294,20 +285,20 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
                 2,
                 b"Left ",
                 editor_parameter(n, selected, 0, context.state().voice_count)
-                    .unwrap_or(seam_parameter(n, context.state().voice_count)),
+                    .unwrap_or(seam_parameter(context.state().voice_count)),
                 0,
             ),
             (
                 102,
                 b"Curve ",
-                curve_parameter(n, selected, context.state().voice_count),
+                curve_parameter(selected, context.state().voice_count),
                 0,
             ),
             (
                 190,
                 b"Right ",
                 editor_parameter(n, selected, 1, context.state().voice_count)
-                    .unwrap_or(seam_parameter(n, context.state().voice_count)),
+                    .unwrap_or(seam_parameter(context.state().voice_count)),
                 0,
             ),
         ],
@@ -317,24 +308,15 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
             (198, b"Level ", LEVEL, 50),
         ],
         EditMode::Warp => [
-            (
-                2,
-                b"Warp Pos ",
-                centroid_parameter(n),
-                dsp::CENTROID_DEFAULT,
-            ),
-            (102, b"Warp Amt ", strength_parameter(n), 0),
+            (2, b"Warp Pos ", WARP_POSITION, dsp::WARP_POSITION_DEFAULT),
+            (102, b"Warp Amt ", WARP_AMOUNT, 0),
             (198, b"Smooth ", SMOOTHING, 0),
         ],
     };
     for (x, prefix, parameter, default) in header {
         let value = parameters.value(parameter).unwrap_or(default);
         if parameter == PITCH {
-            let midi = parameters
-                .value(midi_channel_parameter(n))
-                .unwrap_or(0)
-                .clamp(0, 17)
-                != 0;
+            let midi = parameters.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) != 0;
             pitch_note(&mut canvas, x, value, if midi { 5 } else { header_color });
         } else {
             number(&mut canvas, x, prefix, value, header_color);
@@ -345,7 +327,7 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     if state.ui.mode == EditMode::Segment {
         canvas.shape(Shape::Rectangle, left, 14, right, 42, 1);
     }
-    // Keep the dim grid visible while adjusting centroid/strength in either mode.
+    // Keep the dim grid visible in every mode, including while adjusting warp.
     canvas.shape(Shape::Line, 0, 28, 255, 28, 1);
     for i in 1..n {
         let x = (source.boundary_position(i) * 255.0) as i32;
@@ -387,7 +369,7 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
     if state.ui.mode == EditMode::Warp {
         // Draw over the waveform so the full-brightness core and black margins
         // remain visible. Keep the complete four-pixel marker on screen at either edge.
-        let center = source.centroid.clamp(0, dsp::CENTROID_MAX) as i32;
+        let center = source.warp_position.clamp(0, dsp::WARP_POSITION_MAX) as i32;
         let marker_left = (center - 1).clamp(0, 252);
         canvas.shape(Shape::Rectangle, marker_left, 14, marker_left + 3, 42, 0);
         canvas.shape(
