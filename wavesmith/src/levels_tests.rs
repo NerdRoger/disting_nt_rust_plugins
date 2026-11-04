@@ -219,3 +219,24 @@ fn decibel_level_has_default_headroom_true_mute_and_correct_amplitude_ratios() {
         assert_eq!(level.amplitude(db), actual); // Unchanged settings reuse the cached gain.
     }
 }
+
+#[test]
+fn stereo_level_control_links_gain_and_peak_protection_without_moving_the_image() {
+    let mut control = LevelControl::new(48000);
+    for block in 0..4000 {
+        let mut left = [0.0; CHUNK];
+        let mut right = [0.0; CHUNK];
+        let mut power = 0.0;
+        for (i, (l, r)) in left.iter_mut().zip(&mut right).enumerate() {
+            *l = 20.0
+                * (core::f32::consts::TAU * 110.0 * (block * CHUNK + i) as f32 / 48000.0).sin();
+            *r = *l * 0.3;
+            power += *l * *l + *r * *r;
+        }
+        control.process_stereo(&mut left, &mut right, power, 10.0, PEAK_CEILING);
+        for (&l, &r) in left.iter().zip(&right) {
+            assert!(l.abs() <= PEAK_CEILING + 0.000001);
+            assert!((r - l * 0.3).abs() < 0.000001);
+        }
+    }
+}

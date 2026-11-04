@@ -142,10 +142,32 @@ to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
 triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
 and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
-The Output page follows Oscillator and contains shared Output and Output mode
-(add/replace).
+The Output page follows Oscillator and contains Left Output, Right Output, and
+shared Output mode (add/replace), in that order. Left Output defaults to bus 13
+(physical output 1); Right Output defaults to None. Two distinct assigned buses
+enable stereo automatically. One assigned bus, or both outputs selecting the same
+bus, produces full-level mono through that bus. Both None disables voice audio.
+There is no Stereo parameter or additional specification.
+
+Each voice has Pan from 0% (left) through 50% (center) to 100% (right), default 50%.
+Pan is grayed out and ignored in mono; its stored value is retained. Stereo uses
+square-root equal-power gains, with about -3 dB per side at center. Pan gains are
+cached and changes are smoothed; activating stereo starts from the stored positions.
+Each oscillator is generated once and then distributed to the two mix buffers.
+The mono path retains its previous gain behavior. Shared RMS measurement uses
+the combined left/right energy and actual panned per-voice energy; one gain and
+one linked peak detector control both sides, preserving the stereo image.
+Add/replace applies to both assigned buses. Pitch CV is snapshotted before either
+bus is written. Duplicate output buses are written once as mono. New output destinations fade in over 20 ms; disconnected buses are no longer
+written. Changing only the other stereo output leaves an unchanged output's
+samples and level-controller history intact. Entering or leaving stereo ramps
+each voice's effective gains on the live waveform, rather than blending from a
+held sample; centered stereo settles at -3 dB per side. Existing pan settings are
+retained and restored when stereo becomes available again. Live routing edits do
+not restart RMS or peak protection; reconnecting after silence still acquires
+startup attenuation.
 Every instance has Voice 1 through Voice 10 pages, containing Pitch CV,
-Transpose, Fine tune, and Active in that order. Parameter names are shared; the API's
+Transpose, Fine tune, Pan, and Active in that order. Parameter names are shared; the API's
 parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
 a navigation group so switching voices retains the selected parameter row.
 Transpose ranges from -48 to +48 semitones; per-voice Fine tune ranges from -100
@@ -157,7 +179,7 @@ Re-enabling a MIDI voice makes it available for new notes without resuming an
 old held key. CV voices fade in when re-enabled. Active remains editable in
 both MIDI and CV modes and uses the same V1: through V10: parameter prefixes.
 Output routing remains shared.
-Output defaults to bus 13 / physical output 1. Output None disables all voice
+When Left Output and Right Output are both None, Wavesmith disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
 shared waveform rebuilding and edit fades can still finish while silent.
 An enabled output mixes all active voices through automatic RMS level control.
@@ -194,10 +216,10 @@ It adds no FFTs, table buffers, audio delay or parameter/specification changes.
 Two 16-sample arrays and a small controller are initialized directly in the
 host-allocated state; the steady oscillator and pitch caches remain in use.
 
-Replace writes only the controlled mix. Add preserves the existing bus signal
-and adds the controlled Wavesmith contribution; unrelated upstream audio can
-still make the final bus exceed the ceiling. Output None and MIDI Channel
-changes restart the controller. MIDI Channel changes also apply a 20 ms output
+Replace writes only the controlled mix on each assigned output. Add preserves
+the existing bus signal and adds the controlled Wavesmith contribution; unrelated
+upstream audio can still make the final bus exceed the ceiling. Disabling both
+outputs and changing MIDI Channel restart the controller. MIDI Channel changes also apply a 20 ms output
 transition from the last emitted sample to the new normalized mix, avoiding a
 step when changing between MIDI and continuous CV playback. The first audible
 chunk acquires the new attenuation immediately instead of starting the full CV
@@ -238,7 +260,7 @@ Bend is tracked independently per MIDI channel, affects held/releasing and new
 notes, and is reset when MIDI Channel changes. It combines with both fine-tune
 offsets; CV mode is unaffected. Bend-range RPN messages are not handled.
 Velocity does not change loudness. Sustain and aftertouch are not handled. All Notes Off releases notes on its channel; All Sound Off silences them
-immediately. Changing MIDI Channel clears held notes, as does setting shared Output to None. MIDI allocation adds only small voice states, without extra waveform
+immediately. Changing MIDI Channel clears held notes, as does setting both outputs to None. MIDI allocation adds only small voice states, without extra waveform
 tables or FFT work.
 
 With N segments there are N level parameters named Boundary 00, Boundary 01,
@@ -382,8 +404,8 @@ contribution ceiling. Asymmetric waves can have DC offset.
 The audio bank is fixed at six tables and the voice pool at ten slots.
 Only Voice 1 is active by default. Segments is the only specification.
 The page order is Oscillator, Output, Shape, Voice 1 through Voice 10, Waveform.
-Underlying parameter ordinals now follow that same order: 18 shared controls,
-four parameters for each of ten voices, then interleaved boundary/curve values.
+Underlying parameter ordinals now follow that same order: 19 shared controls,
+five parameters for each of ten voices, then interleaved boundary/curve values.
 Boundary 00 is one shared seam parameter shown again at the end of Waveform.
 
 This revision changes parameter ordinals. Recreate earlier instances/presets and
@@ -412,10 +434,17 @@ procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
 independent segment-width editing, and per-boundary smoothing are deferred.
 
-There is no Voices specification. The 58 fixed shared/voice parameters precede
+There is no Voices specification. The 69 fixed shared/voice parameters precede
 all waveform boundaries and curves, which are appended as interleaved pairs.
-The total is 58 + 2 * Segments (62–122 parameters). Changing Segments preserves
+The total is 69 + 2 * Segments (73–133 parameters). Changing Segments preserves
 the identities and ordinals of all surviving controls. Removed segment values
 are discarded by the host; newly added segments receive their defaults.
 This is a one-time specification/layout change from older builds: review existing
 presets and CV mappings, especially presets saved with fewer than ten voices.
+
+Stereo adds Right Output and one Pan control per voice. This shifts later
+parameter ordinals once; review presets and CV mappings created with earlier
+builds. Once using this layout, changing Segments still preserves all surviving
+parameter identities and ordinals. The waveform tables and FFT work are shared
+between channels; stereo adds small preallocated pan caches, a right mix buffer,
+and a second transition state rather than another oscillator bank.

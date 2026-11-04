@@ -89,22 +89,62 @@ impl LevelControl {
     /// `voice_weight` is the mean sum of squared MIDI gates (unity gates in CV).
     /// A barely-open voice therefore contributes barely any normalization weight.
     pub fn process(&mut self, mix: &mut [f32], voice_power: f32, voice_weight: f32, ceiling: f32) {
+        self.process_channels::<false>(mix, &mut [], voice_power, voice_weight, ceiling);
+    }
+
+    pub fn process_stereo(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        voice_power: f32,
+        voice_weight: f32,
+        ceiling: f32,
+    ) {
+        self.process_channels::<true>(left, right, voice_power, voice_weight, ceiling);
+    }
+
+    fn process_channels<const STEREO: bool>(
+        &mut self,
+        mix: &mut [f32],
+        right: &mut [f32],
+        voice_power: f32,
+        voice_weight: f32,
+        ceiling: f32,
+    ) {
+        if STEREO && mix.len() != right.len() {
+            mix.fill(0.0);
+            right.fill(0.0);
+            self.reset();
+            return;
+        }
         if mix.is_empty() {
             return;
         }
         if voice_weight <= 0.0 || ceiling <= 0.0 {
             mix.fill(0.0);
+            if STEREO {
+                right.fill(0.0);
+            }
             self.reset();
             return;
         }
         let frames = mix.len();
-        let power = mix.iter().map(|v| v * v).sum::<f32>() / frames as f32;
+        let mut total_power = mix.iter().map(|v| v * v).sum::<f32>();
+        if STEREO {
+            total_power += right.iter().map(|v| v * v).sum::<f32>();
+        }
+        let power = total_power / frames as f32;
         if power <= 0.000000000001 {
             // Hold both detectors and gain through silence/cancellation instead
             // of letting stale detector history move the gain without sound.
             let gain = self.gain.min(self.peak_gain);
             for sample in mix {
                 *sample *= gain;
+            }
+            if STEREO {
+                for sample in right {
+                    *sample *= gain;
+                }
             }
             return;
         }
@@ -132,7 +172,10 @@ impl LevelControl {
             self.recovery
         };
         let next_gain = self.gain + (speed * frames as f32).min(1.0) * (target - self.gain);
-        let peak = mix.iter().fold(0.0f32, |peak, v| peak.max(v.abs()));
+        let mut peak = mix.iter().fold(0.0f32, |peak, v| peak.max(v.abs()));
+        if STEREO {
+            peak = right.iter().fold(peak, |peak, v| peak.max(v.abs()));
+        }
         let safe_gain = if peak > ceiling { ceiling / peak } else { 1.0 };
         // Analyze the complete small chunk before emitting it. A held ceiling
         // avoids releasing on every waveform trough; peak recovery takes 200 ms.
@@ -150,6 +193,12 @@ impl LevelControl {
         for (i, sample) in mix.iter_mut().enumerate() {
             let gain = start + gain_step * (i + 1) as f32;
             *sample *= gain.min(self.peak_gain);
+        }
+        if STEREO {
+            for (i, sample) in right.iter_mut().enumerate() {
+                let gain = start + gain_step * (i + 1) as f32;
+                *sample *= gain.min(self.peak_gain);
+            }
         }
         self.gain = next_gain;
     }
@@ -184,6 +233,25 @@ impl ModeTransition {
         }
     }
 
+    pub fn current(&self) -> f32 {
+        self.last
+    }
+
+    pub fn start_from(&mut self, sample: f32) {
+        self.last = sample;
+        self.from = sample;
+        self.remaining = self.length;
+        self.rendered = true;
+    }
+
+    /// Adopt an already-connected destination without freezing its waveform.
+    pub fn adopt(&mut self, sample: f32) {
+        self.last = sample;
+        self.from = sample;
+        self.remaining = 0;
+        self.rendered = true;
+    }
+
     pub fn silence(&mut self) {
         self.last = 0.0;
         self.from = 0.0;
@@ -211,7 +279,7 @@ impl ModeTransition {
 
 // Positive finite input <= 1. Newton refinement avoids importing an unprovided
 // sqrtf firmware symbol or a libm dependency; the bit estimate bounds iteration.
-fn sqrt(value: f32) -> f32 {
+pub(super) fn sqrt(value: f32) -> f32 {
     if value <= 0.0 {
         return 0.0;
     }
