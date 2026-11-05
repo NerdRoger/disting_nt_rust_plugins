@@ -508,3 +508,6 @@ The original render measurement and displayed footer average are unchanged.
 Use `mean_callback_cycles` and `callback_change_percent` for whole-body
 comparisons; moving work between stages must not count as a CPU improvement.
 The monitor also decodes the original report type 1.
+
+Oscillator pitch/level targets are prepared once per audio callback, before
+internal chunk rendering. Per-sample smoothing and gate behavior are unchanged.

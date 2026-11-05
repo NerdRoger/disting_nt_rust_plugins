@@ -953,6 +953,9 @@ impl Plugin for Wavesmith {
             } else {
                 *pitch = oscillator.frequency(*pitch);
             }
+            if frames > 0 {
+                oscillator.prepare(*pitch, state.sample_rate, level);
+            }
         }
         let setup_end = distingnt_api::api::cpu_cycle_count();
         state.engine.request(wave);
@@ -994,7 +997,7 @@ impl Plugin for Wavesmith {
                         continue;
                     }
                     voice_mix.fill(0.0);
-                    oscillator.prepare(frequency, state.sample_rate, level);
+
                     if (if midi_setting == 0 {
                         on && *cv_gain == 1.0
                     } else {
