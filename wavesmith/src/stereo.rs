@@ -116,6 +116,53 @@ impl Pan {
     }
     /// Return actual individual stereo energy for the linked RMS reference.
     pub fn mix(&mut self, voice: &[f32], left: &mut [f32], right: &mut [f32], slew: f32) -> f32 {
+        if !self.moving {
+            let count = voice.len().min(left.len()).min(right.len());
+            let full = count & !3;
+            let (left_gain, right_gain) = (self.left, self.right);
+            let mut power = 0.0;
+            if let (Some(v), Some(l), Some(r)) = (
+                voice.get(..full),
+                left.get_mut(..full),
+                right.get_mut(..full),
+            ) {
+                for ((v, l), r) in v
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(l.as_chunks_mut::<4>().0.iter_mut())
+                    .zip(r.as_chunks_mut::<4>().0.iter_mut())
+                {
+                    macro_rules! mix_sample {
+                        ($i:expr) => {{
+                            let a = v[$i] * left_gain;
+                            let b = v[$i] * right_gain;
+                            l[$i] += a;
+                            r[$i] += b;
+                            power += a * a + b * b;
+                        }};
+                    }
+                    mix_sample!(0);
+                    mix_sample!(1);
+                    mix_sample!(2);
+                    mix_sample!(3);
+                }
+            }
+            if let (Some(v), Some(l), Some(r)) = (
+                voice.get(full..count),
+                left.get_mut(full..count),
+                right.get_mut(full..count),
+            ) {
+                for ((&sample, l), r) in v.iter().zip(l).zip(r) {
+                    let a = sample * left_gain;
+                    let b = sample * right_gain;
+                    *l += a;
+                    *r += b;
+                    power += a * a + b * b;
+                }
+            }
+            return power;
+        }
         let mut power = 0.0;
         for ((&sample, left), right) in voice.iter().zip(left).zip(right) {
             let l = sample * self.left;
@@ -144,6 +191,36 @@ impl Pan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reference_mix(
+        pan: &mut Pan,
+        voice: &[f32],
+        left: &mut [f32],
+        right: &mut [f32],
+        slew: f32,
+    ) -> f32 {
+        let mut power = 0.0;
+        for ((&sample, left), right) in voice.iter().zip(left).zip(right) {
+            let l = sample * pan.left;
+            let r = sample * pan.right;
+            *left += l;
+            *right += r;
+            power += l * l + r * r;
+            if pan.moving {
+                let previous = (pan.left, pan.right);
+                pan.left += slew * (pan.target_left - pan.left);
+                pan.right += slew * (pan.target_right - pan.right);
+                if (pan.left - pan.target_left).abs() < 0.000002
+                    && (pan.right - pan.target_right).abs() < 0.000002
+                    || (pan.left, pan.right) == previous
+                {
+                    pan.left = pan.target_left;
+                    pan.right = pan.target_right;
+                    pan.moving = false;
+                }
+            }
+        }
+        power
+    }
     #[test]
     fn routing_infers_mono_stereo_and_duplicate_buses() {
         for (left, right, enabled, stereo, primary) in [
@@ -192,5 +269,59 @@ mod tests {
             pan.mix(&[1.0; 16], &mut [0.0; 16], &mut [0.0; 16], 1000.0 / 48000.0);
         }
         assert_eq!((pan.left, pan.right), (0.0, 1.0));
+    }
+    #[test]
+    fn unrolled_pan_matches_reference_for_all_positions_lengths_and_transitions() {
+        for frames in 0..=64 {
+            for position in 0..=100 {
+                let mut actual = Pan::new();
+                actual.prepare(position, true);
+                let mut expected = actual;
+                let mut voice = [0.0; 64];
+                for (i, v) in voice.iter_mut().enumerate() {
+                    *v = ((i * 73) % 257) as f32 / 32.0 - 4.0;
+                }
+                for block in 0..5 {
+                    match block {
+                        1 => {
+                            actual.prepare(100 - position, false);
+                            expected.prepare(100 - position, false);
+                        }
+                        2 => {
+                            actual.mono(false);
+                            expected.mono(false);
+                        }
+                        3 => {
+                            actual.prepare(position, true);
+                            expected.prepare(position, true);
+                        }
+                        _ => {}
+                    }
+                    let mut left = [0.375; 65];
+                    let mut right = [-0.25; 66];
+                    let mut el = left;
+                    let mut er = right;
+                    let power = actual.mix(
+                        &voice[..frames],
+                        &mut left[..frames + 1],
+                        &mut right[..frames + 2],
+                        0.05,
+                    );
+                    let ep = reference_mix(
+                        &mut expected,
+                        &voice[..frames],
+                        &mut el[..frames + 1],
+                        &mut er[..frames + 2],
+                        0.05,
+                    );
+                    assert_eq!(power.to_bits(), ep.to_bits());
+                    for (a, b) in left.iter().chain(&right).zip(el.iter().chain(&er)) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                    assert_eq!(actual.moving, expected.moving);
+                    assert_eq!(actual.gains(), expected.gains());
+                }
+            }
+        }
     }
 }
