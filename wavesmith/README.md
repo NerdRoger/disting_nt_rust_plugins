@@ -488,7 +488,7 @@ fails rather than comparing runs with different voice counts, modes, routing,
 sample rates or block sizes. It also reports missing telemetry sequence numbers.
 
 Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
-version `1` and report type `1`. All integer fields are little-endian base-128:
+version `1`; base report type `1` has the fields below. All integer fields are little-endian base-128:
 instance index (5 bytes), sequence (5), displayed average cycles (5), measured
 cycle sum (10), callback count (5), frame count (5), sample rate (5), last block
 size (5), followed by voice count, MIDI mode and stereo flags (one byte each).

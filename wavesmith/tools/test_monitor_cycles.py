@@ -38,6 +38,12 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result["mean_callback_cycles"],20000)
         self.assertEqual(result["mean_setup_cycles"],1500)
         self.assertEqual(result["mean_output_cycles"],3000)
+        with self.assertRaises(ValueError):
+            summarize([decode(packet()), row], "mixed")
+        data[-1] = 127
+        with self.assertRaises(ValueError):
+            decode(data)
+
 
     def test_sequence_wrap_and_large_counts(self):
         first = decode(packet(sequence=0xffffffff,total_cycles=0xffffffffffffffff))

@@ -90,3 +90,86 @@ Detailed CSV/JSON files and experiment binaries are under the ignored
 `target/wavesmith-profiling/` directory. They are local artifacts; this summary
 is retained in Git. The temporary footer overlay and profiling infrastructure
 remain available for future investigations.
+
+
+## Round 2: whole-callback and stage measurements
+
+The second round uses report type 2, committed as `f72c4de`, adding callback-body,
+setup, table-build, level-control and output/transition totals to the original
+render metric. The timer starts at entry to the Rust audio callback and stops
+before telemetry encoding/transmission. It includes normal bookkeeping and
+measurement overhead, but not the C ABI wrapper or USB send. Stage totals need
+not add to the callback total because chunk clearing and loop overhead are
+outside the individual stage timers.
+
+The same ten-voice stereo CV preset, 48 kHz and 24-frame callbacks were used.
+The toolchain was rustc 1.99.1 (58cf8f9c3 2026-10-13), with the existing size
+optimization/LTO profile. Reports were collected for 100 seconds after warmup;
+all completed runs had zero missing messages and matching workload metadata.
+Do not directly combine these numbers with round 1: adding instrumentation can
+change generated-code layout, and round 1 did not time the entire callback.
+
+| Build | Callback body | Setup | Render/mix | Level control | Callback change vs comparison build | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| round2-baseline | 47,263 | 7,765 | 32,086 | 4,469 | +0.00% | Baseline |
+| round2-prepare-once | 46,346 | 8,498 | 30,455 | 4,460 | -1.94% | Kept: 704bacf |
+| round2-controller-loops | 45,775 | 8,498 | 31,000 | 3,315 | -1.23% | Kept: c9f3e12 |
+| round2-slew-cache | 45,759 | 8,491 | 30,991 | 3,316 | -0.04% | Discarded: within variation |
+| round2-idle-wave | 45,743 | 8,505 | 31,384 | 3,316 | -0.07% | Discarded: within variation |
+| round2-exact-pitch-cache | 45,396 | 8,417 | 30,689 | 3,327 | -0.83% | Kept: a0b506b |
+| round2-baseline-control | 47,036 | 7,531 | 32,093 | 4,469 | -0.48% | Original build repeated |
+
+The preparation change moves work from render/mix into setup; the stage-only
+number would have exaggerated the improvement (5.08% versus 1.94% for the
+whole callback). The stereo-controller change saves about 1,144 cycles in level
+control, but some render overhead increases; the net improvement is 1.23%.
+Its separate left/right power accumulators preserve the original sum order,
+and paired gain application preserves each sample's original calculation.
+
+The sample-rate-only slew cache saved 0.04% overall and was discarded. The
+unchanged-waveform shortcut saved about 425 build-bookkeeping cycles, but code
+layout made rendering more expensive; only 0.07% remained overall, so it too was
+discarded, along with its candidate-specific tests. These are examples of why a
+local stage improvement is not sufficient evidence of lower total CPU usage.
+
+The retained exact-frequency cache is one callback-local pair of floats. Each
+voice's persistent cache is checked first; reuse requires a bit-identical final
+octave value. Independent detuning, every representable CV change, phase and
+smoothing remain intact. Tests compare the frequency values and oscillator
+cache state bit-for-bit with independent conversions, including 0.1-microvolt
+changes. Whole-callback improvement was 0.83%; not all of that gain should be
+attributed solely to fewer conversions, because render code layout also changes.
+
+A return to the original build measured 47,036 cycles, versus 47,263 initially
+(0.48% variation). Almost all of this variation is in setup; original-build
+render, build and controller stage means are stable. The final repeated selected
+build is recorded below. Gains should be read relative to both baselines rather
+than presented with more precision than the experiment supports.
+
+Hot code changed from 24,836 bytes for the instrumented round-2 baseline to
+24,812 bytes for the selected build. Cold DRAM code remains 3,460 bytes and
+read-only data remains 1,603 bytes. The exact conversion cache adds only a local
+8-byte pair; there is no added persistent tuning cache or waveform buffer.
+
+Shared pitch-smoothing trajectories were considered but not implemented here:
+independent detuning and voice activation require different state handling and
+would alter floating-point recurrence results. Those are a broader DSP redesign,
+not another exact-preserving loop optimization. The remaining small output stage
+already has a settled-transition fast path. Further arithmetic approximations
+or reductions in control-update frequency were also left out of this round.
+
+### Round-2 verification
+
+The final repeated selected build averaged **45,391 callback cycles**, with
+100 reports and no gaps. This agrees with its earlier 45,396-cycle run within
+0.02%. Compared with the first 47,263-cycle baseline it saves **3.96%**; compared
+with the returning 47,036-cycle baseline it saves **3.50%**.
+A practical conclusion is **about 3.5–4.0% less callback-body work in this round**,
+not a claim of that exact reduction for every preset or block size.
+
+All three successful changes were committed separately. The unchanged-waveform
+shortcut and slew cache, including candidate-only tests, were removed. The
+selected build is deployed with the same scratch preset, and telemetry streaming
+is disabled after collection. The help overlay and monitor remain available.
+Final validation passed all 113 Wavesmith tests, the repository checks and tests,
+the four Python monitor tests and ARM relocation checks.
