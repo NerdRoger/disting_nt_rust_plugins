@@ -325,7 +325,8 @@ refreshing bindings only when the selected table level changes, and computes
 sample indices and fractions once even when blending two tables. Moving-pitch
 runs specialize single-table/blended playback and real/imaginary storage lanes;
 selection changes redispatch before the affected sample without repeating its
-pitch update. Gate updates,
+pitch update. The per-sample pitch helper is explicitly inlined to avoid a
+function call and register-save overhead in each oscillator sample. Gate updates,
 level smoothing and edit-crossfade checks stay outside this moving-pitch loop.
 Level changes, note attack/release/steal and waveform crossfades retain the
 original general renderer. Table references are local to each render call, so

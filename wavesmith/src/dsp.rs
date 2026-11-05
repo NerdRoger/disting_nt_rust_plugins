@@ -723,6 +723,7 @@ impl Oscillator {
     }
 
     // Preserve the original per-sample recurrence and table-selection cadence.
+    #[inline(always)]
     fn advance_pitch(&mut self, engine: &Engine) -> bool {
         if self.pitch_moving {
             let previous = self.increment;
