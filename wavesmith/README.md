@@ -511,3 +511,7 @@ The monitor also decodes the original report type 1.
 
 Oscillator pitch/level targets are prepared once per audio callback, before
 internal chunk rendering. Per-sample smoothing and gate behavior are unchanged.
+
+The level controller combines stereo power/peak detection into one traversal
+and calculates each stereo gain-ramp value once. Left/right power sums and
+per-sample gain arithmetic retain the original accumulation and rounding order.

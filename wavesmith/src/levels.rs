@@ -129,6 +129,125 @@ impl LevelControl {
             return;
         }
         let frames = mix.len();
+        let (mut left_power, mut right_power) = (0.0, 0.0);
+        let (mut left_peak, mut right_peak) = (0.0f32, 0.0f32);
+        if STEREO {
+            for (&left, &right) in mix.iter().zip(right.iter()) {
+                left_power += left * left;
+                right_power += right * right;
+                left_peak = left_peak.max(left.abs());
+                right_peak = right_peak.max(right.abs());
+            }
+        } else {
+            for &sample in mix.iter() {
+                left_power += sample * sample;
+                left_peak = left_peak.max(sample.abs());
+            }
+        }
+        let total_power = if STEREO {
+            left_power + right_power
+        } else {
+            left_power
+        };
+        let peak = if STEREO {
+            left_peak.max(right_peak)
+        } else {
+            left_peak
+        };
+        let power = total_power / frames as f32;
+        if power <= 0.000000000001 {
+            // Hold both detectors and gain through silence/cancellation instead
+            // of letting stale detector history move the gain without sound.
+            let gain = self.gain.min(self.peak_gain);
+            for sample in mix {
+                *sample *= gain;
+            }
+            if STEREO {
+                for sample in right {
+                    *sample *= gain;
+                }
+            }
+            return;
+        }
+        // The floor retains a lone note's natural attack/release. With multiple
+        // notes, a new attack contributes progressively instead of halving the
+        // reference as soon as Note On arrives.
+        let reference = voice_power / (frames as f32 * voice_weight.max(1.0));
+        // Identical detector timing on both sides makes a fading chord's gain
+        // independent of its amplitude envelope. Never chase individual cycles.
+        let detector = (self.attack * frames as f32).min(1.0);
+        self.mix_power += detector * (power - self.mix_power);
+        self.reference_power += detector * (reference - self.reference_power);
+        let target = if self.mix_power > 0.0000000001 {
+            sqrt((self.reference_power / self.mix_power).clamp(0.0, 1.0))
+        } else {
+            self.gain // Silence must not cause gain recovery or noise amplification.
+        };
+        if self.prime_gain {
+            self.gain = target;
+            self.prime_gain = false;
+        }
+        let speed = if target < self.gain {
+            self.attack
+        } else {
+            self.recovery
+        };
+        let next_gain = self.gain + (speed * frames as f32).min(1.0) * (target - self.gain);
+        let safe_gain = if peak > ceiling { ceiling / peak } else { 1.0 };
+        // Analyze the complete small chunk before emitting it. A held ceiling
+        // avoids releasing on every waveform trough; peak recovery takes 200 ms.
+        if safe_gain < self.peak_gain {
+            self.peak_gain = safe_gain;
+            self.peak_hold = self.hold_frames;
+        } else if self.peak_hold > 0 {
+            self.peak_hold = self.peak_hold.saturating_sub(frames);
+        } else {
+            self.peak_gain +=
+                (5.0 * self.recovery * frames as f32).min(1.0) * (safe_gain - self.peak_gain);
+        }
+        let start = self.gain;
+        let gain_step = (next_gain - start) / frames as f32;
+        if STEREO {
+            for (i, (left, right)) in mix.iter_mut().zip(right.iter_mut()).enumerate() {
+                let gain = (start + gain_step * (i + 1) as f32).min(self.peak_gain);
+                *left *= gain;
+                *right *= gain;
+            }
+        } else {
+            for (i, sample) in mix.iter_mut().enumerate() {
+                let gain = start + gain_step * (i + 1) as f32;
+                *sample *= gain.min(self.peak_gain);
+            }
+        }
+        self.gain = next_gain;
+    }
+    #[cfg(test)]
+    fn process_channels_reference<const STEREO: bool>(
+        &mut self,
+        mix: &mut [f32],
+        right: &mut [f32],
+        voice_power: f32,
+        voice_weight: f32,
+        ceiling: f32,
+    ) {
+        if STEREO && mix.len() != right.len() {
+            mix.fill(0.0);
+            right.fill(0.0);
+            self.reset();
+            return;
+        }
+        if mix.is_empty() {
+            return;
+        }
+        if voice_weight <= 0.0 || ceiling <= 0.0 {
+            mix.fill(0.0);
+            if STEREO {
+                right.fill(0.0);
+            }
+            self.reset();
+            return;
+        }
+        let frames = mix.len();
         let mut total_power = mix.iter().map(|v| v * v).sum::<f32>();
         if STEREO {
             total_power += right.iter().map(|v| v * v).sum::<f32>();

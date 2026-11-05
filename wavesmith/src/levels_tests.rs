@@ -240,3 +240,92 @@ fn stereo_level_control_links_gain_and_peak_protection_without_moving_the_image(
         }
     }
 }
+
+#[test]
+fn fused_detector_and_stereo_gain_match_original_controller_bit_for_bit() {
+    for stereo in [false, true] {
+        for frames in [0, 1, 8, 16, 24, 64] {
+            let mut actual = LevelControl::new(48000);
+            let mut expected = actual;
+            for block in 0..1000 {
+                if block % 137 == 0 {
+                    actual.restart_for_mode_change();
+                    expected.restart_for_mode_change();
+                }
+                let mut left = [0.0; 64];
+                let mut right = [0.0; 64];
+                let mut voice_power = 0.0;
+                for (i, (l, r)) in left.iter_mut().zip(&mut right).enumerate().take(frames) {
+                    let amplitude = if block % 19 == 0 {
+                        0.0
+                    } else if block % 11 == 0 {
+                        20.0
+                    } else {
+                        2.5
+                    };
+                    *l = amplitude * ((i * 73 + block * 31) % 257) as f32 / 128.0 - amplitude;
+                    *r = *l * 0.37;
+                    voice_power += *l * *l + *r * *r;
+                }
+                let mut el = left;
+                let mut er = right;
+                let weight = if block % 29 == 0 {
+                    0.0
+                } else {
+                    1.0 + (block % 10) as f32
+                };
+                let ceiling = if block % 43 == 0 { 0.0 } else { 5.0 };
+                if stereo {
+                    actual.process_channels::<true>(
+                        &mut left[..frames],
+                        &mut right[..frames],
+                        voice_power,
+                        weight,
+                        ceiling,
+                    );
+                    expected.process_channels_reference::<true>(
+                        &mut el[..frames],
+                        &mut er[..frames],
+                        voice_power,
+                        weight,
+                        ceiling,
+                    );
+                } else {
+                    actual.process_channels::<false>(
+                        &mut left[..frames],
+                        &mut [],
+                        voice_power,
+                        weight,
+                        ceiling,
+                    );
+                    expected.process_channels_reference::<false>(
+                        &mut el[..frames],
+                        &mut [],
+                        voice_power,
+                        weight,
+                        ceiling,
+                    );
+                }
+                for (a, b) in left.iter().chain(&right).zip(el.iter().chain(&er)) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "stereo {stereo}, frames {frames}, block {block}"
+                    );
+                }
+                for (a, b) in [
+                    (actual.mix_power, expected.mix_power),
+                    (actual.reference_power, expected.reference_power),
+                    (actual.gain, expected.gain),
+                    (actual.peak_gain, expected.peak_gain),
+                ] {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                assert_eq!(
+                    (actual.peak_hold, actual.prime_gain),
+                    (expected.peak_hold, expected.prime_gain)
+                );
+            }
+        }
+    }
+}
