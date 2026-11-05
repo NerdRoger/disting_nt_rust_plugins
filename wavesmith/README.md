@@ -322,7 +322,10 @@ pitch uses the cached integer phase step, gain, table selection and blend.
 Changing pitch uses a dedicated loop that preserves the exact per-sample pitch
 recurrence and anti-aliasing selection cadence. It resolves table storage once,
 refreshing bindings only when the selected table level changes, and computes
-sample indices and fractions once even when blending two tables. Gate updates,
+sample indices and fractions once even when blending two tables. Moving-pitch
+runs specialize single-table/blended playback and real/imaginary storage lanes;
+selection changes redispatch before the affected sample without repeating its
+pitch update. Gate updates,
 level smoothing and edit-crossfade checks stay outside this moving-pitch loop.
 Level changes, note attack/release/steal and waveform crossfades retain the
 original general renderer. Table references are local to each render call, so
