@@ -495,3 +495,6 @@ size (5), followed by voice count, MIDI mode and stereo flags (one byte each).
 The monitor calculates a weighted cycle average from sums and counts over the
 whole run rather than averaging occasional screen readings. One report covers
 approximately one second of audio, with no extra work inside the timed loops.
+
+Measured playback optimization results and decisions are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).

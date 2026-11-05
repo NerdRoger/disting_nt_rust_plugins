@@ -34,6 +34,7 @@ test:
 	python3 tools/check_layers.py
 	python3 distingnt-sys/tools/test_dram_callees.py
 	python3 tools/check_api.py
+	python3 -m unittest discover -s wavesmith/tools -p test_monitor_cycles.py
 	python3 distingnt-sys/tools/test_static_placement.py
 	g++ -g -fsanitize=address,undefined -std=gnu++23 -fpermissive -IdistingNT_API/include -Iwindow-comparator/tests/reference/Common/include -Iwindow-comparator/tests/reference/WindowComparator/include window-comparator/tests/cpp_reference.cpp -o target/window-cpp-reference
 	./target/window-cpp-reference > target/window-cpp-reference.txt
