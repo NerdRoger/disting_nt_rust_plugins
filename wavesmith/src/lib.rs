@@ -955,7 +955,7 @@ impl Plugin for Wavesmith {
                         on && *cv_gain == 1.0
                     } else {
                         midi.gate_is_steady()
-                    }) && oscillator.render_steady(&state.engine, memory, voice_mix)
+                    }) && oscillator.render_open_gate(&state.engine, memory, voice_mix)
                     {
                         gate_power += length as f32;
                     } else {

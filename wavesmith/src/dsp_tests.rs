@@ -8,6 +8,7 @@ std::thread_local! {
     static GENERATED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     static BOUNDARY_POSITIONS: Cell<usize> = const { Cell::new(0) };
     static OSCILLATOR_TICKS: Cell<usize> = const { Cell::new(0) };
+    static MOVING_PITCH_TICKS: Cell<usize> = const { Cell::new(0) };
     static STEADY_TICKS: Cell<usize> = const { Cell::new(0) };
     static FREQUENCY_CONVERSIONS: Cell<usize> = const { Cell::new(0) };
 }
@@ -666,7 +667,7 @@ fn steady_block_playback_is_bit_exact_through_table_blends_pitch_level_changes_a
             engine.advance(&mut memory);
             optimized.prepare(frequency, rate as f32, level);
             let mut actual = [1.25; 24];
-            if !optimized.render_steady(&engine, &memory, &mut actual) {
+            if !optimized.render_open_gate(&engine, &memory, &mut actual) {
                 for (frame, sample) in actual.iter_mut().enumerate() {
                     *sample += optimized.tick_prepared(&engine, &memory, frame);
                 }
@@ -1416,5 +1417,51 @@ fn startup_builds_default_wave_without_an_edit_and_stays_finite_at_supported_rat
         }
         assert!(energy > 1.0);
         assert!(engine.ready[engine.active]);
+    }
+}
+
+pub(super) fn count_moving_pitch_tick() {
+    count_oscillator_tick();
+    MOVING_PITCH_TICKS.with(|counter| counter.set(counter.get() + 1));
+}
+
+#[test]
+fn moving_pitch_renderer_is_bit_exact_across_sweeps_jitter_and_table_transitions() {
+    for rate in [32000, 48000, 96000] {
+        let mut engine = Engine::new(32, rate);
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut wave = Wave::new(32);
+        wave.smoothing = 17;
+        wave.curves[3] = 85;
+        finish_build(&mut engine, &mut memory, wave, 440.0);
+        let mut optimized = Oscillator::new();
+        let mut reference = optimized;
+        // Settle level and pitch before exercising the moving-pitch-only path.
+        for frame in 0..2400 {
+            optimized.tick(&engine, &memory, 440.0, rate as f32, 0.5, frame);
+            reference.tick(&engine, &memory, 440.0, rate as f32, 0.5, frame);
+        }
+        let before = MOVING_PITCH_TICKS.with(|counter| counter.get());
+        for block in 0..1000 {
+            let frequency = match block {
+                0..=249 => 440.0 + (block % 3) as f32 * 0.0001,
+                250..=749 => 20.0 * (2.0f32).powf((block - 250) as f32 / 50.0),
+                _ => 20000.0 * (0.5f32).powf((block - 750) as f32 / 25.0),
+            };
+            optimized.prepare(frequency, rate as f32, 0.5);
+            let mut output = [0.125; 24];
+            assert!(optimized.render_open_gate(&engine, &memory, &mut output));
+            for (frame, sample) in output.iter().enumerate() {
+                let expected =
+                    0.125 + reference.tick(&engine, &memory, frequency, rate as f32, 0.5, frame);
+                assert_eq!(
+                    sample.to_bits(),
+                    expected.to_bits(),
+                    "rate {rate}, block {block}, frame {frame}"
+                );
+            }
+            assert_eq!(optimized, reference);
+        }
+        assert!(MOVING_PITCH_TICKS.with(|counter| counter.get()) > before + 20000);
     }
 }

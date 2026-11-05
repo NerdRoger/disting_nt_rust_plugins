@@ -722,9 +722,8 @@ impl Oscillator {
         self.tick_prepared(engine, memory, frame)
     }
 
-    pub fn tick_prepared(&mut self, engine: &Engine, memory: &Memory, frame: usize) -> f32 {
-        #[cfg(test)]
-        tests::count_oscillator_tick();
+    // Preserve the original per-sample recurrence and table-selection cadence.
+    fn advance_pitch(&mut self, engine: &Engine) {
         if self.pitch_moving {
             let previous = self.increment;
             self.increment += self.slew * (self.target_increment - self.increment);
@@ -744,6 +743,12 @@ impl Oscillator {
                 self.selection_increment = self.increment;
             }
         }
+    }
+
+    pub fn tick_prepared(&mut self, engine: &Engine, memory: &Memory, frame: usize) -> f32 {
+        #[cfg(test)]
+        tests::count_oscillator_tick();
+        self.advance_pitch(engine);
         if self.level_moving {
             let previous = self.level;
             self.level += self.slew * (self.target_level - self.level);
@@ -781,15 +786,19 @@ impl Oscillator {
         sample * self.level * 5.0
     }
 
-    /// Fast path for a settled voice and a fully open gate. Table slices are
+    /// Fast path for constant level and a fully open gate, including moving pitch. Table slices are
     /// rebound each block so publication can never leave a stale bank reference.
-    pub fn render_steady(&mut self, engine: &Engine, memory: &Memory, output: &mut [f32]) -> bool {
-        if self.pitch_moving
-            || self.level_moving
-            || engine.fade != 0
-            || !engine.ready[engine.active & 1]
-        {
+    pub fn render_open_gate(
+        &mut self,
+        engine: &Engine,
+        memory: &Memory,
+        output: &mut [f32],
+    ) -> bool {
+        if self.level_moving || engine.fade != 0 || !engine.ready[engine.active & 1] {
             return false;
+        }
+        if self.pitch_moving {
+            return self.render_moving_pitch(engine, memory, output);
         }
         let table_index = (engine.active & 1) * (engine.layout.count + 1) + self.playback_level;
         let Some(rich) = memory.get(table_index / 2) else {
@@ -837,6 +846,61 @@ impl Oscillator {
                 #[cfg(test)]
                 tests::count_steady_tick();
             }
+        }
+        true
+    }
+    // Gate, level, bank readiness and edit-fade decisions were made by the caller.
+    // Bind tables once and refresh only when pitch selects a different level.
+    fn render_moving_pitch(
+        &mut self,
+        engine: &Engine,
+        memory: &Memory,
+        output: &mut [f32],
+    ) -> bool {
+        let base = (engine.active & 1) * (engine.layout.count + 1);
+        let Some(first) = memory.get(base / 2) else {
+            return false;
+        };
+        if memory.get((base + engine.layout.count - 1) / 2).is_none() {
+            return false;
+        }
+        let mut selected = usize::MAX;
+        let mut rich = first;
+        let mut lean = first;
+        let mut rich_imaginary = false;
+        let mut lean_imaginary = false;
+        let read = |block: &Block, imaginary: bool, index: usize, next: usize, fraction: f32| {
+            let (a, b) = if imaginary {
+                (block.data[index].im, block.data[next].im)
+            } else {
+                (block.data[index].re, block.data[next].re)
+            };
+            a + (b - a) * fraction
+        };
+        for sample in output {
+            self.advance_pitch(engine);
+            if self.playback_level != selected {
+                selected = self.playback_level;
+                let index = base + selected;
+                rich = memory.get(index / 2).unwrap_or(first);
+                lean = memory.get((index + 1) / 2).unwrap_or(rich);
+                rich_imaginary = index & 1 != 0;
+                lean_imaginary = (index + 1) & 1 != 0;
+            }
+            let index = (self.phase >> 24) as usize;
+            let next = (index + 1) & (SIZE - 1);
+            let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
+            let a = read(rich, rich_imaginary, index, next, fraction);
+            let value = if self.playback_blend == 0.0 || selected + 1 == engine.layout.count {
+                a
+            } else {
+                let b = read(lean, lean_imaginary, index, next, fraction);
+                a + (b - a) * self.playback_blend
+            };
+            *sample += value * self.level * 5.0;
+            self.phase = self.phase.wrapping_add(self.phase_step);
+            #[cfg(test)]
+            tests::count_moving_pitch_tick();
         }
         true
     }
