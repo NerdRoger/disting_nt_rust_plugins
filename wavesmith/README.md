@@ -451,3 +451,39 @@ builds. Once using this layout, changing Segments still preserves all surviving
 parameter identities and ordinals. The waveform tables and FFT work are shared
 between channels; stereo adds small preallocated pan caches, a right mix buffer,
 and a second transition state rather than another oscillator bank.
+
+A temporary profiling overlay draws over the existing help footer. `Render cyc:`
+shows the average CPU cycles spent rendering and mixing all voices per audio
+callback, over non-overlapping windows of 256 callbacks (128 ms at 24 frames and
+48 kHz). Intervals from all internal chunks are summed. Pitch-to-frequency
+setup, waveform rebuilding/FFTs, the shared level controller and output writes
+are outside the timed intervals. Interrupts and a small counter-read overhead
+can affect readings; compare the same voice, pitch, routing and block settings.
+The underlying help rendering remains in place. No extra waveform buffers or
+parameter changes are introduced.
+
+The profiling stream is opt-in and USB-only. The monitor enables it with
+`F0 7D 57 53 01 10 F7` and disables it with command `11` in a `finally` block.
+This keeps unsolicited reports out of the firmware upload protocol. No notes
+or musical parameter changes are sent. Run from the repository root:
+
+```powershell
+python wavesmith/tools/monitor_cycles.py --seconds 100 --warmup 5 --label baseline --expect-voices 10 --expect-mode cv --expect-stereo
+```
+
+CSV and JSON summaries are written under ignored `target/wavesmith-profiling/`.
+Use `--output path.csv` for named results, `--compare baseline.json` for a
+percentage comparison, `--instance 0` when several Wavesmith instances exist,
+and `--stop` to disable a stream after an interrupted monitor. Always stop and
+close the monitor before deploying with the existing push script. The monitor
+fails rather than comparing runs with different voice counts, modes, routing,
+sample rates or block sizes. It also reports missing telemetry sequence numbers.
+
+Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
+version `1` and report type `1`. All integer fields are little-endian base-128:
+instance index (5 bytes), sequence (5), displayed average cycles (5), measured
+cycle sum (10), callback count (5), frame count (5), sample rate (5), last block
+size (5), followed by voice count, MIDI mode and stereo flags (one byte each).
+The monitor calculates a weighted cycle average from sums and counts over the
+whole run rather than averaging occasional screen readings. One report covers
+approximately one second of audio, with no extra work inside the timed loops.

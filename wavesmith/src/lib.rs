@@ -6,6 +6,7 @@ mod dsp;
 mod levels;
 mod midi;
 mod stereo;
+mod telemetry;
 mod ui;
 
 use core::ffi::{c_char, CStr};
@@ -162,6 +163,33 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
     wave
 }
 
+// Temporary playback profiler: average total voice-render/mix cycles per audio
+// callback. Fixed 256-callback windows avoid division in the audio thread.
+#[derive(Clone, Copy)]
+struct RenderCycles {
+    total: u64,
+    callbacks: u32,
+    average: u32,
+}
+impl RenderCycles {
+    const fn new() -> Self {
+        Self {
+            total: 0,
+            callbacks: 0,
+            average: 0,
+        }
+    }
+    fn record(&mut self, cycles: u32) {
+        self.total += cycles as u64;
+        self.callbacks += 1;
+        if self.callbacks == 256 {
+            self.average = (self.total >> 8) as u32;
+            self.total = 0;
+            self.callbacks = 0;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct State {
     engine: dsp::Engine,
@@ -178,6 +206,8 @@ struct State {
     mix: [f32; levels::CHUNK],
     right_mix: [f32; levels::CHUNK],
     voice_mix: [f32; levels::CHUNK],
+    render_cycles: RenderCycles,
+    telemetry: telemetry::Telemetry,
     count: usize,
     sample_rate: f32,
     ui: ui::UiState,
@@ -435,6 +465,7 @@ impl Plugin for Wavesmith {
         | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
     const MIDI: bool = true;
+    const MIDI_SYSEX: bool = true;
     const PARAMETER_TEXT: bool = true;
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
@@ -475,6 +506,8 @@ impl Plugin for Wavesmith {
                 mix: [0.0; levels::CHUNK],
                 right_mix: [0.0; levels::CHUNK],
                 voice_mix: [0.0; levels::CHUNK],
+                render_cycles: RenderCycles::new(),
+                telemetry: telemetry::Telemetry::new(),
                 count: n,
                 sample_rate: rate as f32,
                 ui: ui::UiState::new(),
@@ -780,6 +813,10 @@ impl Plugin for Wavesmith {
         0
     }
 
+    fn midi_sysex(bytes: &[u8]) {
+        telemetry::control(bytes);
+    }
+
     fn midi_message(context: &mut Callback<'_, Audio>, status: u8, data1: u8, data2: u8) {
         sync_parameter_graying(context);
         let p = context.read_parameters();
@@ -918,6 +955,7 @@ impl Plugin for Wavesmith {
         }
         state.engine.request(wave);
         state.engine.advance(memory);
+        let mut render_cycles = 0u32;
         if output_enabled {
             let gate_step = state.midi.gate_step;
             for (chunk_index, start) in (0..frames).step_by(levels::CHUNK).enumerate() {
@@ -936,6 +974,7 @@ impl Plugin for Wavesmith {
                 };
                 let mut voice_power = 0.0;
                 let mut gate_power = 0.0;
+                let render_start = distingnt_api::api::cpu_cycle_count();
                 for (((((oscillator, midi), &frequency), cv_gain), &on), pan) in state
                     .oscillators
                     .iter_mut()
@@ -991,6 +1030,8 @@ impl Plugin for Wavesmith {
                         }
                     }
                 }
+                render_cycles = render_cycles
+                    .wrapping_add(distingnt_api::api::cpu_cycle_count().wrapping_sub(render_start));
                 // Protect only Wavesmith's contribution; Add mode preserves
                 // upstream bus audio exactly, including any existing peaks.
                 let ceiling = if level > 0.0 {
@@ -1052,9 +1093,26 @@ impl Plugin for Wavesmith {
             state.mode_transition.silence();
             state.right_mode_transition.silence();
         }
+        state.render_cycles.record(render_cycles);
         // Shared edit time advances once per block even when every output is
         // None, so silent editing cannot stall an unfinished crossfade/build.
         state.engine.advance_time(frames);
+        let packet = state.telemetry.record(
+            render_cycles,
+            frames,
+            state.sample_rate as u32,
+            state.render_cycles.average,
+            pitches.iter().filter(|&&f| f > 0.0).count() as u8,
+            midi_setting != 0,
+            routing.stereo(),
+        );
+        if let Some(mut packet) = packet {
+            telemetry::encode(
+                context.algorithm_index().unwrap_or(u32::MAX) as u64,
+                &mut packet[6..11],
+            );
+            context.send_midi_sysex(DESTINATION_USB, &packet);
+        }
     }
 
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {

@@ -13,6 +13,9 @@ use std::{
 };
 
 std::thread_local! {
+    static SENT_SYSEX: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static CYCLE_COUNTER: Cell<u32> = const { Cell::new(0) };
+    static FOOTER_COVER_AFTER_HELP: Cell<bool> = const { Cell::new(false) };
     static CURRENT: Cell<*mut NtAlgorithm> = const { Cell::new(ptr::null_mut()) };
     static CURRENT_SEGMENTS: Cell<usize> = const { Cell::new(0) };
     static GRAY_CALLS: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
@@ -1256,7 +1259,7 @@ fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment(
         }
         let footer: Vec<_> = text
             .iter()
-            .filter(|(_, y, _)| *y >= 50)
+            .filter(|(_, y, _)| *y == 64)
             .map(|(_, _, value)| value.as_str())
             .collect();
         assert_eq!(footer, ["Push: Mode"]);
@@ -1483,7 +1486,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
         let text = text.borrow();
         let footer: Vec<_> = text
             .iter()
-            .filter(|(_, y, _)| *y >= 50)
+            .filter(|(_, y, _)| *y == 64)
             .map(|(_, _, value)| value.as_str())
             .collect();
         assert_eq!(footer, ["Push: Mode"]);
@@ -1590,7 +1593,7 @@ fn editor_selection_relative_pots_and_permanent_footer() {
         for expected in ["Turn: Select", "Push: Mode"] {
             assert!(text.iter().any(|(_, y, s)| *y >= 57 && s == expected));
         }
-        assert_eq!(text.len(), 5);
+        assert_eq!(text.len(), 6);
         assert!(text.iter().all(|(_, y, _)| *y != 57));
         for (x, prefix, field) in [(2, "Left", 0), (102, "Curve", 2), (190, "Right", 1)] {
             let value = instance.values[editor_parameter(32, 31, field).unwrap()];
@@ -1672,6 +1675,9 @@ unsafe extern "C" fn NT_drawText(x: i32, y: i32, text: *const c_char, color: i32
     if y == 10 {
         assert_eq!(size, TEXT_NORMAL);
         HEADER_COLORS.with(|colors| colors.borrow_mut().push(color));
+    } else if y == 62 {
+        assert_eq!(size, TEXT_NORMAL);
+        FOOTER_COVER_AFTER_HELP.with(|covered| assert!(covered.get()));
     } else {
         assert_eq!(size, TEXT_TINY);
     }
@@ -1680,6 +1686,16 @@ unsafe extern "C" fn NT_drawText(x: i32, y: i32, text: *const c_char, color: i32
 }
 #[no_mangle]
 unsafe extern "C" fn NT_drawShapeI(kind: u8, x0: i32, y0: i32, x1: i32, y1: i32, color: i32) {
+    if (kind, x0, y0, x1, y1) == (SHAPE_RECTANGLE, 0, 50, 255, 63) {
+        let after_help = TEXT.with(|text| {
+            text.borrow()
+                .last()
+                .is_some_and(|(_, _, text)| text == "Push: Mode")
+        });
+        FOOTER_COVER_AFTER_HELP.with(|covered| covered.set(after_help));
+        assert_eq!(color, 0);
+    }
+
     if y0 <= 42 && y1 <= 42 {
         if kind == SHAPE_LINE || kind == SHAPE_POINT {
             GRID_COLORS.with(|colors| colors.borrow_mut().push(color));
@@ -2678,4 +2694,105 @@ fn entering_and_leaving_centered_stereo_keeps_the_live_waveform_without_transien
             );
         }
     }
+}
+
+#[no_mangle]
+unsafe extern "C" fn NT_getCpuCycleCount() -> u32 {
+    CYCLE_COUNTER.with(|counter| {
+        let result = counter.get();
+        counter.set(result.wrapping_add(100));
+        result
+    })
+}
+
+#[test]
+fn render_cycle_meter_averages_complete_windows_without_overflow() {
+    let mut meter = RenderCycles::new();
+    for _ in 0..255 {
+        meter.record(u32::MAX);
+    }
+    assert_eq!(meter.average, 0);
+    meter.record(u32::MAX);
+    assert_eq!(meter.average, u32::MAX);
+    for _ in 0..256 {
+        meter.record(12345);
+    }
+    assert_eq!(meter.average, 12345);
+    assert_eq!((meter.total, meter.callbacks), (0, 0));
+}
+
+#[test]
+fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
+    for (voices, frames) in [(1, 24), (10, 24), (10, 64)] {
+        let mut instance = Instance::with_active_voices(8, voices);
+        CYCLE_COUNTER.with(|counter| counter.set(u32::MAX - 50));
+        let mut samples = std::vec![0.0; LAST_BUS * frames];
+        for _ in 0..256 {
+            instance.render(&mut samples);
+        }
+        let expected = frames.div_ceil(levels::CHUNK) as u32 * 100;
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert_eq!(context.state().render_cycles.average, expected);
+        instance.draw();
+        TEXT.with(|text| {
+            let text = text.borrow();
+            assert!(text.iter().any(|(_, _, value)| value == "Push: Mode"));
+            assert_eq!(
+                text.last(),
+                Some(&(2, 62, std::format!("Render cyc: {expected}")))
+            );
+        });
+        FOOTER_COVER_AFTER_HELP.with(|covered| assert!(covered.get()));
+        SHAPES.with(|shapes| {
+            assert_eq!(
+                shapes.borrow().last(),
+                Some(&(SHAPE_RECTANGLE, 0, 50, 255, 63))
+            )
+        });
+        instance.change(LEFT_OUTPUT, 0);
+        instance.change(RIGHT_OUTPUT, 0);
+        for _ in 0..256 {
+            instance.render(&mut samples);
+        }
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert_eq!(context.state().render_cycles.average, 0);
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn NT_sendMidiSysEx(destination: u32, data: *const u8, count: u32, end: bool) {
+    assert_eq!(destination, DESTINATION_USB);
+    assert!(end);
+    let bytes = unsafe { core::slice::from_raw_parts(data, count as usize) };
+    SENT_SYSEX.with(|messages| messages.borrow_mut().push(bytes.to_vec()));
+}
+
+#[test]
+fn profiling_stream_is_opt_in_usb_only_and_preserves_instance_identity() {
+    let mut instance = Instance::new(8);
+    let mut context = unsafe { Callback::<Audio>::from_raw(instance.base) };
+    assert!(!context.send_midi_sysex(DESTINATION_USB, &[]));
+    assert!(!context.send_midi_sysex(DESTINATION_USB, &[0xf0, 0x80]));
+    assert!(!context.send_midi_sysex(0, &[0xf0, 0x7d]));
+    SENT_SYSEX.with(|messages| messages.borrow_mut().clear());
+    unsafe {
+        factory().midi_sysex.unwrap()([0xf0, 0x7d, b'W', b'S', 1, 0x10, 0xf7].as_ptr(), 7);
+    }
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..2000 {
+        instance.render(&mut samples);
+    }
+    unsafe {
+        factory().midi_sysex.unwrap()([0xf0, 0x7d, b'W', b'S', 1, 0x11, 0xf7].as_ptr(), 7);
+    }
+    SENT_SYSEX.with(|messages| {
+        let messages = messages.borrow();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].len(), telemetry::PACKET_LEN);
+        assert_eq!(&messages[0][6..11], &[0, 0, 0, 0, 0]);
+    });
+    for _ in 0..2000 {
+        instance.render(&mut samples);
+    }
+    SENT_SYSEX.with(|messages| assert_eq!(messages.borrow().len(), 1));
 }

@@ -359,3 +359,13 @@ fn json_adapters_round_trip_members_through_host_bridges() {
     assert!(reader.skip());
     assert_eq!(state.position, 2);
 }
+
+#[no_mangle]
+unsafe extern "C" fn NT_getCpuCycleCount() -> u32 {
+    0xfedc_ba98
+}
+
+#[test]
+fn cpu_cycle_counter_preserves_the_host_unsigned_value() {
+    assert_eq!(cpu_cycle_count(), 0xfedc_ba98);
+}

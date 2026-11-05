@@ -26,3 +26,12 @@ pub fn sample_rate() -> u32 {
     // SAFETY: plugin code runs in a host that supplies persistent readable globals.
     unsafe { (*crate::raw::rust_nt_globals()).sample_rate }
 }
+
+/// Free-running host CPU cycle counter for profiling. Use wrapping subtraction
+/// for elapsed cycles; interrupts during a measured interval are included.
+#[inline]
+pub fn cpu_cycle_count() -> u32 {
+    // SAFETY: the host provides this scalar profiling function with no pointer
+    // or callback-storage preconditions.
+    unsafe { crate::raw::NT_getCpuCycleCount() }
+}

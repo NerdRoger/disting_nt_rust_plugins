@@ -407,6 +407,11 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
     pub unsafe fn from_raw(base: *mut NtAlgorithm) -> Self {
         unsafe { Self::admit(base) }
     }
+    /// Current zero-based host algorithm index, if this instance is in a slot.
+    pub fn algorithm_index(&self) -> Option<u32> {
+        // SAFETY: this callback capability admits a live matching host instance.
+        u32::try_from(unsafe { NT_algorithmIndex(self.raw.cast()) }).ok()
+    }
     #[inline]
     pub fn state(&self) -> &S {
         // SAFETY: registration initializes state; this borrow freezes the context.
@@ -491,6 +496,29 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
                 (*self.raw).parameter_count,
             )
         }
+    }
+}
+
+impl<S: Copy, V: Copy, M: StateMemory<S>> Context<'_, S, V, Audio, M> {
+    /// Send a complete SysEx message from an audio callback. Include F0 and
+    /// seven-bit payload bytes; the host appends F7 synchronously.
+    pub fn send_midi_sysex(&mut self, destination: u32, message: &[u8]) -> bool {
+        if destination == 0
+            || destination & !(DESTINATION_INTERNAL | DESTINATION_BREAKOUT | DESTINATION_USB) != 0
+            || message.first() != Some(&0xf0)
+            || message[1..].iter().any(|&byte| byte >= 0x80)
+        {
+            return false;
+        }
+        let Ok(count) = u32::try_from(message.len()) else {
+            return false;
+        };
+        // SAFETY: audio callback capability, validated MIDI data and synchronous
+        // host consumption of this borrowed byte buffer.
+        unsafe {
+            NT_sendMidiSysEx(destination, message.as_ptr(), count, true);
+        }
+        true
     }
 }
 
