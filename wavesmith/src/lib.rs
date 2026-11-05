@@ -925,6 +925,7 @@ impl Plugin for Wavesmith {
         }
         state.midi.begin_block();
         let pitch_bends = &state.midi.pitch_bends;
+        let mut shared_frequency = (f32::INFINITY, 0.0);
         for (((midi, oscillator), pitch), &render) in state
             .midi
             .voices
@@ -945,13 +946,14 @@ impl Plugin for Wavesmith {
                 }
                 let octave =
                     (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + *pitch;
-                let frequency = oscillator.frequency(octave.clamp(-16.0, 16.0));
+                let frequency =
+                    oscillator.frequency_shared(octave.clamp(-16.0, 16.0), &mut shared_frequency);
                 if midi.take_retune() {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }
                 *pitch = frequency;
             } else {
-                *pitch = oscillator.frequency(*pitch);
+                *pitch = oscillator.frequency_shared(*pitch, &mut shared_frequency);
             }
             if frames > 0 {
                 oscillator.prepare(*pitch, state.sample_rate, level);

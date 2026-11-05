@@ -688,6 +688,22 @@ impl Oscillator {
         self.cached_frequency
     }
 
+    /// Share only bit-identical pitch conversions within this callback. Each
+    /// oscillator's persistent exact cache is still checked first.
+    pub fn frequency_shared(&mut self, octave: f32, shared: &mut (f32, f32)) -> f32 {
+        if octave == self.cached_octave {
+            return self.cached_frequency;
+        }
+        if octave == shared.0 {
+            self.cached_octave = octave;
+            self.cached_frequency = shared.1;
+        } else {
+            let frequency = self.frequency(octave);
+            *shared = (octave, frequency);
+        }
+        self.cached_frequency
+    }
+
     pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {
         if frequency != self.prepared_frequency || sample_rate != self.cached_rate {
             self.prepared_frequency = frequency;

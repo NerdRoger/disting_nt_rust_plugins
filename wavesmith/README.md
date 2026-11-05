@@ -515,3 +515,8 @@ internal chunk rendering. Per-sample smoothing and gate behavior are unchanged.
 The level controller combines stereo power/peak detection into one traversal
 and calculates each stereo gain-ramp value once. Left/right power sums and
 per-sample gain arithmetic retain the original accumulation and rounding order.
+
+Pitch conversion also has a one-entry, callback-local exact-value cache shared
+by voices. Each voice checks its own persistent cache first. Reuse requires a
+bit-identical combined octave value; detuned pitches remain independent. This
+adds no deadband, tuning factorization or persistent memory.
