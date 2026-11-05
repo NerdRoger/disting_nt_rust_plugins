@@ -828,6 +828,7 @@ impl Plugin for Wavesmith {
     }
 
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
+        let callback_start = distingnt_api::api::cpu_cycle_count();
         sync_parameter_graying(context);
         let n = context.state().count.clamp(2, 32);
         let p = context.read_parameters();
@@ -953,9 +954,13 @@ impl Plugin for Wavesmith {
                 *pitch = oscillator.frequency(*pitch);
             }
         }
+        let setup_end = distingnt_api::api::cpu_cycle_count();
         state.engine.request(wave);
         state.engine.advance(memory);
+        let build_end = distingnt_api::api::cpu_cycle_count();
         let mut render_cycles = 0u32;
+        let mut level_cycles = 0u32;
+        let mut output_cycles = 0u32;
         if output_enabled {
             let gate_step = state.midi.gate_step;
             for (chunk_index, start) in (0..frames).step_by(levels::CHUNK).enumerate() {
@@ -1030,8 +1035,8 @@ impl Plugin for Wavesmith {
                         }
                     }
                 }
-                render_cycles = render_cycles
-                    .wrapping_add(distingnt_api::api::cpu_cycle_count().wrapping_sub(render_start));
+                let render_end = distingnt_api::api::cpu_cycle_count();
+                render_cycles = render_cycles.wrapping_add(render_end.wrapping_sub(render_start));
                 // Protect only Wavesmith's contribution; Add mode preserves
                 // upstream bus audio exactly, including any existing peaks.
                 let ceiling = if level > 0.0 {
@@ -1052,6 +1057,8 @@ impl Plugin for Wavesmith {
                         .levels
                         .process(mix, voice_power, gate_power / length as f32, ceiling);
                 }
+                let level_end = distingnt_api::api::cpu_cycle_count();
+                level_cycles = level_cycles.wrapping_add(level_end.wrapping_sub(render_end));
                 state.mode_transition.apply(mix);
                 let first_bus = if routing.stereo() {
                     routing.left
@@ -1087,6 +1094,8 @@ impl Plugin for Wavesmith {
                 } else {
                     state.right_mode_transition.silence();
                 }
+                output_cycles = output_cycles
+                    .wrapping_add(distingnt_api::api::cpu_cycle_count().wrapping_sub(level_end));
             }
         } else {
             state.levels.reset();
@@ -1097,6 +1106,7 @@ impl Plugin for Wavesmith {
         // Shared edit time advances once per block even when every output is
         // None, so silent editing cannot stall an unfinished crossfade/build.
         state.engine.advance_time(frames);
+        let callback_end = distingnt_api::api::cpu_cycle_count();
         let packet = state.telemetry.record(
             render_cycles,
             frames,
@@ -1105,6 +1115,13 @@ impl Plugin for Wavesmith {
             pitches.iter().filter(|&&f| f > 0.0).count() as u8,
             midi_setting != 0,
             routing.stereo(),
+            [
+                callback_end.wrapping_sub(callback_start),
+                setup_end.wrapping_sub(callback_start),
+                build_end.wrapping_sub(setup_end),
+                level_cycles,
+                output_cycles,
+            ],
         );
         if let Some(mut packet) = packet {
             telemetry::encode(

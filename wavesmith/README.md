@@ -498,3 +498,13 @@ approximately one second of audio, with no extra work inside the timed loops.
 
 Measured playback optimization results and decisions are recorded in
 [PERFORMANCE.md](PERFORMANCE.md).
+
+Extended profiling reports (report type 2, same control protocol) append five
+10-byte base-128 totals: callback body, setup/pitch conversion, table rebuilding,
+level control and output/transition work. The callback measurement begins at
+entry and ends before telemetry encoding/transmission, so it includes timing
+instrumentation and normal processing but excludes the ABI wrapper and USB send.
+The original render measurement and displayed footer average are unchanged.
+Use `mean_callback_cycles` and `callback_change_percent` for whole-body
+comparisons; moving work between stages must not count as a CPU improvement.
+The monitor also decodes the original report type 1.

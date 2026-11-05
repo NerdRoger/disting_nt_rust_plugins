@@ -28,6 +28,17 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaises(ValueError): summarize([decode(packet()),decode(packet(sequence=1,voices=9))],"test")
         with self.assertRaises(ValueError): summarize([decode(packet()),decode(packet())],"test")
 
+    def test_extended_stage_totals(self):
+        data = packet()
+        data[4] = 2
+        for value in [40000000,3000000,4000000,5000000,6000000]:
+            data.extend((value >> (7*i)) & 127 for i in range(10))
+        row = decode(data)
+        result = summarize([row], "extended")
+        self.assertEqual(result["mean_callback_cycles"],20000)
+        self.assertEqual(result["mean_setup_cycles"],1500)
+        self.assertEqual(result["mean_output_cycles"],3000)
+
     def test_sequence_wrap_and_large_counts(self):
         first = decode(packet(sequence=0xffffffff,total_cycles=0xffffffffffffffff))
         second = decode(packet(sequence=0))

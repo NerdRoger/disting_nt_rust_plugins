@@ -17,15 +17,17 @@ IDENTIFIER = (0x7D, ord("W"), ord("S"), 1)
 FIELDS = ("instance", "sequence", "display_cycles", "total_cycles", "callbacks",
           "frames", "sample_rate", "block_frames", "voices", "midi", "stereo")
 WIDTHS = (5, 5, 5, 10, 5, 5, 5, 5, 1, 1, 1)
+STAGE_FIELDS = ("callback_cycles", "setup_cycles", "build_cycles", "level_cycles", "output_cycles")
+CSV_FIELDS = FIELDS + STAGE_FIELDS
 WORKLOAD = ("instance", "sample_rate", "block_frames", "voices", "midi", "stereo")
 
 
 def decode(data):
     """mido SysEx data excludes F0 and F7; ignore unrelated vendor messages."""
     data = tuple(data)
-    if data[:5] != IDENTIFIER + (1,):
+    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2):
         return None
-    if len(data) != 53 or any(not 0 <= byte < 128 for byte in data):
+    if len(data) != (103 if data[4] == 2 else 53) or any(not 0 <= byte < 128 for byte in data):
         raise ValueError("Malformed Wavesmith telemetry")
     result, offset = {}, 5
     for field, width in zip(FIELDS, WIDTHS):
@@ -39,6 +41,12 @@ def decode(data):
             or not result["block_frames"] or result["voices"] > 10
             or result["midi"] > 1 or result["stereo"] > 1):
         raise ValueError("Invalid profiling window or workload")
+    if data[4] == 2:
+        for field in STAGE_FIELDS:
+            result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+10]))
+            offset += 10
+    if any(result.get(field, 0) > 0xFFFFFFFFFFFFFFFF for field in STAGE_FIELDS):
+        raise ValueError("Stage counter overflow")
     result["cycles_per_callback"] = result["total_cycles"] / result["callbacks"]
     return result
 
@@ -46,6 +54,8 @@ def decode(data):
 def summarize(rows, label):
     if not rows:
         raise ValueError("No Wavesmith telemetry received")
+    if any(("callback_cycles" in row) != ("callback_cycles" in rows[0]) for row in rows):
+        raise ValueError("Mixed telemetry versions")
     workload = {key: rows[0][key] for key in WORKLOAD}
     if any(any(row[key] != value for key, value in workload.items()) for row in rows):
         raise ValueError("Workload changed during measurement")
@@ -56,12 +66,21 @@ def summarize(rows, label):
         if delta == 0 or delta > 1000:
             raise ValueError("Duplicate/restarted telemetry stream")
         missed += delta - 1
-    return dict(label=label, reports=len(rows), missed_reports=missed, workload=workload,
+    summary = dict(label=label, reports=len(rows), missed_reports=missed, workload=workload,
                 mean_cycles_per_callback=sum(row["total_cycles"] for row in rows) / sum(row["callbacks"] for row in rows),
                 median_cycles_per_callback=statistics.median(values),
                 min_cycles_per_callback=min(values), max_cycles_per_callback=max(values),
                 stdev_cycles_per_callback=statistics.stdev(values) if len(values) > 1 else 0.0,
                 standard_error=statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else 0.0)
+
+    for field in STAGE_FIELDS:
+        if field in rows[0]:
+            if any(field not in row for row in rows):
+                raise ValueError("Mixed telemetry versions")
+            values = [row[field]/row["callbacks"] for row in rows]
+            summary["mean_"+field] = sum(row[field] for row in rows)/sum(row["callbacks"] for row in rows)
+            summary["stderr_"+field] = statistics.stdev(values)/math.sqrt(len(values)) if len(values)>1 else 0.0
+    return summary
 
 
 def choose_port(names, requested):
@@ -112,7 +131,7 @@ def main(argv=None):
     rows, workload = [], None
     print(f"Listening on {input_name}; warmup {args.warmup:g}s, measurement {args.seconds:g}s", flush=True)
     with mido.open_output(output_name) as output, mido.open_input(input_name) as input_port, path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["elapsed_seconds"] + list(FIELDS) + ["cycles_per_callback"])
+        writer = csv.DictWriter(file, fieldnames=["elapsed_seconds"] + list(CSV_FIELDS) + ["cycles_per_callback"])
         writer.writeheader()
         time.sleep(0.1)
         output.send(command(0x10))
@@ -167,6 +186,8 @@ def main(argv=None):
             raise ValueError("Cannot compare different workloads")
         summary["baseline"] = str(args.compare)
         summary["change_percent"] = 100 * (summary["mean_cycles_per_callback"] / baseline["mean_cycles_per_callback"] - 1)
+        if "mean_callback_cycles" in summary and "mean_callback_cycles" in baseline:
+            summary["callback_change_percent"] = 100 * (summary["mean_callback_cycles"]/baseline["mean_callback_cycles"]-1)
     path.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Saved {path} and {path.with_suffix('.json')}", flush=True)
