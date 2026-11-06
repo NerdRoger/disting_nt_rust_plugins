@@ -622,3 +622,56 @@ are unchanged. State grows **80 bytes**, 2,328 -> **2,408**, across ten voices.
 No additional waveform tables or heap allocations are introduced. The user
 reported CV glides and MIDI pitch bends sounded fine, so this improvement was
 accepted and committed separately before investigating shared smoothing.
+
+
+## Round 10: shared CV smoothing, rejected
+
+The remaining candidate shared one normalized, two-sample-smoothed CV factor
+curve across voices on an input bus, then applied each voice's cached tuning
+scale and independent phase. Joining was limited to approximately one part per
+million of the current phase increment, and range/level/gate/shape-transition
+cases retained individual smoothing. Interleaved input groups replayed a cached
+chunk-start snapshot so a bus was never advanced twice in the same chunk.
+
+Initial deployment attempts failed during file transfer while another MIDI
+monitor held the connection. The user stopped that monitor and recreated
+scratch. All results below are fresh measurements of that recreated preset;
+they must not be compared directly with the earlier round10-base measurement.
+Only the supplied deployment script was used. Each resumed run captured 100
+seconds after five seconds warmup, with ten CV voices, stereo, 48 kHz and
+24 frames. Reports matched these metadata with no gaps. No notes or parameter
+changes were sent by the profiling tools.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| round10-resume-base | 38,134 | 8,054 | 23,778 |
+| round10-resume-shared | 36,641 | 8,068 | 22,155 |
+| round10-resume-control | 35,621 | 8,052 | 21,264 |
+
+The first comparison suggested **3.92% fewer whole-callback cycles**, but the
+returning accepted build was **6.59% faster than the first baseline**. Relative
+to that returning control the shared candidate was **2.86% slower**.
+Most variation was in rendering, where eligibility for cached-selection fast
+paths changes. These measurements do not establish a reliable shared-smoothing
+gain; the initial apparent reduction is not retained as a performance claim.
+
+The candidate also cost **2,096 additional ITC bytes**, 24,952 -> 27,048 (+8.4%),
+**112 cold-code bytes**, 3,500 -> 3,612, and **400 instance state bytes**,
+2,408 -> 2,808; rodata remained 1,603 bytes. That is a weak trade-off against the
+accepted optimizations even before the returning-control regression.
+
+125 candidate tests passed in debug and release, plus repository/ABI/static
+placement and relocation checks. A native ten-detuned-voice, changing-CV test
+executed the shared path for 353,360 of 360,000 voice samples. Other tests
+checked curve reuse, input ordering, finite output, monotonic settling and
+tuning-change fallback. Those functional results do not establish lower CPU
+cost or acceptable audio; no human listening approval was requested for this
+candidate because it failed the performance/code-size gate.
+
+The shared-smoothing code and its candidate-only tests were removed, preserving
+all accepted changes including the user-approved paired smoothing (103dce5).
+The restored source passes all **122 Wavesmith tests** and ARM relocation
+validation, and the accepted build is deployed with the recreated scratch
+preset. Streaming is disabled and monitor ports are closed. Candidate source,
+patch, binary and raw measurements remain only under ignored
+`target/wavesmith-profiling/`. No shared-smoothing implementation is retained.
