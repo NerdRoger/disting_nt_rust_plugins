@@ -630,15 +630,18 @@ fn store_table(
 pub struct Oscillator {
     phase: u32,
     level: f32,
-    increment: f32,
     playback_level: usize,
     playback_blend: f32,
-    selection_increment: f32,
+    selection_low: u32,
+    selection_high: u32,
+    pitch_slew: i32,
+    #[cfg(test)]
+    selection_step: u32,
     cached_octave: f32,
     cached_frequency: f32,
     cached_rate: f32,
     prepared_frequency: f32,
-    target_increment: f32,
+    target_step: u32,
     target_level: f32,
     slew: f32,
     phase_step: u32,
@@ -651,20 +654,30 @@ pub struct Oscillator {
 const SELECTION_RATIO: f32 = 1.000_693_4; // 2^0.001
 const SELECTION_RATIO_INVERSE: f32 = 0.999_307_1; // 2^-0.001
 
+const PHASE_SCALE: f32 = 4_294_967_296.0;
+const PHASE_SCALE_INVERSE: f32 = 1.0 / PHASE_SCALE;
+// Q30 keeps the coefficient signed-positive even for an instantaneous slew.
+const PITCH_SLEW_SCALE: f32 = 1_073_741_824.0;
+const SELECTION_HIGH_Q31: u64 = (SELECTION_RATIO * 2_147_483_648.0) as u64;
+const SELECTION_LOW_Q31: u64 = (SELECTION_RATIO_INVERSE * 2_147_483_648.0) as u64;
+
 impl Oscillator {
     pub const fn new() -> Self {
         Self {
             phase: 0,
             level: 0.0,
-            increment: 0.0,
             playback_level: 0,
             playback_blend: 0.0,
-            selection_increment: 0.0,
+            selection_low: 0,
+            selection_high: 0,
+            pitch_slew: 0,
+            #[cfg(test)]
+            selection_step: 0,
             cached_octave: f32::INFINITY,
             cached_frequency: 0.0,
             cached_rate: 0.0,
             prepared_frequency: 0.0,
-            target_increment: 0.0,
+            target_step: 0,
             target_level: 0.0,
             slew: 0.0,
             phase_step: 0,
@@ -691,10 +704,17 @@ impl Oscillator {
     pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {
         if frequency != self.prepared_frequency || sample_rate != self.cached_rate {
             self.prepared_frequency = frequency;
-            self.cached_rate = sample_rate;
-            self.slew = (1000.0 / sample_rate).min(1.0);
-            self.target_increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
-            self.pitch_moving = true;
+            if sample_rate != self.cached_rate {
+                self.cached_rate = sample_rate;
+                self.slew = (1000.0 / sample_rate).min(1.0);
+                self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
+            }
+            let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+            self.target_step = (increment * PHASE_SCALE) as u32;
+            self.pitch_moving = self.phase_step != self.target_step
+                || self.selection_high == 0
+                || self.phase_step >= self.selection_high
+                || self.phase_step <= self.selection_low;
         }
         if level != self.target_level {
             self.target_level = level;
@@ -703,9 +723,18 @@ impl Oscillator {
     }
 
     pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
-        self.increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
-        self.phase_step = (self.increment * 4_294_967_296.0) as u32;
+        let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
+        self.phase_step = (increment * PHASE_SCALE) as u32;
         self.pitch_moving = true;
+    }
+
+    #[cfg(test)]
+    fn pitch_increment(&self) -> f32 {
+        self.phase_step as f32 * PHASE_SCALE_INVERSE
+    }
+    #[cfg(test)]
+    fn selected_increment(&self) -> f32 {
+        self.selection_step as f32 * PHASE_SCALE_INVERSE
     }
 
     #[cfg(test)]
@@ -722,26 +751,39 @@ impl Oscillator {
         self.tick_prepared(engine, memory, frame)
     }
 
-    // Preserve the original per-sample recurrence and table-selection cadence.
+    // Exponential pitch tracking in phase-step units. Current/target steps are
+    // bounded by 0.45 * 2^32, so their signed difference and Q30 product fit.
     #[inline(always)]
     fn advance_pitch(&mut self, engine: &Engine) {
         if self.pitch_moving {
-            let previous = self.increment;
-            self.increment += self.slew * (self.target_increment - self.increment);
-            // Stop at exactly the same floating-point fixed point as the old
-            // recurrence. No snap-to-target or extra pitch quantization.
-            self.pitch_moving = self.increment != previous;
-            self.phase_step = (self.increment * 4_294_967_296.0) as u32;
-            // Anchor the deadband to the last accepted pitch, so gradual CV changes
-            // accumulate. Phase still follows every change, including sub-millivolt
-            // movement. Follow the actual slewed pitch rather than its destination.
-            if self.selection_increment == 0.0
-                || self.increment >= self.selection_increment * SELECTION_RATIO
-                || self.increment <= self.selection_increment * SELECTION_RATIO_INVERSE
+            let delta = (self.target_step as i32).wrapping_sub(self.phase_step as i32);
+            if delta != 0 {
+                let rounded = ((delta as i64 * self.pitch_slew as i64 + (1i64 << 29)) >> 30) as i32;
+                // Never stick short of the target: continue in one phase-step
+                // units when the rounded exponential adjustment reaches zero.
+                let change = if rounded == 0 {
+                    delta.signum()
+                } else {
+                    rounded
+                };
+                self.phase_step = self.phase_step.wrapping_add(change as u32);
+            }
+            self.pitch_moving = self.phase_step != self.target_step;
+            if self.selection_high == 0
+                || self.phase_step >= self.selection_high
+                || self.phase_step <= self.selection_low
             {
+                let increment = self.phase_step as f32 * PHASE_SCALE_INVERSE;
                 (self.playback_level, self.playback_blend) =
-                    engine.layout.playback_levels(self.increment);
-                self.selection_increment = self.increment;
+                    engine.layout.playback_levels(increment);
+                self.selection_low = ((self.phase_step as u64 * SELECTION_LOW_Q31) >> 31) as u32;
+                self.selection_high = ((self.phase_step as u64 * SELECTION_HIGH_Q31
+                    + ((1u64 << 31) - 1))
+                    >> 31) as u32;
+                #[cfg(test)]
+                {
+                    self.selection_step = self.phase_step;
+                }
             }
         }
     }

@@ -313,3 +313,63 @@ passed all 113 Wavesmith tests in debug and optimized builds, repository checks,
 four monitor tests and ARM relocation validation. It is deployed with the same
 scratch preset. The repeated run had 101 reports and no gaps, and the
 monitor stopped streaming and closed MIDI ports on exit.
+
+
+## Round 5: fixed-point per-sample pitch tracking
+
+The existing ten-voice stereo CV preset was measured at 48 kHz with 24-frame
+callbacks. Four alternating runs used 100 seconds after five seconds of warmup;
+each received 100 or 101 reports, with no missing messages or workload changes.
+No MIDI notes or musical parameter changes were sent.
+
+| Build | Callback-body cycles | Rendering cycles | Callback change vs initial baseline |
+|---|---:|---:|---:|
+| round5-current | 44,838 | 30,329 | +0.00% |
+| round5-fixed-pitch | 39,265 | 24,642 | -12.43% |
+| round5-control | 44,824 | 30,332 | -0.03% |
+| round5-fixed-repeat | 39,272 | 24,649 | -12.42% |
+
+The repeated original differs from the initial baseline by only -0.03% in whole
+callback cycles. The fixed-point repeat is **12.39% below that returning control**
+in callback-body cycles and **18.74% below it** in rendering cycles. The two
+fixed-point callback means agree within 0.02%. These are measured cycle savings
+for this CV workload, not percentage points of the firmware CPU meter or a
+claim that MIDI and CV now have equal cost. Frequency conversion still uses the
+original floating-point exponent/division and exact per-voice cache.
+
+Current and target pitch increments now use the existing 32-bit phase-step
+units. An integer Q30 coefficient applies the approximately 1 ms exponential
+slew, rounded each sample; a minimum one-unit move prevents sticking short of
+the target. At 48 kHz that unit is about 0.000011 Hz. The anti-alias cache uses
+integer lower/upper thresholds equivalent to its existing 1 mV selection band;
+conversion back to floating point happens only when selecting new tables.
+Pitch-target changes are not suppressed with a CV-input deadband. The slew
+coefficients are cached until sample rate changes.
+
+This deliberately changes rounding relative to the old f32 pitch recurrence.
+Numerical tests compare against a double-precision exponential reference with
+an explicit accumulated rounding bound, verify monotonic tracking without
+overshoot, exact eventual settling, and less than 0.002 cents steady tuning
+error at the tested 20 Hz through 12 kHz frequencies. Tests cover four sample
+rates (32/44.1/48/96 kHz), sub-millivolt ramps in both directions, live rate
+changes, MIDI retuning and the existing anti-alias selection/sweep checks.
+The old scalar waveform-reference test aligns phase for its waveform/gain
+comparison and separately bounds pitch error; fast and general integer
+renderers retain exact pitch/phase/state comparisons. This does not claim
+bit-identical audio to the old floating-point trajectory.
+
+ARM output uses native signed multiply-accumulate-long instructions for the
+pitch recurrence, with no 64-bit arithmetic runtime helpers. ITC code increases
+from **23,324 to 23,468 bytes (+144 B, +0.62%)**. Cold code remains 3,460 bytes
+and read-only data 1,603 bytes. Persistent oscillator state increases by four
+bytes per voice, **40 bytes across ten voices**; no additional waveform buffers,
+FFT work or dynamic allocations are introduced.
+
+The change was retained for its repeatable cycle saving and small code cost.
+All 115 Wavesmith tests pass in debug and optimized host builds, repository
+checks and ARM relocation validation pass, and the final object was explicitly
+rebuilt. The fixed-point version is deployed through the supplied script with
+scratch; the monitor stopped SysEx streaming and closed its ports on exit.
+CSV/JSON measurements and comparison binaries remain under ignored
+`target/wavesmith-profiling/`. A listening check on smooth CV glides remains
+useful because numerical agreement cannot establish subjective equivalence.

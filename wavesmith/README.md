@@ -309,19 +309,28 @@ accepted selection. This applies equally to CV and MIDI playback. Actual phase
 and pitch smoothing still follow every pitch change; the deadband affects only
 anti-alias filtering. Small changes accumulate against the cached pitch, so
 slow glides still update the filter. Stable notes reuse the selection without
-repeating its table search and blend calculation on every sample. This adds one
-cached float per voice and no waveform buffers or FFT work.
+repeating its table search and blend calculation on every sample. The accepted
+selection is stored as integer lower/upper phase-step thresholds; it adds no
+waveform buffers or FFT work.
 Voice caches also persist across audio blocks: note/CV-to-frequency conversion
-runs only when the exact combined pitch changes, and phase-increment and slew
-setup runs only when frequency or sample rate changes. Level smoothing restarts
-only when Level changes. Pitch and level recurrences stop when they reach their
-existing floating-point fixed point, without snapping or rounding the pitch.
+runs only when the exact combined pitch changes. Phase-step targets update only
+when frequency or sample rate changes; slew coefficients update only when the
+sample rate changes. Level smoothing restarts only when Level changes.
+Pitch smoothing uses signed integer arithmetic on the existing 32-bit phase
+steps, with a Q30 coefficient and the same approximately 1 ms exponential time
+constant. Rounding continues in one-phase-step increments near the target so
+tracking settles exactly instead of sticking short. At 48 kHz one step is about
+0.000011 Hz. Level retains its original floating-point recurrence. Pitch is no
+longer bit-identical to the old floating-point recurrence: tests bound transient
+error against a double-precision reference and check steady tuning, monotonic
+tracking, tiny CV ramps and sample-rate changes. No CV-input deadband is used.
 With a fully open gate, constant level and no waveform crossfade, a block
 renderer resolves the active waveform bank outside the sample loop. Settled
 pitch uses the cached integer phase step, gain, table selection and blend.
-Changing pitch uses a dedicated loop that preserves the exact per-sample pitch
-recurrence and anti-aliasing selection cadence. It resolves table storage once,
-refreshing bindings only when the selected table level changes, and computes
+Changing pitch uses a dedicated loop with the same integer pitch recurrence as
+the general renderer and the existing anti-alias selection band. It resolves
+table storage once, refreshing bindings only when the selected table level
+changes, and computes
 sample indices and fractions once even when blending two tables. A single
 moving-pitch loop handles the storage lane and table blend directly to conserve
 ITC code space. The per-sample pitch helper is explicitly inlined to avoid a
@@ -329,8 +338,9 @@ function call and register-save overhead in each oscillator sample. Gate updates
 level smoothing and edit-crossfade checks stay outside this moving-pitch loop.
 Level changes, note attack/release/steal and waveform crossfades retain the
 original general renderer. Table references are local to each render call, so
-newly published banks are picked up immediately. No CV deadband or quantization
-is added. This adds no persistent state, waveform buffers or FFT work.
+newly published banks are picked up immediately. The integer pitch tracker uses
+the existing 32-bit phase-step resolution, adds four state bytes per voice and
+adds no waveform buffers or FFT work.
 Stationary stereo pan uses a two-sample-unrolled mixing loop, with a scalar
 tail for arbitrary chunk sizes. It preserves the original per-sample output
 and stereo-energy accumulation order. Moving pan retains the original smoothing
@@ -509,7 +519,8 @@ comparisons; moving work between stages must not count as a CPU improvement.
 The monitor also decodes the original report type 1.
 
 Oscillator pitch/level targets are prepared once per audio callback, before
-internal chunk rendering. Per-sample smoothing and gate behavior are unchanged.
+internal chunk rendering. Pitch smoothing uses the integer recurrence described
+above; level smoothing and gate behavior retain their existing arithmetic.
 
 The level controller combines stereo power/peak detection into one traversal
 and calculates each stereo gain-ramp value once. Left/right power sums and

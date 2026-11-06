@@ -531,6 +531,7 @@ fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_pat
     let mut reference_memory = memory;
     let mut oscillator = Oscillator::new();
     let mut wave = Wave::new(32);
+    let mut pitch_error_bound = 0.0f64;
     for block in 0..160 {
         if block == 40 {
             wave.curves[2] = 75;
@@ -546,11 +547,25 @@ fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_pat
         reference.advance(&mut reference_memory);
         let frequency = if block < 80 { 220.0 } else { 8800.0 };
         for frame in 0..64 {
+            reference.phase = oscillator.phase;
+            let old_increment = reference.increment as f64;
             let actual = oscillator.tick(&shared, &memory, frequency, 48000.0, 0.5, frame);
             let expected = reference.tick(&reference_memory, frequency, 48000.0, 0.5);
-            // Only the anti-alias blend may differ inside the 1.2-cent band.
-            assert_eq!(oscillator.phase, reference.phase);
-            assert_eq!(oscillator.increment, reference.increment);
+            // Compare audio at the same phase; validate pitch separately with
+            // a recurrence error budget including old f32 rounding and one
+            // integer phase unit per fixed-point update.
+            let alpha = (1000.0f32 / 48000.0) as f64;
+            let target = (frequency / 48000.0) as f64;
+            let exact = old_increment + alpha * (target - old_increment);
+            let float_round = ((reference.increment as f64 - exact) * PHASE_SCALE as f64).abs();
+            pitch_error_bound = (1.0 - alpha) * pitch_error_bound + float_round + 1.0 + alpha;
+            let error = (oscillator.phase_step as f64
+                - reference.increment as f64 * PHASE_SCALE as f64)
+                .abs();
+            assert!(
+                error <= pitch_error_bound + 1.0,
+                "pitch error {error} > {pitch_error_bound}"
+            );
             assert_eq!(oscillator.level, reference.level);
             assert!(
                 (actual - expected).abs() < 0.15,
@@ -574,7 +589,7 @@ fn anti_alias_cache_ignores_small_jitter_but_pitch_tracks_it_and_slow_changes_ac
     let base = 48000.0 * 0.48 / 127.0;
     voice.tune_when_silent(base, 48000.0);
     voice.tick(&engine, &memory, base, 48000.0, 1.0, 0);
-    let accepted = voice.selection_increment;
+    let accepted = voice.selected_increment();
     let selection = (voice.playback_level, voice.playback_blend);
     let start_phase = voice.phase;
     let mut reference = Oscillator::new();
@@ -584,10 +599,10 @@ fn anti_alias_cache_ignores_small_jitter_but_pitch_tracks_it_and_slow_changes_ac
         let frequency = base * if frame % 100 < 50 { 1.0003 } else { 0.9997 };
         voice.tick(&engine, &memory, frequency, 48000.0, 1.0, frame);
         reference.tick(&engine, &memory, base, 48000.0, 1.0, frame);
-        assert_eq!(voice.selection_increment, accepted);
+        assert_eq!(voice.selected_increment(), accepted);
         assert_eq!((voice.playback_level, voice.playback_blend), selection);
     }
-    assert_ne!(voice.increment, accepted);
+    assert_ne!(voice.pitch_increment(), accepted);
     assert_ne!(voice.phase, reference.phase);
     assert_ne!(voice.phase, start_phase);
     // Tiny monotonic changes eventually cross the last accepted pitch, rather
@@ -595,12 +610,12 @@ fn anti_alias_cache_ignores_small_jitter_but_pitch_tracks_it_and_slow_changes_ac
     for direction in [1.0f32, -1.0] {
         voice.tune_when_silent(base, 48000.0);
         voice.tick(&engine, &memory, base, 48000.0, 1.0, 0);
-        let accepted = voice.selection_increment;
+        let accepted = voice.selected_increment();
         for frame in 0..600 {
             let frequency = base * (1.0 + direction * frame as f32 * 0.000002);
             voice.tick(&engine, &memory, frequency, 48000.0, 1.0, frame);
         }
-        assert!((voice.selection_increment - accepted) * direction > 0.0);
+        assert!((voice.selected_increment() - accepted) * direction > 0.0);
         assert!((voice.playback_blend - selection.1) * direction > 0.0);
     }
 }
@@ -615,10 +630,10 @@ fn anti_alias_cache_refreshes_on_midi_retuning_and_stays_within_one_millivolt_on
             let frequency = 440.0 * 2.0f32.powf((note - 69.0) / 12.0);
             voice.tune_when_silent(frequency, rate as f32);
             voice.tick(&engine, &memory, frequency, rate as f32, 1.0, 0);
-            assert_eq!(voice.selection_increment, voice.increment);
+            assert_eq!(voice.selected_increment(), voice.pitch_increment());
             assert_eq!(
                 (voice.playback_level, voice.playback_blend),
-                engine.layout.playback_levels(voice.increment)
+                engine.layout.playback_levels(voice.pitch_increment())
             );
         }
         for frame in 0..16000 {
@@ -629,14 +644,16 @@ fn anti_alias_cache_refreshes_on_midi_retuning_and_stays_within_one_millivolt_on
             };
             let frequency = 40.0 * 2.0f32.powf(octave);
             voice.tick(&engine, &memory, frequency, rate as f32, 1.0, frame);
-            let error = (voice.increment / voice.selection_increment).log2().abs();
+            let error = (voice.pitch_increment() / voice.selected_increment())
+                .log2()
+                .abs();
             assert!(error <= 0.001001, "{error} octaves at {rate} Hz");
             assert_eq!(
                 (voice.playback_level, voice.playback_blend),
-                engine.layout.playback_levels(voice.selection_increment)
+                engine.layout.playback_levels(voice.selected_increment())
             );
             let highest = engine.layout.cutoff(voice.playback_level) as f32;
-            assert!(voice.increment * highest < 0.5 || voice.playback_blend == 1.0);
+            assert!(voice.pitch_increment() * highest < 0.5 || voice.playback_blend == 1.0);
         }
     }
 }
@@ -682,7 +699,7 @@ fn block_playback_preserves_samples_and_state_through_pitch_level_changes_and_ba
                 );
             }
             assert_eq!(optimized.phase, reference.phase);
-            assert_eq!(optimized.increment, reference.increment);
+            assert_eq!(optimized.phase_step, reference.phase_step);
             assert_eq!(optimized.level, reference.level);
             engine.advance_time(24);
         }
@@ -1508,4 +1525,57 @@ fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
         }
     }
     std::println!("Maximum gain-regrouping sample error: {max_error} V");
+}
+
+#[test]
+fn fixed_pitch_tracks_exponential_reference_without_overshoot_and_settles_exactly() {
+    for rate in [32000, 44100, 48000, 96000] {
+        let engine = Engine::new(8, rate);
+        let mut voice = Oscillator::new();
+        for frequency in [20.0, 440.0, 12000.0, 20.0, 20.0001, 19.9999] {
+            voice.prepare(frequency, rate as f32, 1.0);
+            let mut exact = voice.phase_step as f64;
+            let alpha = voice.pitch_slew as f64 / PITCH_SLEW_SCALE as f64;
+            for _ in 0..5000 {
+                let before = voice.phase_step;
+                exact += alpha * (voice.target_step as f64 - exact);
+                voice.advance_pitch(&engine);
+                assert!((voice.phase_step as f64 - exact).abs() <= 1.0 / alpha + 2.0);
+                assert!(
+                    (before.min(voice.target_step)..=before.max(voice.target_step))
+                        .contains(&voice.phase_step)
+                );
+            }
+            assert_eq!(voice.phase_step, voice.target_step);
+            assert!(!voice.pitch_moving);
+            let actual_hz = voice.phase_step as f64 * rate as f64 / PHASE_SCALE as f64;
+            let cents = 1200.0 * (actual_hz / frequency as f64).log2().abs();
+            assert!(cents < 0.002, "{rate} Hz, {frequency} Hz: {cents} cents");
+        }
+    }
+}
+
+#[test]
+fn fixed_pitch_follows_sub_millivolt_ramps_and_reprepares_after_rate_changes() {
+    let mut voice = Oscillator::new();
+    for rate in [32000, 48000, 96000, 44100] {
+        let engine = Engine::new(8, rate);
+        let base = 220.0;
+        voice.tune_when_silent(base, rate as f32);
+        voice.prepare(base, rate as f32, 1.0);
+        voice.advance_pitch(&engine);
+        assert_eq!(voice.phase_step, voice.target_step);
+        for direction in [1.0, -1.0] {
+            for frame in 1..1000 {
+                // Each target change is about 0.003 mV at 1V/oct.
+                let frequency = base * (1.0 + direction * frame as f32 * 0.000002);
+                let before = voice.phase_step;
+                voice.prepare(frequency, rate as f32, 1.0);
+                voice.advance_pitch(&engine);
+                if frame > 100 {
+                    assert!((voice.phase_step as i64 - before as i64) as f32 * direction > 0.0);
+                }
+            }
+        }
+    }
 }
