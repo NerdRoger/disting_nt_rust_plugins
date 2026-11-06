@@ -250,3 +250,66 @@ explicitly rebuilt and passed all 112 Wavesmith tests, the repository test/check
 suite, four Python monitor tests and ARM relocation validation. The chosen build
 is deployed with `scratch` unchanged; telemetry is stopped and MIDI ports are
 closed after collection. Profiling itself remains available for future tests.
+
+
+## Round 4: two small arithmetic experiments
+
+Both candidates were tested independently against the same unmodified build,
+with the existing ten-voice stereo CV preset, 48 kHz and 24-frame callbacks.
+Each run used 100 seconds after five seconds of warmup. A return to the original
+build checked temporal variation before selecting either arithmetic change.
+
+| Build | ITC code | Callback-body cycles | Change vs initial baseline | Decision |
+|---|---:|---:|---:|---|
+| round4-current | 23,392 B | 46,113 | +0.00% | Baseline |
+| round4-gain | 23,324 B | 45,085 | -2.23% | Gain candidate |
+| round4-reciprocal | 23,400 B | 45,835 | -0.60% | Discarded |
+| round4-control | 23,392 B | 45,673 | -0.95% | Original repeated |
+
+Precomputed gain changes `(sample * level) * 5` to `sample * (level * 5)` only
+while level is constant and the open-gate renderer can run. It removes a multiply
+from each sample and does not add persistent memory. The 68-byte reduction is
+measured from the complete ARM object, not estimated from source lines.
+
+That reassociation is not bit-identical. Tests compare the fast renderer with
+the unmodified scalar multiplication order at all level settings from -60 to
+0 dB, three sample rates and four pitches, covering moving and settled pitch.
+Maximum observed per-voice sample error was 0.00000047683716 V (0.48 microvolts).
+The bound is four f32 epsilon units times max(1, absolute expected sample);
+pitch/phase/oscillator state comparisons remain exact. Existing playback tests
+use this explicit sample bound rather than falsely claiming bit identity.
+
+The reciprocal experiment cached `1/sample_rate` and used multiplication for
+pitch increments. It passed numerical tests (maximum relative increment error
+0.00000011917944, about 0.00021 cents), and independently added eight ITC bytes
+and forty state bytes across ten voices. But its 0.60% apparent CPU saving was
+smaller than the 0.95% shift in the returning original build. Against that
+returning control it was actually slower. No reliable end-to-end gain was
+established, so the reciprocal field, arithmetic and candidate-only test were
+discarded. Original division-based pitch calculation remains.
+
+A combined candidate was built and numerically validated offline (23,416 ITC
+bytes), but was not deployed or benchmarked: the reciprocal did not justify
+retention on its own. No performance claim is made for that unused combination.
+
+The selected gain-only build is repeated below against the returning control.
+The measured region remains the callback body before telemetry serialization,
+not the firmware's entire displayed CPU load. All reports had zero missing
+messages and identical workload metadata. Detailed CSV/JSON files and temporary
+candidate artifacts remain in ignored `target/wavesmith-profiling/`.
+
+### Round-4 selection and repeat
+
+Gain-only repeated at **44,853 callback cycles**, **1.80%
+below the returning original build**. The first paired comparison was 2.23%
+lower. A reasonable description is **about 1.8–2.2% fewer measured callback
+cycles in this workload**, with **68 fewer ITC bytes** and no additional
+persistent state. Render-only means for the two gain runs agreed within 0.003%;
+setup and original-build timings still exhibit reload/CV variability.
+
+Final ITC code is **23,324 bytes**, down from 23,392. The reciprocal and its test
+are absent; the original division-based pitch math remains. The gain-only source
+passed all 113 Wavesmith tests in debug and optimized builds, repository checks,
+four monitor tests and ARM relocation validation. It is deployed with the same
+scratch preset. The repeated run had 101 reports and no gaps, and the
+monitor stopped streaming and closed MIDI ports on exit.
