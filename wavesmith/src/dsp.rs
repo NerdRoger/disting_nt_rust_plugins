@@ -813,6 +813,7 @@ impl Oscillator {
             };
             left + (right - left) * fraction
         };
+        let gain = self.level * 5.0;
         let blend = self.playback_blend;
         let simple = blend == 0.0 || self.playback_level + 1 == engine.layout.count;
         // Resolve table storage and interpolation mode outside the sample loop.
@@ -827,7 +828,7 @@ impl Oscillator {
                     (index + 1) & (SIZE - 1),
                     fraction,
                 );
-                *sample += value * self.level * 5.0;
+                *sample += value * gain;
                 self.phase = self.phase.wrapping_add(self.phase_step);
                 #[cfg(test)]
                 tests::count_steady_tick();
@@ -842,7 +843,7 @@ impl Oscillator {
                 let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
                 let a = read(rich, table_index & 1 != 0, index, next, fraction);
                 let b = read(lean, (table_index + 1) & 1 != 0, index, next, fraction);
-                *sample += (a + (b - a) * blend) * self.level * 5.0;
+                *sample += (a + (b - a) * blend) * gain;
                 self.phase = self.phase.wrapping_add(self.phase_step);
                 #[cfg(test)]
                 tests::count_steady_tick();
@@ -865,6 +866,7 @@ impl Oscillator {
         if memory.get((base + engine.layout.count - 1) / 2).is_none() {
             return false;
         }
+        let gain = self.level * 5.0;
         let mut selected = usize::MAX;
         let mut rich = first;
         let mut lean = first;
@@ -898,7 +900,7 @@ impl Oscillator {
                 let b = read(lean, lean_imaginary, index, next, fraction);
                 a + (b - a) * self.playback_blend
             };
-            *sample += value * self.level * 5.0;
+            *sample += value * gain;
             self.phase = self.phase.wrapping_add(self.phase_step);
             #[cfg(test)]
             tests::count_moving_pitch_tick();

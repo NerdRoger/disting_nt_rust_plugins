@@ -518,3 +518,9 @@ per-sample gain arithmetic retain the original accumulation and rounding order.
 Pitch conversion uses each voice's persistent exact cache. Cross-voice sharing
 was removed in the code-space review because its measured benefit was small.
 Independent detuning and every representable CV change remain intact.
+
+While Level is settled, block rendering calculates the volts-per-sample gain
+(`level * 5`) once per chunk instead of applying two multiplications per sample.
+Level transitions retain the general renderer. Regrouping can change final
+floating-point rounding; numerical tests bound the difference and keep pitch,
+phase and oscillator-state comparisons exact. No persistent state is added.

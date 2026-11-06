@@ -642,7 +642,7 @@ fn anti_alias_cache_refreshes_on_midi_retuning_and_stays_within_one_millivolt_on
 }
 
 #[test]
-fn steady_block_playback_is_bit_exact_through_table_blends_pitch_level_changes_and_bank_swaps() {
+fn block_playback_preserves_samples_and_state_through_pitch_level_changes_and_bank_swaps() {
     for rate in [32000, 48000, 96000] {
         let mut engine = Engine::new(8, rate);
         let mut memory = [Block::ZERO; BLOCKS];
@@ -675,10 +675,10 @@ fn steady_block_playback_is_bit_exact_through_table_blends_pitch_level_changes_a
             for (frame, &actual) in actual.iter().enumerate() {
                 let expected =
                     1.25 + reference.tick(&engine, &memory, frequency, rate as f32, level, frame);
-                assert_eq!(
-                    actual.to_bits(),
-                    expected.to_bits(),
-                    "rate {rate}, block {block}, frame {frame}"
+                let bound = 4.0 * f32::EPSILON * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= bound,
+                    "rate {rate}, block {block}, frame {frame}: {actual} != {expected}"
                 );
             }
             assert_eq!(optimized.phase, reference.phase);
@@ -1426,7 +1426,7 @@ pub(super) fn count_moving_pitch_tick() {
 }
 
 #[test]
-fn moving_pitch_renderer_is_bit_exact_across_sweeps_jitter_and_table_transitions() {
+fn moving_pitch_renderer_preserves_state_and_bounded_samples_across_pitch_changes() {
     for rate in [32000, 48000, 96000] {
         let mut engine = Engine::new(32, rate);
         let mut memory = [Block::ZERO; BLOCKS];
@@ -1454,14 +1454,58 @@ fn moving_pitch_renderer_is_bit_exact_across_sweeps_jitter_and_table_transitions
             for (frame, sample) in output.iter().enumerate() {
                 let expected =
                     0.125 + reference.tick(&engine, &memory, frequency, rate as f32, 0.5, frame);
-                assert_eq!(
-                    sample.to_bits(),
-                    expected.to_bits(),
-                    "rate {rate}, block {block}, frame {frame}"
+                let bound = 4.0 * f32::EPSILON * expected.abs().max(1.0);
+                assert!(
+                    (sample - expected).abs() <= bound,
+                    "rate {rate}, block {block}, frame {frame}: {sample} != {expected}"
                 );
             }
             assert_eq!(optimized, reference);
         }
         assert!(MOVING_PITCH_TICKS.with(|counter| counter.get()) > before + 20000);
     }
+}
+
+#[test]
+fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
+    let mut max_error = 0.0f32;
+    for rate in [32000, 48000, 96000] {
+        let mut engine = Engine::new(32, rate);
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut wave = Wave::new(32);
+        wave.smoothing = 40;
+        wave.warp_amount = -60;
+        wave.curves[3] = 90;
+        finish_build(&mut engine, &mut memory, wave, 440.0);
+        for db in -60..=0 {
+            let level = if db == -60 {
+                0.0
+            } else {
+                10.0f32.powf(db as f32 / 20.0)
+            };
+            for frequency in [20.0, 440.0, 8800.0, 20000.0] {
+                let mut actual = Oscillator::new();
+                actual.level = level;
+                actual.target_level = level;
+                actual.tune_when_silent(frequency, rate as f32);
+                actual.prepare(frequency, rate as f32, level);
+                let mut reference = actual;
+                for _ in 0..4 {
+                    let mut output = [0.0; 64];
+                    assert!(actual.render_open_gate(&engine, &memory, &mut output));
+                    for (frame, &sample) in output.iter().enumerate() {
+                        let expected = reference.tick_prepared(&engine, &memory, frame);
+                        max_error = max_error.max((sample - expected).abs());
+                        let bound = 4.0 * f32::EPSILON * expected.abs().max(1.0);
+                        assert!(
+                            (sample - expected).abs() <= bound,
+                            "rate {rate}, dB {db}, frequency {frequency}: {sample} != {expected}"
+                        );
+                    }
+                    assert_eq!(actual, reference);
+                }
+            }
+        }
+    }
+    std::println!("Maximum gain-regrouping sample error: {max_error} V");
 }
