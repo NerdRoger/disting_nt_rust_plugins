@@ -718,3 +718,88 @@ fn array_initializers_write_final_elements_and_support_empty_arrays() {
     assert!(destination.initialized);
     assert_eq!(unsafe { empty.assume_init() }, []);
 }
+
+#[test]
+fn struct_array_fields_initialize_in_place_with_guards_empty_and_packed_fields() {
+    #[derive(Clone, Copy)]
+    struct Fields {
+        flag: bool,
+        values: [u32; 1024],
+        empty: [u8; 0],
+    }
+    #[repr(C)]
+    struct Guarded {
+        before: u64,
+        state: MaybeUninit<Fields>,
+        after: u64,
+    }
+    let mut memory = Guarded {
+        before: 0xa5a5a5a5,
+        state: MaybeUninit::uninit(),
+        after: 0x5a5a5a5a,
+    };
+    let mut destination = unsafe { RegionInitializer::new(memory.state.as_mut_ptr()) };
+    let mut calls = 0;
+    crate::initialize_region!(
+        &mut destination,
+        Fields { flag: true },
+        arrays {
+            values: |index| {
+                calls += 1;
+                (index * index) as u32
+            },
+            empty: |_| panic!("empty initializer called"),
+        }
+    );
+    assert!(destination.initialized);
+    let state = unsafe { memory.state.assume_init() };
+    assert!(state.flag);
+    assert_eq!(state.empty, []);
+    assert_eq!(calls, 1024);
+    for (index, &value) in state.values.iter().enumerate() {
+        assert_eq!(value, (index * index) as u32);
+    }
+    assert_eq!((memory.before, memory.after), (0xa5a5a5a5, 0x5a5a5a5a));
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct Packed {
+        first: u8,
+        values: [u32; 2],
+    }
+    let mut memory = MaybeUninit::<Packed>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(memory.as_mut_ptr()) };
+    crate::initialize_region!(
+        &mut destination,
+        Packed { first: 7 },
+        arrays {
+            values: |index| 42 + index as u32
+        }
+    );
+    let state = unsafe { memory.assume_init() };
+    let (first, values) = (state.first, state.values);
+    assert_eq!((first, values), (7, [42, 43]));
+}
+
+#[test]
+fn array_field_panic_never_marks_partial_state_initialized() {
+    #[derive(Clone, Copy)]
+    struct Fields {
+        values: [u32; 4],
+    }
+    let mut memory = MaybeUninit::<Fields>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(memory.as_mut_ptr()) };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::initialize_region!(
+            &mut destination,
+            Fields {},
+            arrays {
+                values: |index| {
+                    assert_ne!(index, 2);
+                    index as u32
+                }
+            }
+        );
+    }));
+    assert!(result.is_err());
+    assert!(!destination.initialized);
+}

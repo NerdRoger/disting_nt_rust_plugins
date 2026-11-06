@@ -76,10 +76,10 @@ impl Instance {
             );
             assert!(
                 req.sram
-                    < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>() + 8000)
-                        as u32
+                    < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>()
+                        + 14000) as u32
             );
-            assert!(core::mem::size_of::<State>() < 4096);
+            assert!(core::mem::size_of::<State>() < 8192);
             let alignment =
                 distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&specs)
                     .unwrap();
@@ -724,6 +724,14 @@ fn fixed_ten_voices_have_shared_routing_and_grouped_voice_pages() {
                             transpose as u8,
                             fine as u8,
                             voice_pan_parameter(voice) as u8,
+                            sub_parameter(voice, 0, 0) as u8,
+                            sub_parameter(voice, 0, 1) as u8,
+                            sub_parameter(voice, 0, 2) as u8,
+                            sub_parameter(voice, 0, 3) as u8,
+                            sub_parameter(voice, 1, 0) as u8,
+                            sub_parameter(voice, 1, 1) as u8,
+                            sub_parameter(voice, 1, 2) as u8,
+                            sub_parameter(voice, 1, 3) as u8,
                             voice_active_parameter(voice) as u8
                         ]
                     );
@@ -1593,7 +1601,7 @@ fn editor_selection_relative_pots_and_permanent_footer() {
         for expected in ["Turn: Select", "Push: Mode"] {
             assert!(text.iter().any(|(_, y, s)| *y >= 57 && s == expected));
         }
-        assert_eq!(text.len(), 6);
+        assert_eq!(text.len(), 5 + usize::from(cfg!(feature = "profiling")));
         assert!(text.iter().all(|(_, y, _)| *y != 57));
         for (x, prefix, field) in [(2, "Left", 0), (102, "Curve", 2), (190, "Right", 1)] {
             let value = instance.values[editor_parameter(32, 31, field).unwrap()];
@@ -1907,7 +1915,12 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
             expected.push((voice_transpose_parameter(voice), false));
         }
         let mut initial_expected = expected.clone();
-        initial_expected.extend((0..VOICE_COUNT).map(|voice| (voice_pan_parameter(voice), true)));
+        for voice in 0..VOICE_COUNT {
+            initial_expected.push((voice_pan_parameter(voice), true));
+            for sub in 0..stack::SUBS {
+                initial_expected.push((sub_parameter(voice, sub, 2), true));
+            }
+        }
         GRAY_CALLS.with(|calls| assert_eq!(&*calls.borrow(), &initial_expected));
         GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
         instance.render(&mut samples);
@@ -1938,7 +1951,7 @@ fn restored_midi_mode_grays_controls_on_first_audio_callback() {
     instance.render(&mut [0.0; LAST_BUS * 24]);
     GRAY_CALLS.with(|calls| {
         let calls = calls.borrow();
-        assert_eq!(calls.len(), 31);
+        assert_eq!(calls.len(), 1 + VOICE_COUNT * (3 + stack::SUBS));
         assert!(calls.iter().all(|&(_, gray)| gray));
         assert!(!calls.iter().any(|&(p, _)| p == FINE || p == LEVEL));
     });
@@ -2526,7 +2539,8 @@ fn pan_graying_follows_distinct_output_buses_and_preserves_values() {
         assert_eq!(instance.values[voice_pan_parameter(0)], 17);
         GRAY_CALLS.with(|calls| {
             for &(p, _) in calls.borrow().iter() {
-                assert!((0..VOICE_COUNT).any(|v| p == voice_pan_parameter(v)));
+                assert!((0..VOICE_COUNT).any(|v| p == voice_pan_parameter(v)
+                    || (0..stack::SUBS).any(|sub| p == sub_parameter(v, sub, 2))));
             }
         });
     }
@@ -2708,6 +2722,7 @@ unsafe extern "C" fn NT_getCpuCycleCount() -> u32 {
     })
 }
 
+#[cfg(feature = "profiling")]
 #[test]
 fn render_cycle_meter_averages_complete_windows_without_overflow() {
     let mut meter = RenderCycles::new();
@@ -2724,6 +2739,7 @@ fn render_cycle_meter_averages_complete_windows_without_overflow() {
     assert_eq!((meter.total, meter.callbacks), (0, 0));
 }
 
+#[cfg(feature = "profiling")]
 #[test]
 fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
     for (voices, frames) in [(1, 24), (10, 24), (10, 64)] {
@@ -2735,7 +2751,7 @@ fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
         }
         let expected = frames.div_ceil(levels::CHUNK) as u32 * 100;
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-        assert_eq!(context.state().render_cycles.average, expected);
+        assert_eq!(context.state().profiling.render_cycles.average, expected);
         instance.draw();
         TEXT.with(|text| {
             let text = text.borrow();
@@ -2758,7 +2774,7 @@ fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
             instance.render(&mut samples);
         }
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-        assert_eq!(context.state().render_cycles.average, 0);
+        assert_eq!(context.state().profiling.render_cycles.average, 0);
     }
 }
 
@@ -2770,6 +2786,7 @@ unsafe extern "C" fn NT_sendMidiSysEx(destination: u32, data: *const u8, count: 
     SENT_SYSEX.with(|messages| messages.borrow_mut().push(bytes.to_vec()));
 }
 
+#[cfg(feature = "profiling")]
 #[test]
 fn profiling_stream_is_opt_in_usb_only_and_preserves_instance_identity() {
     let mut instance = Instance::new(8);
@@ -2837,4 +2854,252 @@ fn shared_cv_conversion_handles_detuning_distinct_inputs_rerouting_and_exact_jit
     instance.change(voice_pitch_parameter(1), 10);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 1, -4.0 / 12.0 - 40.0 / 1200.0 + 0.9);
+}
+
+#[cfg(not(feature = "profiling"))]
+#[test]
+fn normal_build_preserves_help_without_cycle_reads_or_profiling_sysex() {
+    let mut instance = Instance::with_active_voices(8, 10);
+    assert!(unsafe { factory().midi_sysex.is_none() });
+    CYCLE_COUNTER.with(|counter| counter.set(12345));
+    SENT_SYSEX.with(|messages| messages.borrow_mut().clear());
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..2000 {
+        instance.render(&mut samples);
+    }
+    instance.draw();
+    CYCLE_COUNTER.with(|counter| assert_eq!(counter.get(), 12345));
+    SENT_SYSEX.with(|messages| assert!(messages.borrow().is_empty()));
+    TEXT.with(|text| {
+        let text = text.borrow();
+        assert!(text.iter().any(|(_, _, value)| value == "Turn: Select"));
+        assert_eq!(text.last(), Some(&(159, 64, String::from("Push: Mode"))));
+        assert!(!text
+            .iter()
+            .any(|(_, _, value)| value.starts_with("Render cyc:")));
+    });
+    FOOTER_COVER_AFTER_HELP.with(|covered| assert!(!covered.get()));
+}
+
+fn enable_stack(instance: &mut Instance, voice: usize) {
+    for sub in 0..stack::SUBS {
+        instance.change(sub_parameter(voice, sub, 3), 1);
+    }
+}
+fn assert_sub_frequency(instance: &Instance, voice: usize, sub: usize, expected: f32) {
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    let actual = context.state().subvoices[voice][sub]
+        .oscillator
+        .target_frequency_for_test();
+    assert!(
+        (actual - expected).abs() < expected * 0.00001 + 0.001,
+        "sub {voice}/{sub}: {actual} != {expected}"
+    );
+}
+
+#[test]
+fn sub_metadata_is_off_by_default_complete_prefixed_and_stable() {
+    for segments in [2, 8, 32] {
+        let instance = Instance::new(segments);
+        assert_eq!(instance.values.len(), 149 + 2 * segments as usize);
+        for voice in 0..VOICE_COUNT {
+            for sub in 0..stack::SUBS {
+                for (field, min, max, default, unit) in [
+                    (0, -48, 48, 0, UNIT_SEMITONES),
+                    (1, -100, 100, 0, UNIT_CENTS),
+                    (2, 0, 100, 50, UNIT_PERCENT),
+                    (3, 0, 1, 0, UNIT_ENUM),
+                ] {
+                    let index = sub_parameter(voice, sub, field);
+                    let d = unsafe { &*(*instance.base).parameters.add(index) };
+                    assert_eq!((d.min, d.max, d.default, d.unit), (min, max, default, unit));
+                    assert_eq!(
+                        parameter_prefix(&instance, index as i32),
+                        std::format!("V{}:", voice + 1)
+                    );
+                    assert!(index < WAVEFORM_START);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stacked_cv_tracks_parent_with_independent_offsets_pan_and_disabled_work() {
+    let mut instance = Instance::new(8);
+    instance.change(PITCH, 69);
+    instance.change(voice_pitch_parameter(0), 1);
+    instance.change(voice_transpose_parameter(0), 7);
+    instance.change(voice_fine_parameter(0), 10);
+    instance.change(RIGHT_OUTPUT, 14);
+    enable_stack(&mut instance, 0);
+    instance.change(sub_parameter(0, 0, 0), 12);
+    instance.change(sub_parameter(0, 0, 1), -20);
+    instance.change(sub_parameter(0, 0, 2), 0);
+    instance.change(sub_parameter(0, 1, 0), -12);
+    instance.change(sub_parameter(0, 1, 1), 20);
+    instance.change(sub_parameter(0, 1, 2), 100);
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..500 {
+        samples[..24].fill(0.25);
+        instance.render(&mut samples);
+    }
+    let parent = 440.0 * 2.0f32.powf(0.25 + 7.0 / 12.0 + 10.0 / 1200.0);
+    assert_sub_frequency(&instance, 0, 0, parent * 2.0f32.powf(1.0 - 20.0 / 1200.0));
+    assert_sub_frequency(&instance, 0, 1, parent * 2.0f32.powf(-1.0 + 20.0 / 1200.0));
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    assert_eq!(context.state().subvoices[0][0].pan.gains(), (1.0, 0.0));
+    assert_eq!(context.state().subvoices[0][1].pan.gains(), (0.0, 1.0));
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 3 * 24);
+    for sub in 0..stack::SUBS {
+        instance.change(sub_parameter(0, sub, 3), 0);
+    }
+    for _ in 0..100 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    let conversions = dsp::playback_work_counts().1;
+    samples[..24].fill(0.5);
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 24);
+    assert_eq!(dsp::playback_work_counts().1 - conversions, 1);
+    instance.change(voice_active_parameter(0), 0);
+    for _ in 0..100 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), before);
+}
+
+#[test]
+fn midi_stacks_share_gates_bends_release_and_oldest_note_stealing() {
+    let mut reference = Instance::with_active_voices(8, 2);
+    let mut stacked = Instance::with_active_voices(8, 2);
+    reference.change(OUTPUT_MODE, 1);
+    stacked.change(OUTPUT_MODE, 1);
+    reference.change(MIDI_CHANNEL, 1);
+    stacked.change(MIDI_CHANNEL, 1);
+    for voice in 0..2 {
+        enable_stack(&mut stacked, voice);
+        stacked.change(sub_parameter(voice, 0, 0), 12);
+        stacked.change(sub_parameter(voice, 1, 0), -12);
+    }
+    let mut a = [0.0; LAST_BUS * 24];
+    let mut b = a;
+    for note in [60, 64, 67] {
+        reference.midi(0x90, note, 100);
+        stacked.midi(0x90, note, 100);
+        for _ in 0..300 {
+            reference.render(&mut a);
+            stacked.render(&mut b);
+            let r = unsafe { Callback::<ReadOnly>::from_raw(reference.base) };
+            let s = unsafe { Callback::<ReadOnly>::from_raw(stacked.base) };
+            assert_eq!(
+                s.state().midi,
+                r.state().midi,
+                "gate must advance once per group"
+            );
+            assert_eq!(s.state().oscillators, r.state().oscillators);
+        }
+    }
+    let context = unsafe { Callback::<ReadOnly>::from_raw(stacked.base) };
+    assert_eq!(context.state().midi.voices[0].pitch(), 67);
+    assert_eq!(context.state().midi.voices[1].pitch(), 64);
+    stacked.midi(0xe0, 0, 96); // +1 semitone to the entire stack.
+    stacked.render(&mut b);
+    for (voice, note) in [(0, 67), (1, 64)] {
+        let frequency = 440.0 * 2.0f32.powf((note as f32 + 1.0 - 69.0) / 12.0);
+        assert_sub_frequency(&stacked, voice, 0, frequency * 2.0);
+        assert_sub_frequency(&stacked, voice, 1, frequency * 0.5);
+    }
+    for note in [64, 67] {
+        stacked.midi(0x80, note, 0);
+    }
+    for _ in 0..100 {
+        stacked.render(&mut b);
+    }
+    assert!(b[12 * 24..13 * 24].iter().all(|&x| x == 0.0));
+    let before = dsp::oscillator_tick_count();
+    stacked.render(&mut b);
+    assert_eq!(dsp::oscillator_tick_count(), before);
+    // Turning off a sub while no key is held must not revive a stale release tail.
+    stacked.change(sub_parameter(0, 0, 3), 0);
+    stacked.render(&mut b);
+    let context = unsafe { Callback::<ReadOnly>::from_raw(stacked.base) };
+    assert!(!context.state().subvoices[0][0].rendering(false));
+}
+
+#[test]
+fn all_thirty_oscillators_render_once_per_frame_with_shared_tables_and_peak_protection() {
+    let mut instance = Instance::with_active_voices(32, 10);
+    instance.change(MIDI_CHANNEL, 1);
+    instance.change(RIGHT_OUTPUT, 14);
+    instance.change(OUTPUT_MODE, 1);
+    instance.change(LEVEL, 0);
+    for voice in 0..VOICE_COUNT {
+        enable_stack(&mut instance, voice);
+        instance.change(sub_parameter(voice, 0, 1), -10);
+        instance.change(sub_parameter(voice, 1, 1), 10);
+        instance.change(sub_parameter(voice, 0, 2), 0);
+        instance.change(sub_parameter(voice, 1, 2), 100);
+        instance.midi(0x90, 48 + voice as u8, 100);
+    }
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..1000 {
+        instance.render(&mut samples);
+        for &sample in &samples[12 * 24..14 * 24] {
+            assert!(sample.is_finite() && sample.abs() <= 5.001);
+        }
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 30 * 24);
+    instance.change(LEFT_OUTPUT, 0);
+    instance.change(RIGHT_OUTPUT, 0);
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), before);
+}
+
+#[test]
+fn stacked_unison_keeps_loudness_near_single_oscillator_and_mono_ignores_sub_pan() {
+    let mut reference = Instance::new(8);
+    let mut left = Instance::new(8);
+    let mut right = Instance::new(8);
+    for instance in [&mut reference, &mut left, &mut right] {
+        instance.change(MIDI_CHANNEL, 1);
+        instance.change(OUTPUT_MODE, 1);
+    }
+    for instance in [&mut left, &mut right] {
+        enable_stack(instance, 0);
+    }
+    for sub in 0..stack::SUBS {
+        left.change(sub_parameter(0, sub, 2), 0);
+        right.change(sub_parameter(0, sub, 2), 100);
+    }
+    for instance in [&mut reference, &mut left, &mut right] {
+        instance.midi(0x90, 60, 100);
+    }
+    let mut a = [0.0; LAST_BUS * 24];
+    let mut b = a;
+    let mut c = a;
+    let mut single_energy = 0.0f64;
+    let mut stacked_energy = 0.0f64;
+    for block in 0..2400 {
+        reference.render(&mut a);
+        left.render(&mut b);
+        right.render(&mut c);
+        assert_eq!(b, c, "stored sub pans cannot affect mono");
+        if block >= 2000 {
+            for (&single, &stacked) in a[12 * 24..13 * 24].iter().zip(&b[12 * 24..13 * 24]) {
+                single_energy += (single as f64).powi(2);
+                stacked_energy += (stacked as f64).powi(2);
+            }
+        }
+    }
+    let ratio = (stacked_energy / single_energy).sqrt();
+    assert!((0.8..1.2).contains(&ratio), "unison RMS ratio {ratio}");
 }

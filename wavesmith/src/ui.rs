@@ -412,18 +412,21 @@ pub fn draw(context: &mut Callback<'_, Ui>, mut canvas: Canvas<'_>) {
         text(&mut canvas, 42, 64, c"Turn: Select");
     }
     text(&mut canvas, 159, 64, c"Push: Mode");
-    // Temporary profiling overlay: retain the normal help rendering above so
-    // removing this overlay restores it without rebuilding the help layout.
-    canvas.shape(Shape::Rectangle, 0, 50, 255, 63, 0);
-    let mut buffer = [0u8; 40];
-    buffer[..12].copy_from_slice(b"Render cyc: ");
-    if let Some(length) = distingnt_api::api::text::format_integer(
-        &mut buffer[12..],
-        state.render_cycles.average.min(i32::MAX as u32) as i32,
-    ) {
-        if let Some(bytes) = buffer.get(..12 + length + 1) {
-            if let Ok(value) = CStr::from_bytes_with_nul(bytes) {
-                canvas.text(2, 62, value, 15, Alignment::Left, TextSize::Normal);
+    #[cfg(feature = "profiling")]
+    {
+        // Temporary profiling overlay: retain the normal help rendering above so
+        // removing this overlay restores it without rebuilding the help layout.
+        canvas.shape(Shape::Rectangle, 0, 50, 255, 63, 0);
+        let mut buffer = [0u8; 40];
+        buffer[..12].copy_from_slice(b"Render cyc: ");
+        if let Some(length) = distingnt_api::api::text::format_integer(
+            &mut buffer[12..],
+            state.profiling.render_cycles.average.min(i32::MAX as u32) as i32,
+        ) {
+            if let Some(bytes) = buffer.get(..12 + length + 1) {
+                if let Ok(value) = CStr::from_bytes_with_nul(bytes) {
+                    canvas.text(2, 62, value, 15, Alignment::Left, TextSize::Normal);
+                }
             }
         }
     }

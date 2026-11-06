@@ -768,3 +768,60 @@ The existing separation of MIDI, stereo, levels and UI remains useful; broader
 render-loop merging or file splitting would add churn without a demonstrated
 size/performance benefit. Test-only historical DSP routines remain as numerical
 references rather than being deleted as dead firmware code.
+
+
+## Optional profiling instrumentation
+
+Profiling is now controlled by the non-default Cargo feature `profiling`.
+`make plugins/wavesmith.o` builds the normal plugin without timing reads, meter
+state, telemetry encoding/transmission/control or the footer overlay.
+`make wavesmith-profile` builds the optimized instrumented variant separately
+as `plugins/wavesmith-profile.o`. The Python monitor protocol remains unchanged.
+
+Compared with the preceding always-instrumented build, normal ARM ITC decreases
+24,932 -> 23,326 bytes (-1,606), cold code 3,500 -> 3,484, rodata
+1,603 -> 1,591, and instance State 2,368 -> 2,288 (-80 bytes).
+The normal artifact has no NT_getCpuCycleCount, NT_sendMidiSysEx or telemetry
+symbols. These footprint results establish removal, not a measured CPU gain.
+
+119 normal-build tests and 122 profiling-build tests pass, along with the full
+repository suite and relocation validation for both ARM artifacts. A normal-
+build regression checks that rendering does not read the mocked cycle counter,
+that no profiling SysEx callback/messages are present, and that the permanent
+help footer is visible. The profiling tests still verify meter rollover,
+overlay rendering, and opt-in USB streaming. `make test` exercises both modes,
+including in CI, while release packaging uses the normal build.
+
+
+## Experimental three-oscillator note stacks
+
+Each of the ten allocatable voices now has two optional sub-oscillators. Each
+sub has independent transpose, fine tune, pan and Active parameters; both
+start Off. Parent gates advance once and are reused by the subs, including
+note stealing, pitch bend, note-off and parent-disable releases. Independent
+sub-enable fades avoid abrupt entry/removal, and all oscillator energy and
+squared effective gates feed the existing shared loudness controller.
+
+Production ARM State increases 2,288 -> 4,352 bytes (+2,064): twenty 100-byte
+sub states plus one shared 64-byte gate chunk. The six waveform tables per bank
+and all FFT/build buffers are unchanged. ITC increases 23,326 -> 25,698 bytes,
+cold code 3,484 -> 4,004 and rodata 1,591 -> 1,701. These are footprint results;
+no device CPU improvement is claimed. Disabled subs skip pitch preparation and
+rendering after their fade, although checking their settings still has a cost.
+
+The safe in-place initializer now accepts array fields via `arrays { field:
+|index| value }`. It checks every ordinary/array field together and fills arrays
+in their final allocation. This removes a large constructor temporary: local
+ARM constructor stack reservation falls from 2,352 in the first stack prototype
+to 768 bytes (excluding saved registers and called functions). Guards, packed
+fields, zero-length arrays, exact callback counts and partial-initialization
+failure are covered by API tests. Existing plugins' initializer syntax remains
+supported, and Wavesmith still forbids unsafe code.
+
+124 normal and 127 profiling tests cover the existing paths plus sub defaults
+and parameter prefixes, relative CV/MIDI tuning, independent stereo pan, shared
+gates/stealing/bend/release, skipped disabled work, full thirty-oscillator output
+and peak protection, mono pan bypass, and unison RMS within 20% of a single
+oscillator. Parameter limits are 153..213 with 14 pages; respecification tests
+check stable surviving ordinals across every segment count. This is a one-time
+preset-layout change requiring fresh instances from the preceding build.

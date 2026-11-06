@@ -11,6 +11,15 @@ plugins/wavesmith.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.tom
 	python3 distingnt-sys/tools/link_plugin.py target/$(RUST_TARGET)/plugin/libwavesmith.a $@ --dram-callees
 	python3 tools/check_plugin.py $@
 
+# Always rebuild this opt-in variant; normal/release artifacts remain separate.
+wavesmith-profile:
+	@mkdir -p plugins
+	cargo build --manifest-path Cargo.toml -p wavesmith --target $(RUST_TARGET) --profile plugin --features profiling
+	python3 distingnt-sys/tools/link_plugin.py target/$(RUST_TARGET)/plugin/libwavesmith.a plugins/wavesmith-profile.o --dram-callees
+	python3 tools/check_plugin.py plugins/wavesmith-profile.o
+
+.PHONY: wavesmith-profile
+
 plugins/rust-window-comparator.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml window-comparator/Cargo.toml $(wildcard window-comparator/src/*.rs) distingnt-sys/build.rs $(API_SOURCES)
 	@mkdir -p $(dir $@)
 	cargo build --manifest-path Cargo.toml -p window-comparator --target $(RUST_TARGET) --profile plugin
@@ -24,7 +33,7 @@ $(OUTPUT): Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml distingn
 	python3 tools/check_plugin.py $@
 
 clean:
-	rm -f $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o
+	rm -f $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o plugins/wavesmith-profile.o
 	rm -rf target
 
 .PHONY: all clean
@@ -41,6 +50,7 @@ test:
 	cargo test -p window-comparator --lib -- --include-ignored
 	cargo test -p monosynth --lib
 	cargo test -p wavesmith --lib
+	cargo test -p wavesmith --lib --features profiling
 	cargo test -p distingnt-sys --lib
 	cargo test -p distingnt-api --lib
 	cargo test -p distingnt-api --doc

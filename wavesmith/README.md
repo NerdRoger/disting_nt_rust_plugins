@@ -2,7 +2,9 @@
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
 The only setup specification is Segments (2–32, default 8). Every instance
-provides ten voices; Voice 1 defaults to Active On and Voices 2–10 to Off.
+provides ten note voices, each with a main oscillator and two optional sub-oscillators
+(up to 30 sounding oscillators). Voice 1 defaults to Active On and Voices 2–10
+to Off; both subs default to Off in every voice.
 Every instance uses six 256-sample anti-alias tables per bank. Configured voices
 share the same waveform and table banks. Shape edits work while audio plays.
 Use the NT's respecification workflow to change the segment count; use each
@@ -167,7 +169,10 @@ retained and restored when stereo becomes available again. Live routing edits do
 not restart RMS or peak protection; reconnecting after silence still acquires
 startup attenuation.
 Every instance has Voice 1 through Voice 10 pages, containing Pitch CV,
-Transpose, Fine tune, Pan, and Active in that order. Parameter names are shared; the API's
+Transpose and Fine tune for the parent pitch, and Pan for its main oscillator.
+These are followed by Sub 1 transpose, fine tune, pan and active, then the same
+four controls for Sub 2, and finally the parent Active switch. Parameter names
+are shared; the API's
 parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
 a navigation group so switching voices retains the selected parameter row.
 Transpose ranges from -48 to +48 semitones; per-voice Fine tune ranges from -100
@@ -179,6 +184,22 @@ Re-enabling a MIDI voice makes it available for new notes without resuming an
 old held key. CV voices fade in when re-enabled. Active remains editable in
 both MIDI and CV modes and uses the same V1: through V10: parameter prefixes.
 Output routing remains shared.
+
+Each sub follows its parent's pitch with an additional -48..+48 semitone
+offset and -100..+100 cent fine adjustment. Both offsets default to zero; its
+independent pan defaults to 50%. Sub transposition applies in MIDI as well as
+CV mode, while the parent's existing Transpose remains CV-only. Parent Fine
+tune and shared Fine tune affect all three oscillators. Mono routing ignores
+all pans; stereo enables them independently.
+
+MIDI allocates and steals whole groups: one note occupies one of the ten note
+voices, regardless of enabled sub count. All three oscillators share one gate,
+pitch bend and release/steal timing. A sub's Active switch adds a short fade
+when enabling or disabling it, and disabled subs skip pitch preparation and
+audio rendering after their fade. Parent Active disables the whole group.
+All sounding oscillators contribute to the linked RMS/peak controller.
+Waveform tables, rebuilding and FFT work remain shared across all 30 oscillators.
+
 When Left Output and Right Output are both None, Wavesmith disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
 shared waveform rebuilding and edit fades can still finish while silent.
@@ -235,7 +256,8 @@ the destination bus. Each voice has its own phase, pitch/gain slew and anti-alia
 selection. Persistent frequency caches and steady playback remain active.
 The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
 more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
-reserve ten states; only active voices and short fading tails are processed.
+reserve thirty oscillator states and ten MIDI note slots; only active oscillators
+and short fading tails are processed.
 All ten voice pages and their parameters are always present.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
@@ -440,11 +462,17 @@ contribution ceiling. Asymmetric waves can have DC offset.
 
 ## Build and test
 
+**Sub-oscillator prototype:** the extra eight controls per note voice change
+parameter ordinals. Add a fresh Wavesmith instance after upgrading; existing
+instances/presets and mappings from the earlier layout are not migrated. The
+new layout stays stable when respecifying Segments. Voice pages still share one
+navigation group, and parent Active remains their last row.
+
 The audio bank is fixed at six tables and the voice pool at ten slots.
 Only Voice 1 is active by default. Segments is the only specification.
 The page order is Oscillator, Output, Shape, Voice 1 through Voice 10, Waveform.
 Underlying parameter ordinals now follow that same order: 19 shared controls,
-five parameters for each of ten voices, then interleaved boundary/curve values.
+thirteen parameters for each of ten voices, then interleaved boundary/curve values.
 Boundary 00 is one shared seam parameter shown again at the end of Waveform.
 
 This revision changes parameter ordinals. Recreate earlier instances/presets and
@@ -473,9 +501,9 @@ procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
 independent segment-width editing, and per-boundary smoothing are deferred.
 
-There is no Voices specification. The 69 fixed shared/voice parameters precede
+There is no Voices specification. The 149 fixed shared/voice parameters precede
 all waveform boundaries and curves, which are appended as interleaved pairs.
-The total is 69 + 2 * Segments (73–133 parameters). Changing Segments preserves
+The total is 149 + 2 * Segments (153–213 parameters). Changing Segments preserves
 the identities and ordinals of all surviving controls. Removed segment values
 are discarded by the host; newly added segments receive their defaults.
 This is a one-time specification/layout change from older builds: review existing
@@ -488,7 +516,38 @@ parameter identities and ordinals. The waveform tables and FFT work are shared
 between channels; stereo adds small preallocated pan caches, a right mix buffer,
 and a second transition state rather than another oscillator bank.
 
-A temporary profiling overlay draws over the existing help footer. `Render cyc:`
+### Optional profiling build
+
+Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer
+and the factory SysEx monitoring callback. They display the regular help footer.
+This is a compile-time choice, separate from the MIDI channel setting.
+
+Build the special instrumented variant inside the devcontainer with:
+
+```sh
+make wavesmith-profile
+cargo test -p wavesmith --lib --features profiling
+```
+
+This produces `plugins/wavesmith-profile.o` with Cargo feature `profiling` enabled.
+It uses the same optimized `plugin` profile as production, so measurement does
+not include unoptimized debug-build overhead. Normal builds and CI releases
+continue to use `make plugins/wavesmith.o` without that feature. `make test`
+tests both configurations.
+
+To profile on the device, use the instrumented artifact in place of the normal
+Wavesmith file, preserving its filename and preset identity:
+
+```sh
+cp plugins/wavesmith-profile.o plugins/wavesmith.o
+```
+
+Then deploy `wavesmith.o` using the supplied push script and the `scratch`
+preset. Restore the production artifact afterwards with
+`make -B plugins/wavesmith.o` and deploy that file again. The Python monitor is
+unchanged; it requires the instrumented build.
+
+In a profiling build, a temporary overlay draws over the existing help footer. `Render cyc:`
 shows the average CPU cycles spent rendering and mixing all voices per audio
 callback, over non-overlapping windows of 256 callbacks (128 ms at 24 frames and
 48 kHz). Intervals from all internal chunks are summed. Pitch-to-frequency
@@ -498,7 +557,7 @@ can affect readings; compare the same voice, pitch, routing and block settings.
 The underlying help rendering remains in place. No extra waveform buffers or
 parameter changes are introduced.
 
-The profiling stream is opt-in and USB-only. The monitor enables it with
+In that build the profiling stream is also opt-in at runtime and USB-only. The monitor enables it with
 `F0 7D 57 53 01 10 F7` and disables it with command `11` in a `finally` block.
 This keeps unsolicited reports out of the firmware upload protocol. No notes
 or musical parameter changes are sent. Run from the repository root:
@@ -519,7 +578,8 @@ Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
 version `1`; base report type `1` has the fields below. All integer fields are little-endian base-128:
 instance index (5 bytes), sequence (5), displayed average cycles (5), measured
 cycle sum (10), callback count (5), frame count (5), sample rate (5), last block
-size (5), followed by voice count, MIDI mode and stereo flags (one byte each).
+size (5), followed by note-voice count, MIDI mode and stereo flags (one byte each).
+The voice count describes note groups, not the number of enabled sub-oscillators.
 The monitor calculates a weighted cycle average from sums and counts over the
 whole run rather than averaging occasional screen readings. One report covers
 approximately one second of audio, with no extra work inside the timed loops.

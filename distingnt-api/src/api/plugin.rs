@@ -190,19 +190,67 @@ impl<T: Copy, const N: usize> RegionInitializer<'_, [T; N]> {
 ///     distingnt_api::initialize_region!(fake, State { a: 1 });
 /// }
 /// ```
+/// Array fields can be filled element by element without a temporary array:
+/// ```
+/// #![forbid(unsafe_code)]
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct State { flag: bool, samples: [u32; 1024] }
+/// fn initialize(destination: &mut RegionInitializer<'_, State>) {
+///     distingnt_api::initialize_region!(destination, State { flag: true },
+///         arrays { samples: |index| index as u32 });
+/// }
+/// ```
+/// Missing fields are still rejected across both groups:
+/// ```compile_fail
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct State { flag: bool, missing: u8, samples: [u32; 4] }
+/// fn initialize(destination: &mut RegionInitializer<'_, State>) {
+///     distingnt_api::initialize_region!(destination, State { flag: true },
+///         arrays { samples: |_| 0 });
+/// }
+/// ```
 #[macro_export]
 macro_rules! initialize_region {
-    ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? }) => {{
-        // An exhaustive pattern checks omissions/duplicates without building S.
-        let _ = |value: $state| { let $state { $($field: _),* } = value; };
+    ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? }) => {
+        $crate::initialize_region!($destination, $state { $($field: $value),* }, arrays {})
+    };
+    ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? },
+        arrays { $($array:ident: $element:expr),* $(,)? }) => {{
+        // Check omissions/duplicates across scalar and array fields without building S.
+        let _ = |value: $state| { let $state { $($field: _,)* $($array: _,)* } = value; };
         let initializer: &mut $crate::api::plugin::RegionInitializer<'_, $state> = &mut *$destination;
         let pointer: *mut $state = initializer.__destination();
         // SAFETY: typed exclusive destination, every field checked above, each
         // expression yields that field's type. Failure/panic never publishes it.
         // Unaligned writes also support repr(packed) state structs safely.
         $(unsafe { ::core::ptr::addr_of_mut!((*pointer).$field).write_unaligned($value); })*
+        $(unsafe { $crate::api::plugin::__initialize_array_field(
+            ::core::ptr::addr_of_mut!((*pointer).$array), $element); })*
         unsafe { initializer.__finish(); }
     }};
+}
+
+/// # Safety
+/// The destination must be exclusively writable storage for the array. It may
+/// be unaligned (a packed field). Called only by the exhaustive initializer macro.
+#[doc(hidden)]
+#[inline(always)]
+pub unsafe fn __initialize_array_field<T: Copy, const N: usize>(
+    destination: *mut [T; N],
+    mut element: impl FnMut(usize) -> T,
+) {
+    for index in 0..N {
+        // SAFETY: the caller owns all N elements; index is within that allocation.
+        // No reference is formed, so a packed field need not be aligned for T.
+        unsafe {
+            destination
+                .cast::<T>()
+                .add(index)
+                .write_unaligned(element(index));
+        }
+    }
 }
 
 /// Callback state contains values only: no destructor is silently lost when the

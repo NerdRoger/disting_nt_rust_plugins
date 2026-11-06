@@ -5,7 +5,9 @@
 mod dsp;
 mod levels;
 mod midi;
+mod stack;
 mod stereo;
+#[cfg(feature = "profiling")]
 mod telemetry;
 mod ui;
 
@@ -53,7 +55,7 @@ const SHAPE_TRIGGERS: [usize; 8] = [
     SAWTOOTH_BOUNDARIES,
 ];
 const GLOBALS: usize = 19;
-const VOICE_PARAMETERS: usize = 5;
+const VOICE_PARAMETERS: usize = 5 + stack::SUBS * 4;
 const VOICE_COUNT: usize = 10;
 const WAVEFORM_START: usize = GLOBALS + VOICE_COUNT * VOICE_PARAMETERS;
 const VOICE_PAGE_NAMES: [&CStr; VOICE_COUNT] = [
@@ -87,12 +89,16 @@ const fn voice_fine_parameter(voice: usize) -> usize {
 }
 
 const fn voice_active_parameter(voice: usize) -> usize {
-    voice_pitch_parameter(voice) + 4
+    voice_pitch_parameter(voice) + VOICE_PARAMETERS - 1
 }
 
 const fn voice_pan_parameter(voice: usize) -> usize {
     voice_pitch_parameter(voice) + 3
 }
+const fn sub_parameter(voice: usize, sub: usize, field: usize) -> usize {
+    voice_pitch_parameter(voice) + 4 + sub * 4 + field
+}
+
 fn output_routing(value: impl Fn(usize) -> Option<i16>) -> stereo::Routing {
     stereo::Routing::new(
         value(LEFT_OUTPUT).unwrap_or(13),
@@ -165,12 +171,14 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
 
 // Temporary playback profiler: average total voice-render/mix cycles per audio
 // callback. Fixed 256-callback windows avoid division in the audio thread.
+#[cfg(feature = "profiling")]
 #[derive(Clone, Copy)]
 struct RenderCycles {
     total: u64,
     callbacks: u32,
     average: u32,
 }
+#[cfg(feature = "profiling")]
 impl RenderCycles {
     const fn new() -> Self {
         Self {
@@ -190,10 +198,33 @@ impl RenderCycles {
     }
 }
 
+// A zero-sized field keeps direct in-place initialization exhaustive in both builds.
+#[cfg(not(feature = "profiling"))]
+type Profiling = ();
+
+#[cfg(feature = "profiling")]
+#[derive(Clone, Copy)]
+struct Profiling {
+    render_cycles: RenderCycles,
+    telemetry: telemetry::Telemetry,
+}
+
+#[cfg(feature = "profiling")]
+impl Default for Profiling {
+    fn default() -> Self {
+        Self {
+            render_cycles: RenderCycles::new(),
+            telemetry: telemetry::Telemetry::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct State {
     engine: dsp::Engine,
     oscillators: [dsp::Oscillator; VOICE_COUNT],
+    subvoices: [[stack::SubVoice; stack::SUBS]; VOICE_COUNT],
+    stack_gates: [f32; levels::CHUNK],
     midi: midi::MidiState,
     cv_gains: [f32; VOICE_COUNT],
     cv_pitch: dsp::CvPitchCache,
@@ -207,8 +238,7 @@ struct State {
     mix: [f32; levels::CHUNK],
     right_mix: [f32; levels::CHUNK],
     voice_mix: [f32; levels::CHUNK],
-    render_cycles: RenderCycles,
-    telemetry: telemetry::Telemetry,
+    profiling: Profiling,
     count: usize,
     sample_rate: f32,
     ui: ui::UiState,
@@ -221,7 +251,10 @@ struct State {
 impl State {
     fn set_midi_channel(&mut self, setting: u8, enabled: &[bool; VOICE_COUNT]) {
         if self.midi.set_channel(setting) {
-            self.oscillators = [dsp::Oscillator::new(); VOICE_COUNT];
+            self.oscillators.fill(dsp::Oscillator::new());
+            for sub in self.subvoices.iter_mut().flatten() {
+                sub.reset();
+            }
             for (gain, &on) in self.cv_gains.iter_mut().zip(enabled) {
                 *gain = if on { 1.0 } else { 0.0 };
             }
@@ -230,7 +263,12 @@ impl State {
             self.right_mode_transition.start();
         }
     }
-    fn set_routing(&mut self, routing: stereo::Routing, pan_positions: &[i16; VOICE_COUNT]) {
+    fn set_routing(
+        &mut self,
+        routing: stereo::Routing,
+        pan_positions: &[i16; VOICE_COUNT],
+        sub_settings: &[[stack::Settings; stack::SUBS]; VOICE_COUNT],
+    ) {
         let old = self.routing;
         let changed = old != Some(routing);
         let first_bus = if routing.stereo() {
@@ -274,7 +312,17 @@ impl State {
                 self.levels.restart_for_mode_change();
             }
         }
-        for (pan, &position) in self.pans.iter_mut().zip(pan_positions) {
+        for (pan, position) in self
+            .pans
+            .iter_mut()
+            .chain(self.subvoices.iter_mut().flatten().map(|sub| &mut sub.pan))
+            .zip(
+                pan_positions
+                    .iter()
+                    .copied()
+                    .chain(sub_settings.iter().flatten().map(|s| s.pan)),
+            )
+        {
             let gains = pan.gains();
             let immediate = old.is_none() || old.is_some_and(|old| !old.enabled());
             if routing.stereo() {
@@ -356,6 +404,11 @@ fn sync_parameter_graying(context: &mut Callback<'_, Audio>) {
         applied &= parameters
             .gray(voice_pan_parameter(voice), !stereo)
             .is_some();
+        for sub in 0..stack::SUBS {
+            applied &= parameters
+                .gray(sub_parameter(voice, sub, 2), !stereo)
+                .is_some();
+        }
     }
     if !applied {
         context.state_mut().grayed_for_stereo = None;
@@ -466,7 +519,7 @@ impl Plugin for Wavesmith {
         | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
     const MIDI: bool = true;
-    const MIDI_SYSEX: bool = true;
+    const MIDI_SYSEX: bool = cfg!(feature = "profiling");
     const PARAMETER_TEXT: bool = true;
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
@@ -494,7 +547,7 @@ impl Plugin for Wavesmith {
             destination,
             State {
                 engine: dsp::Engine::new(n, rate),
-                oscillators: [dsp::Oscillator::new(); VOICE_COUNT],
+                stack_gates: [0.0; levels::CHUNK],
                 midi: midi::MidiState::new(rate),
                 cv_gains: [0.0; VOICE_COUNT],
                 cv_pitch: dsp::CvPitchCache::new(),
@@ -503,13 +556,11 @@ impl Plugin for Wavesmith {
                 mode_transition: levels::ModeTransition::new(rate),
                 right_mode_transition: levels::ModeTransition::new(rate),
                 routing: None,
-                pans: [stereo::Pan::new(); VOICE_COUNT],
                 pan_slew: (1000.0 / rate as f32).min(1.0),
                 mix: [0.0; levels::CHUNK],
                 right_mix: [0.0; levels::CHUNK],
                 voice_mix: [0.0; levels::CHUNK],
-                render_cycles: RenderCycles::new(),
-                telemetry: telemetry::Telemetry::new(),
+                profiling: Profiling::default(),
                 count: n,
                 sample_rate: rate as f32,
                 ui: ui::UiState::new(),
@@ -517,6 +568,11 @@ impl Plugin for Wavesmith {
                 trigger_high: [false; 8],
                 grayed_for_midi: None,
                 grayed_for_stereo: None,
+            },
+            arrays {
+                oscillators: |_| dsp::Oscillator::new(),
+                pans: |_| stereo::Pan::new(),
+                subvoices: |_| [stack::SubVoice::new(); stack::SUBS]
             }
         );
         Some(())
@@ -605,6 +661,48 @@ impl Plugin for Wavesmith {
             metadata.set_parameter(fine, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)?)?;
             let pan = voice_pan_parameter(voice);
             metadata.set_parameter(pan, definition(c"Pan", 0, 100, 50, UNIT_PERCENT)?)?;
+            for (sub, names) in [
+                [
+                    c"Sub 1 transpose",
+                    c"Sub 1 fine tune",
+                    c"Sub 1 pan",
+                    c"Sub 1 active",
+                ],
+                [
+                    c"Sub 2 transpose",
+                    c"Sub 2 fine tune",
+                    c"Sub 2 pan",
+                    c"Sub 2 active",
+                ],
+            ]
+            .iter()
+            .enumerate()
+            {
+                metadata.set_parameter(
+                    sub_parameter(voice, sub, 0),
+                    definition(names[0], -48, 48, 0, UNIT_SEMITONES)?,
+                )?;
+                metadata.set_parameter(
+                    sub_parameter(voice, sub, 1),
+                    definition(names[1], -100, 100, 0, UNIT_CENTS)?,
+                )?;
+                metadata.set_parameter(
+                    sub_parameter(voice, sub, 2),
+                    definition(names[2], 0, 100, 50, UNIT_PERCENT)?,
+                )?;
+                metadata.set_parameter(
+                    sub_parameter(voice, sub, 3),
+                    Definition::new(
+                        names[3],
+                        0,
+                        1,
+                        0,
+                        UNIT_ENUM,
+                        SCALING_NONE,
+                        Some(ACTIVE_VALUES.table()),
+                    )?,
+                )?;
+            }
             let active = voice_active_parameter(voice);
             metadata.set_parameter(
                 active,
@@ -627,6 +725,14 @@ impl Plugin for Wavesmith {
                     transpose as u8,
                     fine as u8,
                     pan as u8,
+                    sub_parameter(voice, 0, 0) as u8,
+                    sub_parameter(voice, 0, 1) as u8,
+                    sub_parameter(voice, 0, 2) as u8,
+                    sub_parameter(voice, 0, 3) as u8,
+                    sub_parameter(voice, 1, 0) as u8,
+                    sub_parameter(voice, 1, 1) as u8,
+                    sub_parameter(voice, 1, 2) as u8,
+                    sub_parameter(voice, 1, 3) as u8,
                     active as u8,
                 ],
             )?;
@@ -793,15 +899,7 @@ impl Plugin for Wavesmith {
             return 0;
         };
         for (voice, &prefix) in VOICE_PREFIXES.iter().take(VOICE_COUNT).enumerate() {
-            if [
-                voice_pitch_parameter(voice),
-                voice_transpose_parameter(voice),
-                voice_fine_parameter(voice),
-                voice_pan_parameter(voice),
-                voice_active_parameter(voice),
-            ]
-            .contains(&parameter)
-            {
+            if (voice_pitch_parameter(voice)..=voice_active_parameter(voice)).contains(&parameter) {
                 let bytes = prefix.to_bytes_with_nul();
                 let Some(output) = buffer.get_mut(..bytes.len()) else {
                     return 0;
@@ -815,6 +913,7 @@ impl Plugin for Wavesmith {
         0
     }
 
+    #[cfg(feature = "profiling")]
     fn midi_sysex(bytes: &[u8]) {
         telemetry::control(bytes);
     }
@@ -830,6 +929,7 @@ impl Plugin for Wavesmith {
     }
 
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
+        #[cfg(feature = "profiling")]
         let callback_start = distingnt_api::api::cpu_cycle_count();
         sync_parameter_graying(context);
         let n = context.state().count.clamp(2, 32);
@@ -919,22 +1019,52 @@ impl Plugin for Wavesmith {
                 *pitch = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
+        let mut sub_settings = [[stack::Settings::OFF; stack::SUBS]; VOICE_COUNT];
+        if output_enabled {
+            for (voice, ((settings, &render), subs)) in sub_settings
+                .iter_mut()
+                .zip(&render_voice)
+                .zip(&context.state().subvoices)
+                .enumerate()
+            {
+                for (sub, (setting, sub_voice)) in settings.iter_mut().zip(subs).enumerate() {
+                    setting.active = p.value(sub_parameter(voice, sub, 3)).unwrap_or(0) != 0;
+                    if routing.stereo() {
+                        setting.pan = p.value(sub_parameter(voice, sub, 2)).unwrap_or(50);
+                    }
+                    if render && sub_voice.rendering(setting.active) {
+                        setting.octaves = p
+                            .value(sub_parameter(voice, sub, 0))
+                            .unwrap_or(0)
+                            .clamp(-48, 48) as f32
+                            / 12.0
+                            + p.value(sub_parameter(voice, sub, 1))
+                                .unwrap_or(0)
+                                .clamp(-100, 100) as f32
+                                / 1200.0;
+                    }
+                }
+            }
+        }
         let processing = context.processing();
         let state = processing.state;
         let level = state.level.amplitude(level_db);
         let memory = processing.regions;
         state.set_midi_channel(midi_setting, &enabled);
-        state.set_routing(routing, &pan_positions);
+        state.set_routing(routing, &pan_positions, &sub_settings);
         if output_enabled {
             state.midi.release_disabled(&enabled);
         } else {
             state.midi.sync_enabled(&enabled);
             state.cv_gains = [0.0; VOICE_COUNT];
+            for sub in state.subvoices.iter_mut().flatten() {
+                sub.reset();
+            }
         }
         state.midi.begin_block();
         let pitch_bends = &state.midi.pitch_bends;
         state.cv_pitch.begin_block();
-        for ((((midi, oscillator), &tuning), render), &(bus, cv)) in state
+        for ((((((midi, oscillator), &tuning), render), &(bus, cv)), subs), settings) in state
             .midi
             .voices
             .iter_mut()
@@ -942,21 +1072,48 @@ impl Plugin for Wavesmith {
             .zip(&tuning_octaves)
             .zip(render_voice.iter_mut())
             .zip(&cv_inputs)
+            .zip(state.subvoices.iter_mut())
+            .zip(&sub_settings)
             .take(VOICE_COUNT)
         {
             if !*render {
+                for (sub, setting) in subs.iter_mut().zip(settings) {
+                    if !setting.active {
+                        sub.silence();
+                    }
+                }
                 continue;
             }
             if midi_setting != 0 {
                 if !midi.sounding() {
                     *render = false;
+                    for (sub, setting) in subs.iter_mut().zip(settings) {
+                        if !setting.active {
+                            sub.silence();
+                        }
+                    }
                     continue;
                 }
                 let octave =
                     (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + tuning;
                 let frequency = oscillator.frequency(octave.clamp(-16.0, 16.0));
-                if midi.take_retune() {
+                let retune = midi.take_retune();
+                if retune {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
+                }
+                for (sub, setting) in subs.iter_mut().zip(settings) {
+                    if sub.rendering(setting.active) {
+                        let frequency = sub
+                            .oscillator
+                            .frequency((octave + setting.octaves).clamp(-16.0, 16.0));
+                        if retune {
+                            sub.oscillator
+                                .tune_when_silent(frequency, state.sample_rate);
+                        }
+                        if frames > 0 {
+                            sub.oscillator.prepare(frequency, state.sample_rate, level);
+                        }
+                    }
                 }
                 if frames > 0 {
                     oscillator.prepare(frequency, state.sample_rate, level);
@@ -965,15 +1122,30 @@ impl Plugin for Wavesmith {
                 let factor = state.cv_pitch.factor(bus, cv);
                 if frames > 0 {
                     oscillator.prepare_cv(tuning, factor, state.sample_rate, level);
+                    for (sub, setting) in subs.iter_mut().zip(settings) {
+                        if sub.rendering(setting.active) {
+                            sub.oscillator.prepare_cv(
+                                (tuning + setting.octaves).clamp(-16.0, 16.0),
+                                factor,
+                                state.sample_rate,
+                                level,
+                            );
+                        }
+                    }
                 }
             }
         }
+        #[cfg(feature = "profiling")]
         let setup_end = distingnt_api::api::cpu_cycle_count();
         state.engine.request(wave);
         state.engine.advance(memory);
+        #[cfg(feature = "profiling")]
         let build_end = distingnt_api::api::cpu_cycle_count();
+        #[cfg(feature = "profiling")]
         let mut render_cycles = 0u32;
+        #[cfg(feature = "profiling")]
         let mut level_cycles = 0u32;
+        #[cfg(feature = "profiling")]
         let mut output_cycles = 0u32;
         if output_enabled {
             let gate_step = state.midi.gate_step;
@@ -991,30 +1163,48 @@ impl Plugin for Wavesmith {
                 let Some(voice_mix) = state.voice_mix.get_mut(..length) else {
                     return;
                 };
+                let Some(stack_gates) = state.stack_gates.get_mut(..length) else {
+                    return;
+                };
                 let mut voice_power = 0.0;
                 let mut gate_power = 0.0;
+                #[cfg(feature = "profiling")]
                 let render_start = distingnt_api::api::cpu_cycle_count();
-                for (((((oscillator, midi), &render), cv_gain), &on), pan) in state
-                    .oscillators
-                    .iter_mut()
-                    .zip(state.midi.voices.iter_mut())
-                    .zip(&render_voice)
-                    .zip(state.cv_gains.iter_mut())
-                    .zip(&enabled)
-                    .zip(state.pans.iter_mut())
-                    .take(VOICE_COUNT)
+                for (((((((oscillator, midi), &render), cv_gain), &on), pan), subs), settings) in
+                    state
+                        .oscillators
+                        .iter_mut()
+                        .zip(state.midi.voices.iter_mut())
+                        .zip(&render_voice)
+                        .zip(state.cv_gains.iter_mut())
+                        .zip(&enabled)
+                        .zip(state.pans.iter_mut())
+                        .zip(state.subvoices.iter_mut())
+                        .zip(&sub_settings)
+                        .take(VOICE_COUNT)
                 {
                     if !render {
                         continue;
                     }
                     voice_mix.fill(0.0);
 
-                    if (if midi_setting == 0 {
+                    let has_subs = subs
+                        .iter()
+                        .zip(settings)
+                        .any(|(s, setting)| s.rendering(setting.active));
+                    let steady_gate = if midi_setting == 0 {
                         on && *cv_gain == 1.0
                     } else {
                         midi.gate_is_steady()
-                    }) && oscillator.render_open_gate(&state.engine, memory, voice_mix)
+                    };
+                    if has_subs {
+                        stack_gates.fill(0.0);
+                    }
+                    if steady_gate && oscillator.render_open_gate(&state.engine, memory, voice_mix)
                     {
+                        if has_subs {
+                            stack_gates.fill(1.0);
+                        }
                         gate_power += length as f32;
                     } else {
                         for (frame, sample) in voice_mix.iter_mut().enumerate() {
@@ -1030,6 +1220,11 @@ impl Plugin for Wavesmith {
                             };
                             if gate == 0.0 {
                                 break;
+                            }
+                            if has_subs {
+                                if let Some(sample) = stack_gates.get_mut(frame) {
+                                    *sample = gate;
+                                }
                             }
                             gate_power += gate * gate;
                             *sample = gate
@@ -1048,9 +1243,37 @@ impl Plugin for Wavesmith {
                             voice_power += sample * sample;
                         }
                     }
+                    for (sub, setting) in subs.iter_mut().zip(settings) {
+                        if !sub.rendering(setting.active) {
+                            continue;
+                        }
+                        gate_power += sub.render(
+                            &state.engine,
+                            memory,
+                            voice_mix,
+                            stack_gates,
+                            steady_gate,
+                            setting.active,
+                            gate_step,
+                            chunk_index * levels::CHUNK,
+                        );
+                        if routing.stereo() || sub.pan.moving() {
+                            voice_power += sub.pan.mix(voice_mix, mix, right_mix, state.pan_slew);
+                        } else {
+                            for (sum, &sample) in mix.iter_mut().zip(voice_mix.iter()) {
+                                *sum += sample;
+                                voice_power += sample * sample;
+                            }
+                        }
+                    }
                 }
+                #[cfg(feature = "profiling")]
                 let render_end = distingnt_api::api::cpu_cycle_count();
-                render_cycles = render_cycles.wrapping_add(render_end.wrapping_sub(render_start));
+                #[cfg(feature = "profiling")]
+                {
+                    render_cycles =
+                        render_cycles.wrapping_add(render_end.wrapping_sub(render_start));
+                }
                 // Protect only Wavesmith's contribution; Add mode preserves
                 // upstream bus audio exactly, including any existing peaks.
                 let ceiling = if level > 0.0 {
@@ -1071,8 +1294,12 @@ impl Plugin for Wavesmith {
                         .levels
                         .process(mix, voice_power, gate_power / length as f32, ceiling);
                 }
+                #[cfg(feature = "profiling")]
                 let level_end = distingnt_api::api::cpu_cycle_count();
-                level_cycles = level_cycles.wrapping_add(level_end.wrapping_sub(render_end));
+                #[cfg(feature = "profiling")]
+                {
+                    level_cycles = level_cycles.wrapping_add(level_end.wrapping_sub(render_end));
+                }
                 state.mode_transition.apply(mix);
                 let first_bus = if routing.stereo() {
                     routing.left
@@ -1108,41 +1335,49 @@ impl Plugin for Wavesmith {
                 } else {
                     state.right_mode_transition.silence();
                 }
-                output_cycles = output_cycles
-                    .wrapping_add(distingnt_api::api::cpu_cycle_count().wrapping_sub(level_end));
+                #[cfg(feature = "profiling")]
+                {
+                    output_cycles = output_cycles.wrapping_add(
+                        distingnt_api::api::cpu_cycle_count().wrapping_sub(level_end),
+                    );
+                }
             }
         } else {
             state.levels.reset();
             state.mode_transition.silence();
             state.right_mode_transition.silence();
         }
-        state.render_cycles.record(render_cycles);
+        #[cfg(feature = "profiling")]
+        state.profiling.render_cycles.record(render_cycles);
         // Shared edit time advances once per block even when every output is
         // None, so silent editing cannot stall an unfinished crossfade/build.
         state.engine.advance_time(frames);
-        let callback_end = distingnt_api::api::cpu_cycle_count();
-        let packet = state.telemetry.record(
-            render_cycles,
-            frames,
-            state.sample_rate as u32,
-            state.render_cycles.average,
-            render_voice.iter().filter(|&&render| render).count() as u8,
-            midi_setting != 0,
-            routing.stereo(),
-            [
-                callback_end.wrapping_sub(callback_start),
-                setup_end.wrapping_sub(callback_start),
-                build_end.wrapping_sub(setup_end),
-                level_cycles,
-                output_cycles,
-            ],
-        );
-        if let Some(mut packet) = packet {
-            telemetry::encode(
-                context.algorithm_index().unwrap_or(u32::MAX) as u64,
-                &mut packet[6..11],
+        #[cfg(feature = "profiling")]
+        {
+            let callback_end = distingnt_api::api::cpu_cycle_count();
+            let packet = state.profiling.telemetry.record(
+                render_cycles,
+                frames,
+                state.sample_rate as u32,
+                state.profiling.render_cycles.average,
+                render_voice.iter().filter(|&&render| render).count() as u8,
+                midi_setting != 0,
+                routing.stereo(),
+                [
+                    callback_end.wrapping_sub(callback_start),
+                    setup_end.wrapping_sub(callback_start),
+                    build_end.wrapping_sub(setup_end),
+                    level_cycles,
+                    output_cycles,
+                ],
             );
-            context.send_midi_sysex(DESTINATION_USB, &packet);
+            if let Some(mut packet) = packet {
+                telemetry::encode(
+                    context.algorithm_index().unwrap_or(u32::MAX) as u64,
+                    &mut packet[6..11],
+                );
+                context.send_midi_sysex(DESTINATION_USB, &packet);
+            }
         }
     }
 
