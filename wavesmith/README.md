@@ -331,7 +331,7 @@ Level changes, note attack/release/steal and waveform crossfades retain the
 original general renderer. Table references are local to each render call, so
 newly published banks are picked up immediately. No CV deadband or quantization
 is added. This adds no persistent state, waveform buffers or FFT work.
-Stationary stereo pan uses a four-sample-unrolled mixing loop, with a scalar
+Stationary stereo pan uses a two-sample-unrolled mixing loop, with a scalar
 tail for arbitrary chunk sizes. It preserves the original per-sample output
 and stereo-energy accumulation order. Moving pan retains the original smoothing
 loop, including its exact settlement timing. No additional buffers are needed.

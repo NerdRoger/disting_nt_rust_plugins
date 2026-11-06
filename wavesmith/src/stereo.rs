@@ -118,7 +118,7 @@ impl Pan {
     pub fn mix(&mut self, voice: &[f32], left: &mut [f32], right: &mut [f32], slew: f32) -> f32 {
         if !self.moving {
             let count = voice.len().min(left.len()).min(right.len());
-            let full = count & !3;
+            let full = count & !1;
             let (left_gain, right_gain) = (self.left, self.right);
             let mut power = 0.0;
             if let (Some(v), Some(l), Some(r)) = (
@@ -127,11 +127,11 @@ impl Pan {
                 right.get_mut(..full),
             ) {
                 for ((v, l), r) in v
-                    .as_chunks::<4>()
+                    .as_chunks::<2>()
                     .0
                     .iter()
-                    .zip(l.as_chunks_mut::<4>().0.iter_mut())
-                    .zip(r.as_chunks_mut::<4>().0.iter_mut())
+                    .zip(l.as_chunks_mut::<2>().0.iter_mut())
+                    .zip(r.as_chunks_mut::<2>().0.iter_mut())
                 {
                     macro_rules! mix_sample {
                         ($i:expr) => {{
@@ -144,8 +144,6 @@ impl Pan {
                     }
                     mix_sample!(0);
                     mix_sample!(1);
-                    mix_sample!(2);
-                    mix_sample!(3);
                 }
             }
             if let (Some(v), Some(l), Some(r)) = (
