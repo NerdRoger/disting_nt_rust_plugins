@@ -173,3 +173,80 @@ selected build is deployed with the same scratch preset, and telemetry streaming
 is disabled after collection. The help overlay and monitor remain available.
 Final validation passed all 113 Wavesmith tests, the repository checks and tests,
 the four Python monitor tests and ARM relocation checks.
+
+
+## Round 3: code-space versus CPU review
+
+This review deliberately tested removing optimizations from the combined build,
+instead of assuming their original incremental gains were still independent.
+The workload and protocol were the same: ten sounding CV voices, stereo output,
+48 kHz, 24-frame callbacks, 100-second measurements after five seconds of warmup.
+All reported runs completed with zero missing messages. Code sizes below are
+ITC-bound executable sections, excluding cold DRAM code and read-only data.
+
+| Build / removal candidate | ITC code | Callback cycles | CPU change vs its comparison build | Decision |
+|---|---:|---:|---:|---|
+| round3-current | 24,812 B | 45,578 | +0.00% | Starting build |
+| round3-no-specialization | 23,608 B | 45,967 | +0.85% | Kept: 9312d4d |
+| round3-no-unrolling | 23,304 B | 47,678 | +3.72% | Rejected |
+| round3-compact-stereo | 23,344 B | 46,963 | +2.17% | Rejected |
+| round3-two-sample-stereo | 23,472 B | 45,293 | -1.47% | Kept: 1735adc |
+| round3-no-pitch-sharing | 23,392 B | 45,414 | +0.27% | Kept: 8da7ca9 |
+
+The specialization removal compares with the starting build. Stereo alternatives
+compare with the accepted no-specialization build. Pitch-sharing removal compares
+with the selected two-sample mixer. Positive cycle changes mean slower execution.
+Do not add these percentages or compare alternatives against different baselines.
+
+### Decisions
+
+- Removed the specialized moving-pitch table/lane loops: **1,204 bytes recovered**
+  for **0.85% more callback cycles**. This is a better space/time balance than
+  retaining four specialized loop variants. Pitch-helper inlining remains.
+- Rejected complete stereo-unrolling removal: only 304 further bytes saved for
+  3.72% more callback cycles. The compact fixed-pan scalar loop was also rejected:
+  264 bytes saved for 2.17% more callback cycles.
+- Reduced stereo unrolling from four samples to two instead: **136 bytes saved**
+  and **1.47% fewer callback cycles** in this context. This is both smaller and
+  faster in the measured combined build, with exact sample/energy agreement.
+- Removed the small shared-pitch cache: **80 bytes saved**, a small 0.27% measured
+  callback penalty, and simpler conversion code. This is a judgment call favoring
+  space and simplicity for a marginal gain; it is not a zero-cost removal.
+  Each voice's original persistent exact cache remains, with no CV deadband.
+- Kept the original moving-pitch fast path and explicit pitch-helper inlining:
+  their measured benefits were strong for their code cost. Kept once-per-callback
+  preparation and shared stereo level calculations, which saved code and cycles.
+
+Final ITC code is **23,392 bytes**, versus **24,812 bytes** at the start of this
+review: **1,420 bytes recovered (5.72%)**. Relative to today's original 21,170-byte
+build, net growth is now 2,222 bytes (10.50%), instead of 3,642 bytes (17.20%).
+Cold DRAM code remains 3,460 bytes; read-only data remains 1,603 bytes. Waveform
+and FFT buffers are unchanged. ELF file size includes symbols and relocations
+and must not be read as the ITC allocation.
+
+The byte deltas differ from the original historical additions because inlining,
+function layout and other retained optimizations interact. These removal tests
+measure the actual current trade-offs. Small timing differences can also vary
+with reloads and CV/cache activity, so the final combined build is repeated
+below rather than claiming precise CPU gains from every byte recovered.
+
+Profiling infrastructure remains intentionally present for these comparisons;
+the SysEx stream is opt-in and is stopped by the monitor. This is not a build
+with all diagnostic code stripped. Candidate-specific code/tests from rejected
+alternatives are absent from the final source.
+
+### Round-3 final verification
+
+The selected build repeated at **45,415 callback cycles**,
+versus **45,578** at the start of this review (-0.36%).
+This is within the previously observed reload/setup variation, so the practical
+conclusion is **5.72% less ITC code with essentially unchanged CPU performance**,
+not a claim of a meaningful CPU speedup. The repeat completed with 101
+reports and no missing telemetry, and agrees with the earlier selected-build
+run (45,414 cycles) within 0.02%.
+
+All accepted removals/changes were committed separately. The final source was
+explicitly rebuilt and passed all 112 Wavesmith tests, the repository test/check
+suite, four Python monitor tests and ARM relocation validation. The chosen build
+is deployed with `scratch` unchanged; telemetry is stopped and MIDI ports are
+closed after collection. Profiling itself remains available for future tests.
