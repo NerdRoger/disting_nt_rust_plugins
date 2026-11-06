@@ -5,7 +5,6 @@
 mod dsp;
 mod levels;
 mod midi;
-mod stack;
 mod stereo;
 #[cfg(feature = "profiling")]
 mod telemetry;
@@ -55,8 +54,8 @@ const SHAPE_TRIGGERS: [usize; 8] = [
     SAWTOOTH_BOUNDARIES,
 ];
 const GLOBALS: usize = 19;
-const VOICE_PARAMETERS: usize = 5 + stack::SUBS * 4;
-const VOICE_COUNT: usize = 10;
+const VOICE_PARAMETERS: usize = 6;
+const VOICE_COUNT: usize = 24;
 const WAVEFORM_START: usize = GLOBALS + VOICE_COUNT * VOICE_PARAMETERS;
 const VOICE_PAGE_NAMES: [&CStr; VOICE_COUNT] = [
     c"Voice 1",
@@ -69,9 +68,25 @@ const VOICE_PAGE_NAMES: [&CStr; VOICE_COUNT] = [
     c"Voice 8",
     c"Voice 9",
     c"Voice 10",
+    c"Voice 11",
+    c"Voice 12",
+    c"Voice 13",
+    c"Voice 14",
+    c"Voice 15",
+    c"Voice 16",
+    c"Voice 17",
+    c"Voice 18",
+    c"Voice 19",
+    c"Voice 20",
+    c"Voice 21",
+    c"Voice 22",
+    c"Voice 23",
+    c"Voice 24",
 ];
 const VOICE_PREFIXES: [&CStr; VOICE_COUNT] = [
-    c"V1:", c"V2:", c"V3:", c"V4:", c"V5:", c"V6:", c"V7:", c"V8:", c"V9:", c"V10:",
+    c"V1:", c"V2:", c"V3:", c"V4:", c"V5:", c"V6:", c"V7:", c"V8:", c"V9:", c"V10:", c"V11:",
+    c"V12:", c"V13:", c"V14:", c"V15:", c"V16:", c"V17:", c"V18:", c"V19:", c"V20:", c"V21:",
+    c"V22:", c"V23:", c"V24:",
 ];
 static MIDI_CHANNELS: EnumStrings<18> = EnumStrings::new([
     c"Off", c"All", c"1", c"2", c"3", c"4", c"5", c"6", c"7", c"8", c"9", c"10", c"11", c"12",
@@ -89,14 +104,39 @@ const fn voice_fine_parameter(voice: usize) -> usize {
 }
 
 const fn voice_active_parameter(voice: usize) -> usize {
-    voice_pitch_parameter(voice) + VOICE_PARAMETERS - 1
+    voice_pitch_parameter(voice) + 5
 }
 
 const fn voice_pan_parameter(voice: usize) -> usize {
     voice_pitch_parameter(voice) + 3
 }
-const fn sub_parameter(voice: usize, sub: usize, field: usize) -> usize {
-    voice_pitch_parameter(voice) + 4 + sub * 4 + field
+const fn voice_group_parameter(voice: usize) -> usize {
+    voice_pitch_parameter(voice) + 4
+}
+const fn default_group(voice: usize) -> u8 {
+    (voice / 3) as u8
+}
+fn read_groups(value: impl Fn(usize) -> Option<i16>) -> [u8; VOICE_COUNT] {
+    core::array::from_fn(|voice| {
+        (value(voice_group_parameter(voice))
+            .unwrap_or(default_group(voice) as i16 + 1)
+            .clamp(1, midi::GROUP_COUNT as i16)
+            - 1) as u8
+    })
+}
+fn enabled_groups(
+    enabled: &[bool; VOICE_COUNT],
+    groups: &[u8; VOICE_COUNT],
+) -> [bool; midi::GROUP_COUNT] {
+    let mut available = [false; midi::GROUP_COUNT];
+    for (&on, &group) in enabled.iter().zip(groups) {
+        if on {
+            if let Some(slot) = available.get_mut(group as usize) {
+                *slot = true;
+            }
+        }
+    }
+    available
 }
 
 fn output_routing(value: impl Fn(usize) -> Option<i16>) -> stereo::Routing {
@@ -223,10 +263,13 @@ impl Default for Profiling {
 struct State {
     engine: dsp::Engine,
     oscillators: [dsp::Oscillator; VOICE_COUNT],
-    subvoices: [[stack::SubVoice; stack::SUBS]; VOICE_COUNT],
-    stack_gates: [f32; levels::CHUNK],
     midi: midi::MidiState,
-    cv_gains: [f32; VOICE_COUNT],
+    // Current MIDI bindings; live edits adopt their destination after fading out.
+    voice_groups: [u8; VOICE_COUNT],
+    // Only ramping groups write/read these shared gates; steady gates use unity.
+    group_gates: [[f32; levels::CHUNK]; midi::GROUP_COUNT],
+    // CV gates, or MIDI per-oscillator Active/membership fades.
+    voice_gains: [f32; VOICE_COUNT],
     cv_pitch: dsp::CvPitchCache,
     levels: levels::LevelControl,
     level: levels::Level,
@@ -252,10 +295,7 @@ impl State {
     fn set_midi_channel(&mut self, setting: u8, enabled: &[bool; VOICE_COUNT]) {
         if self.midi.set_channel(setting) {
             self.oscillators.fill(dsp::Oscillator::new());
-            for sub in self.subvoices.iter_mut().flatten() {
-                sub.reset();
-            }
-            for (gain, &on) in self.cv_gains.iter_mut().zip(enabled) {
+            for (gain, &on) in self.voice_gains.iter_mut().zip(enabled) {
                 *gain = if on { 1.0 } else { 0.0 };
             }
             self.levels.restart_for_mode_change();
@@ -263,12 +303,7 @@ impl State {
             self.right_mode_transition.start();
         }
     }
-    fn set_routing(
-        &mut self,
-        routing: stereo::Routing,
-        pan_positions: &[i16; VOICE_COUNT],
-        sub_settings: &[[stack::Settings; stack::SUBS]; VOICE_COUNT],
-    ) {
+    fn set_routing(&mut self, routing: stereo::Routing, pan_positions: &[i16; VOICE_COUNT]) {
         let old = self.routing;
         let changed = old != Some(routing);
         let first_bus = if routing.stereo() {
@@ -312,17 +347,7 @@ impl State {
                 self.levels.restart_for_mode_change();
             }
         }
-        for (pan, position) in self
-            .pans
-            .iter_mut()
-            .chain(self.subvoices.iter_mut().flatten().map(|sub| &mut sub.pan))
-            .zip(
-                pan_positions
-                    .iter()
-                    .copied()
-                    .chain(sub_settings.iter().flatten().map(|s| s.pan)),
-            )
-        {
+        for (pan, &position) in self.pans.iter_mut().zip(pan_positions) {
             let gains = pan.gains();
             let immediate = old.is_none() || old.is_some_and(|old| !old.enabled());
             if routing.stereo() {
@@ -383,7 +408,7 @@ fn sync_midi_parameter_graying(context: &mut Callback<'_, Audio>) {
             .gray(voice_pitch_parameter(voice), midi)
             .is_some();
         applied &= parameters
-            .gray(voice_transpose_parameter(voice), midi)
+            .gray(voice_group_parameter(voice), !midi)
             .is_some();
     }
     if !applied {
@@ -404,11 +429,6 @@ fn sync_parameter_graying(context: &mut Callback<'_, Audio>) {
         applied &= parameters
             .gray(voice_pan_parameter(voice), !stereo)
             .is_some();
-        for sub in 0..stack::SUBS {
-            applied &= parameters
-                .gray(sub_parameter(voice, sub, 2), !stereo)
-                .is_some();
-        }
     }
     if !applied {
         context.state_mut().grayed_for_stereo = None;
@@ -547,9 +567,8 @@ impl Plugin for Wavesmith {
             destination,
             State {
                 engine: dsp::Engine::new(n, rate),
-                stack_gates: [0.0; levels::CHUNK],
                 midi: midi::MidiState::new(rate),
-                cv_gains: [0.0; VOICE_COUNT],
+                voice_gains: [0.0; VOICE_COUNT],
                 cv_pitch: dsp::CvPitchCache::new(),
                 levels: levels::LevelControl::new(rate),
                 level: levels::Level::new(),
@@ -572,7 +591,8 @@ impl Plugin for Wavesmith {
             arrays {
                 oscillators: |_| dsp::Oscillator::new(),
                 pans: |_| stereo::Pan::new(),
-                subvoices: |_| [stack::SubVoice::new(); stack::SUBS]
+                voice_groups: default_group,
+                group_gates: |_| [0.0; levels::CHUNK],
             }
         );
         Some(())
@@ -661,48 +681,16 @@ impl Plugin for Wavesmith {
             metadata.set_parameter(fine, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)?)?;
             let pan = voice_pan_parameter(voice);
             metadata.set_parameter(pan, definition(c"Pan", 0, 100, 50, UNIT_PERCENT)?)?;
-            for (sub, names) in [
-                [
-                    c"Sub 1 transpose",
-                    c"Sub 1 fine tune",
-                    c"Sub 1 pan",
-                    c"Sub 1 active",
-                ],
-                [
-                    c"Sub 2 transpose",
-                    c"Sub 2 fine tune",
-                    c"Sub 2 pan",
-                    c"Sub 2 active",
-                ],
-            ]
-            .iter()
-            .enumerate()
-            {
-                metadata.set_parameter(
-                    sub_parameter(voice, sub, 0),
-                    definition(names[0], -48, 48, 0, UNIT_SEMITONES)?,
-                )?;
-                metadata.set_parameter(
-                    sub_parameter(voice, sub, 1),
-                    definition(names[1], -100, 100, 0, UNIT_CENTS)?,
-                )?;
-                metadata.set_parameter(
-                    sub_parameter(voice, sub, 2),
-                    definition(names[2], 0, 100, 50, UNIT_PERCENT)?,
-                )?;
-                metadata.set_parameter(
-                    sub_parameter(voice, sub, 3),
-                    Definition::new(
-                        names[3],
-                        0,
-                        1,
-                        0,
-                        UNIT_ENUM,
-                        SCALING_NONE,
-                        Some(ACTIVE_VALUES.table()),
-                    )?,
-                )?;
-            }
+            metadata.set_parameter(
+                voice_group_parameter(voice),
+                definition(
+                    c"Voice Group",
+                    1,
+                    midi::GROUP_COUNT as i16,
+                    default_group(voice) as i16 + 1,
+                    UNIT_NONE,
+                )?,
+            )?;
             let active = voice_active_parameter(voice);
             metadata.set_parameter(
                 active,
@@ -725,14 +713,7 @@ impl Plugin for Wavesmith {
                     transpose as u8,
                     fine as u8,
                     pan as u8,
-                    sub_parameter(voice, 0, 0) as u8,
-                    sub_parameter(voice, 0, 1) as u8,
-                    sub_parameter(voice, 0, 2) as u8,
-                    sub_parameter(voice, 0, 3) as u8,
-                    sub_parameter(voice, 1, 0) as u8,
-                    sub_parameter(voice, 1, 1) as u8,
-                    sub_parameter(voice, 1, 2) as u8,
-                    sub_parameter(voice, 1, 3) as u8,
+                    voice_group_parameter(voice) as u8,
                     active as u8,
                 ],
             )?;
@@ -802,7 +783,7 @@ impl Plugin for Wavesmith {
                 Some(MIDI_CHANNELS.table()),
             )?,
         )?;
-        // Segment count does not add pages; even ten voices stay below 32 pages.
+        // 24 voice pages plus four shared pages leave room for the firmware page.
         // Walk the shape in time order, repeating Boundary 00 at the end.
         let mut indices = [0u8; dsp::MAX_SEGMENTS * 2 + 1];
         *indices.first_mut()? = WAVEFORM_START as u8;
@@ -832,7 +813,10 @@ impl Plugin for Wavesmith {
         if parameter == LEFT_OUTPUT as i32 || parameter == RIGHT_OUTPUT as i32 {
             sync_parameter_graying(context);
             if !output_routing(|p| context.read_parameters().value(p)).enabled() {
-                context.state_mut().midi.sync_enabled(&[false; VOICE_COUNT]);
+                context
+                    .state_mut()
+                    .midi
+                    .sync_enabled(&[false; midi::GROUP_COUNT]);
             }
             return;
         }
@@ -923,9 +907,11 @@ impl Plugin for Wavesmith {
         let p = context.read_parameters();
         let setting = p.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) as u8;
         let enabled = enabled_voices(|index| p.value(index));
+        let groups = read_groups(|index| p.value(index));
+        let available = enabled_groups(&enabled, &groups);
         let state = context.state_mut();
         state.set_midi_channel(setting, &enabled);
-        state.midi.message(status, data1, data2, &enabled);
+        state.midi.message(status, data1, data2, &available);
     }
 
     fn step(context: &mut Callback<'_, Audio>, samples: &mut [f32], frames: usize) {
@@ -953,29 +939,23 @@ impl Plugin for Wavesmith {
         let replace = p.value(OUTPUT_MODE).unwrap_or(0) != 0;
         let enabled = enabled_voices(|index| p.value(index));
         let mut render_voice = [false; VOICE_COUNT];
-        for (voice, (&on, render)) in enabled
+        for ((&on, render), &gain) in enabled
             .iter()
-            .zip(render_voice.iter_mut())
-            .take(VOICE_COUNT)
-            .enumerate()
+            .zip(&mut render_voice)
+            .zip(&context.state().voice_gains)
         {
-            *render = output_enabled
-                && (on
-                    || if midi_setting == 0 {
-                        context
-                            .state()
-                            .cv_gains
-                            .get(voice)
-                            .is_some_and(|&gain| gain > 0.0)
-                    } else {
-                        context
-                            .state()
-                            .midi
-                            .voices
-                            .get(voice)
-                            .is_some_and(|v| v.sounding())
-                    });
+            *render = output_enabled && (on || gain > 0.0);
         }
+        let desired_groups = if midi_setting != 0 {
+            read_groups(|index| p.value(index))
+        } else {
+            [0; VOICE_COUNT]
+        };
+        let available = if midi_setting != 0 {
+            enabled_groups(&enabled, &desired_groups)
+        } else {
+            [false; midi::GROUP_COUNT]
+        };
         // Tuning remains in octaves throughout setup; render_voice owns eligibility,
         // including release tails. No pitch value doubles as an enabled flag.
         let mut tuning_octaves = [0.0f32; VOICE_COUNT];
@@ -996,16 +976,16 @@ impl Plugin for Wavesmith {
                     .unwrap_or(0)
                     .clamp(-100, 100) as f32
                     / 1200.0;
-                if midi_setting != 0 {
-                    // MIDI ignores global Pitch, Pitch CV and per-voice Transpose.
-                    *pitch = fine + voice_fine;
-                    continue;
-                }
                 let transpose = p
                     .value(voice_transpose_parameter(voice))
                     .unwrap_or(0)
                     .clamp(-48, 48) as f32
                     / 12.0;
+                if midi_setting != 0 {
+                    // MIDI ignores global Pitch and Pitch CV; per-voice transpose applies.
+                    *pitch = fine + voice_fine + transpose;
+                    continue;
+                }
                 let bus = p.value(voice_pitch_parameter(voice)).unwrap_or(0);
                 let cv = buses.read_first(bus);
                 let cv = if cv.is_finite() {
@@ -1019,119 +999,78 @@ impl Plugin for Wavesmith {
                 *pitch = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
-        let mut sub_settings = [[stack::Settings::OFF; stack::SUBS]; VOICE_COUNT];
-        if output_enabled {
-            for (voice, ((settings, &render), subs)) in sub_settings
-                .iter_mut()
-                .zip(&render_voice)
-                .zip(&context.state().subvoices)
-                .enumerate()
-            {
-                for (sub, (setting, sub_voice)) in settings.iter_mut().zip(subs).enumerate() {
-                    setting.active = p.value(sub_parameter(voice, sub, 3)).unwrap_or(0) != 0;
-                    if routing.stereo() {
-                        setting.pan = p.value(sub_parameter(voice, sub, 2)).unwrap_or(50);
-                    }
-                    if render && sub_voice.rendering(setting.active) {
-                        setting.octaves = p
-                            .value(sub_parameter(voice, sub, 0))
-                            .unwrap_or(0)
-                            .clamp(-48, 48) as f32
-                            / 12.0
-                            + p.value(sub_parameter(voice, sub, 1))
-                                .unwrap_or(0)
-                                .clamp(-100, 100) as f32
-                                / 1200.0;
-                    }
-                }
-            }
-        }
         let processing = context.processing();
         let state = processing.state;
         let level = state.level.amplitude(level_db);
         let memory = processing.regions;
         state.set_midi_channel(midi_setting, &enabled);
-        state.set_routing(routing, &pan_positions, &sub_settings);
+        state.set_routing(routing, &pan_positions);
         if output_enabled {
-            state.midi.release_disabled(&enabled);
+            state.midi.release_disabled(&available);
         } else {
-            state.midi.sync_enabled(&enabled);
-            state.cv_gains = [0.0; VOICE_COUNT];
-            for sub in state.subvoices.iter_mut().flatten() {
-                sub.reset();
-            }
+            state.midi.sync_enabled(&available);
+            state.voice_gains = [0.0; VOICE_COUNT];
         }
         state.midi.begin_block();
-        let pitch_bends = &state.midi.pitch_bends;
+        let retuned = core::array::from_fn::<_, { midi::GROUP_COUNT }, _>(|group| {
+            state
+                .midi
+                .groups
+                .get_mut(group)
+                .is_some_and(|group| group.take_retune())
+        });
         state.cv_pitch.begin_block();
-        for ((((((midi, oscillator), &tuning), render), &(bus, cv)), subs), settings) in state
-            .midi
-            .voices
-            .iter_mut()
-            .zip(state.oscillators.iter_mut())
-            .zip(&tuning_octaves)
-            .zip(render_voice.iter_mut())
-            .zip(&cv_inputs)
-            .zip(state.subvoices.iter_mut())
-            .zip(&sub_settings)
-            .take(VOICE_COUNT)
+        for (((((((oscillator, gain), binding), &desired), &on), &tuning), &(bus, cv)), render) in
+            state
+                .oscillators
+                .iter_mut()
+                .zip(&mut state.voice_gains)
+                .zip(&mut state.voice_groups)
+                .zip(&desired_groups)
+                .zip(&enabled)
+                .zip(&tuning_octaves)
+                .zip(&cv_inputs)
+                .zip(&mut render_voice)
         {
-            if !*render {
-                for (sub, setting) in subs.iter_mut().zip(settings) {
-                    if !setting.active {
-                        sub.silence();
-                    }
-                }
-                continue;
-            }
             if midi_setting != 0 {
-                if !midi.sounding() {
+                let old_sounding = state
+                    .midi
+                    .groups
+                    .get(*binding as usize)
+                    .is_some_and(|group| group.sounding());
+                let changed = *binding != desired
+                    && (*gain == 0.0 || !old_sounding || oscillator.is_silent());
+                if changed {
+                    *binding = desired;
+                }
+                let Some(group) = state.midi.groups.get(*binding as usize) else {
                     *render = false;
-                    for (sub, setting) in subs.iter_mut().zip(settings) {
-                        if !setting.active {
-                            sub.silence();
-                        }
+                    continue;
+                };
+                if !*render || !group.sounding() {
+                    if !on {
+                        *gain = 0.0;
                     }
+                    *render = false;
                     continue;
                 }
-                let octave =
-                    (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + tuning;
+                let octave = (group.pitch() as f32 - 69.0) / 12.0
+                    + group.bend_octaves(&state.midi.pitch_bends)
+                    + tuning;
                 let frequency = oscillator.frequency(octave.clamp(-16.0, 16.0));
-                let retune = midi.take_retune();
-                if retune {
+                if changed
+                    || *gain == 0.0
+                    || retuned.get(*binding as usize).copied().unwrap_or(false)
+                {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
-                }
-                for (sub, setting) in subs.iter_mut().zip(settings) {
-                    if sub.rendering(setting.active) {
-                        let frequency = sub
-                            .oscillator
-                            .frequency((octave + setting.octaves).clamp(-16.0, 16.0));
-                        if retune {
-                            sub.oscillator
-                                .tune_when_silent(frequency, state.sample_rate);
-                        }
-                        if frames > 0 {
-                            sub.oscillator.prepare(frequency, state.sample_rate, level);
-                        }
-                    }
                 }
                 if frames > 0 {
                     oscillator.prepare(frequency, state.sample_rate, level);
                 }
-            } else {
+            } else if *render {
                 let factor = state.cv_pitch.factor(bus, cv);
                 if frames > 0 {
                     oscillator.prepare_cv(tuning, factor, state.sample_rate, level);
-                    for (sub, setting) in subs.iter_mut().zip(settings) {
-                        if sub.rendering(setting.active) {
-                            sub.oscillator.prepare_cv(
-                                (tuning + setting.octaves).clamp(-16.0, 16.0),
-                                factor,
-                                state.sample_rate,
-                                level,
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -1163,68 +1102,82 @@ impl Plugin for Wavesmith {
                 let Some(voice_mix) = state.voice_mix.get_mut(..length) else {
                     return;
                 };
-                let Some(stack_gates) = state.stack_gates.get_mut(..length) else {
-                    return;
-                };
                 let mut voice_power = 0.0;
                 let mut gate_power = 0.0;
                 #[cfg(feature = "profiling")]
                 let render_start = distingnt_api::api::cpu_cycle_count();
-                for (((((((oscillator, midi), &render), cv_gain), &on), pan), subs), settings) in
-                    state
-                        .oscillators
+                let mut group_states = [midi::GateState::Silent; midi::GROUP_COUNT];
+                if midi_setting != 0 {
+                    for ((group, gates), status) in state
+                        .midi
+                        .groups
                         .iter_mut()
-                        .zip(state.midi.voices.iter_mut())
-                        .zip(&render_voice)
-                        .zip(state.cv_gains.iter_mut())
-                        .zip(&enabled)
-                        .zip(state.pans.iter_mut())
-                        .zip(state.subvoices.iter_mut())
-                        .zip(&sub_settings)
-                        .take(VOICE_COUNT)
+                        .zip(&mut state.group_gates)
+                        .zip(&mut group_states)
+                    {
+                        *status = group.gate_state();
+                        if *status == midi::GateState::Ramping {
+                            let Some(gates) = gates.get_mut(..length) else {
+                                return;
+                            };
+                            for gate in gates {
+                                *gate = group.next_gain(gate_step);
+                            }
+                        }
+                    }
+                }
+                for ((((((oscillator, gain), &binding), &desired), &render), &on), pan) in state
+                    .oscillators
+                    .iter_mut()
+                    .zip(&mut state.voice_gains)
+                    .zip(&state.voice_groups)
+                    .zip(&desired_groups)
+                    .zip(&render_voice)
+                    .zip(&enabled)
+                    .zip(&mut state.pans)
                 {
                     if !render {
                         continue;
                     }
                     voice_mix.fill(0.0);
 
-                    let has_subs = subs
-                        .iter()
-                        .zip(settings)
-                        .any(|(s, setting)| s.rendering(setting.active));
-                    let steady_gate = if midi_setting == 0 {
-                        on && *cv_gain == 1.0
+                    let following = midi_setting == 0 || binding == desired;
+                    let gate_on = on && following;
+                    let group_state = group_states
+                        .get(binding as usize)
+                        .copied()
+                        .unwrap_or(midi::GateState::Silent);
+                    let shared_gate_steady =
+                        midi_setting == 0 || group_state == midi::GateState::Steady;
+                    let gates = if group_state == midi::GateState::Ramping {
+                        state.group_gates.get(binding as usize)
                     } else {
-                        midi.gate_is_steady()
+                        None
                     };
-                    if has_subs {
-                        stack_gates.fill(0.0);
-                    }
-                    if steady_gate && oscillator.render_open_gate(&state.engine, memory, voice_mix)
+                    if gate_on
+                        && *gain == 1.0
+                        && shared_gate_steady
+                        && oscillator.render_open_gate(&state.engine, memory, voice_mix)
                     {
-                        if has_subs {
-                            stack_gates.fill(1.0);
-                        }
                         gate_power += length as f32;
                     } else {
                         for (frame, sample) in voice_mix.iter_mut().enumerate() {
-                            let gate = if midi_setting == 0 {
-                                *cv_gain = if on {
-                                    (*cv_gain + gate_step).min(1.0)
-                                } else {
-                                    (*cv_gain - gate_step).max(0.0)
-                                };
-                                *cv_gain
+                            *gain = if gate_on {
+                                (*gain + gate_step).min(1.0)
                             } else {
-                                midi.next_gain(gate_step)
+                                (*gain - gate_step).max(0.0)
                             };
+                            let shared_gate = if shared_gate_steady {
+                                1.0
+                            } else {
+                                gates
+                                    .and_then(|gates| gates.get(frame))
+                                    .copied()
+                                    .unwrap_or(0.0)
+                            };
+                            let gate = *gain * shared_gate;
                             if gate == 0.0 {
                                 break;
-                            }
-                            if has_subs {
-                                if let Some(sample) = stack_gates.get_mut(frame) {
-                                    *sample = gate;
-                                }
                             }
                             gate_power += gate * gate;
                             *sample = gate
@@ -1241,29 +1194,6 @@ impl Plugin for Wavesmith {
                         for (sum, &sample) in mix.iter_mut().zip(voice_mix.iter()) {
                             *sum += sample;
                             voice_power += sample * sample;
-                        }
-                    }
-                    for (sub, setting) in subs.iter_mut().zip(settings) {
-                        if !sub.rendering(setting.active) {
-                            continue;
-                        }
-                        gate_power += sub.render(
-                            &state.engine,
-                            memory,
-                            voice_mix,
-                            stack_gates,
-                            steady_gate,
-                            setting.active,
-                            gate_step,
-                            chunk_index * levels::CHUNK,
-                        );
-                        if routing.stereo() || sub.pan.moving() {
-                            voice_power += sub.pan.mix(voice_mix, mix, right_mix, state.pan_slew);
-                        } else {
-                            for (sum, &sample) in mix.iter_mut().zip(voice_mix.iter()) {
-                                *sum += sample;
-                                voice_power += sample * sample;
-                            }
                         }
                     }
                 }

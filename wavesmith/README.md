@@ -2,9 +2,8 @@
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
 The only setup specification is Segments (2–32, default 8). Every instance
-provides ten note voices, each with a main oscillator and two optional sub-oscillators
-(up to 30 sounding oscillators). Voice 1 defaults to Active On and Voices 2–10
-to Off; both subs default to Off in every voice.
+provides 24 independent oscillator voices; only Voice 1 defaults to Active On.
+In MIDI mode, Voice Group assigns each oscillator to one of eight note groups.
 Every instance uses six 256-sample anti-alias tables per bank. Configured voices
 share the same waveform and table banks. Shape edits work while audio plays.
 Use the NT's respecification workflow to change the segment count; use each
@@ -168,37 +167,31 @@ held sample; centered stereo settles at -3 dB per side. Existing pan settings ar
 retained and restored when stereo becomes available again. Live routing edits do
 not restart RMS or peak protection; reconnecting after silence still acquires
 startup attenuation.
-Every instance has Voice 1 through Voice 10 pages, containing Pitch CV,
-Transpose and Fine tune for the parent pitch, and Pan for its main oscillator.
-These are followed by Sub 1 transpose, fine tune, pan and active, then the same
-four controls for Sub 2, and finally the parent Active switch. Parameter names
-are shared; the API's
-parameter UI prefix identifies the voice as V1: through V10:. Voice pages share
-a navigation group so switching voices retains the selected parameter row.
-Transpose ranges from -48 to +48 semitones; per-voice Fine tune ranges from -100
-to +100 cents. Both offsets default to zero. Active is an Off/On enum; only Voice 1 defaults to On.
-An Off voice is silent in CV mode and immediately excluded from MIDI allocation
-and voice stealing. Turning off a sounding voice uses a short approximately 5 ms
-fade; after that, its CV reads, pitch conversion and oscillator rendering stop.
-Re-enabling a MIDI voice makes it available for new notes without resuming an
-old held key. CV voices fade in when re-enabled. Active remains editable in
-both MIDI and CV modes and uses the same V1: through V10: parameter prefixes.
-Output routing remains shared.
+Every instance has Voice 1 through Voice 24 pages, containing Pitch CV,
+Transpose, Fine tune, Pan, Voice Group, and Active in that order. Parameter names
+are shared; the API's parameter UI prefix identifies V1: through V24:. All voice
+pages share a navigation group, so moving between pages retains the selected row.
+Transpose ranges from -48 to +48 semitones and Fine tune from -100 to +100 cents;
+both default to zero and apply in CV and MIDI modes. Each Pan is independent,
+with centered defaults and the shared stereo/mono behavior described above.
+Active is an Off/On enum, always last, with only Voice 1 initially On.
 
-Each sub follows its parent's pitch with an additional -48..+48 semitone
-offset and -100..+100 cent fine adjustment. Both offsets default to zero; its
-independent pan defaults to 50%. Sub transposition applies in MIDI as well as
-CV mode, while the parent's existing Transpose remains CV-only. Parent Fine
-tune and shared Fine tune affect all three oscillators. Mono routing ignores
-all pans; stereo enables them independently.
+Voice Group ranges from 1 to 8. Defaults assign consecutive sets of three:
+Voices 1–3 to Group 1, Voices 4–6 to Group 2, through Voices 22–24 to Group 8. In CV mode it is grayed out and has no effect: every active oscillator
+uses its own Pitch CV and tuning. In MIDI mode groups containing active voices
+are allocated notes, and all active members follow their group's note, bend and
+gate while retaining independent transpose, fine tune and pan. For example,
+five members in Group 1 and two in Group 2 give two-note polyphony with different
+stack sizes. Empty/inactive groups are skipped. No fixed sub-oscillators remain.
 
-MIDI allocates and steals whole groups: one note occupies one of the ten note
-voices, regardless of enabled sub count. All three oscillators share one gate,
-pitch bend and release/steal timing. A sub's Active switch adds a short fade
-when enabling or disabling it, and disabled subs skip pitch preparation and
-audio rendering after their fade. Parent Active disables the whole group.
-All sounding oscillators contribute to the linked RMS/peak controller.
-Waveform tables, rebuilding and FFT work remain shared across all 30 oscillators.
+Turning off one oscillator fades it out without releasing other members of its
+MIDI group. Disabling the final member releases that group's held note and
+excludes it from allocation. Enabling a member of a sounding group fades it into
+the existing note. Moving between held groups first fades out the old binding,
+then adopts the latest destination and fades in; other members continue playing.
+The short fades take approximately 5 ms each. Once silent, inactive oscillators
+skip CV reads, pitch conversion and rendering. Output routing remains shared.
+Waveform tables, rebuilding and FFT work are shared across all 24 oscillators.
 
 When Left Output and Right Output are both None, Wavesmith disables all voice
 CV reading, frequency conversion, phase advancement and sample generation;
@@ -210,7 +203,7 @@ are weighted by their squared attack/release gates, so a barely audible new note
 does not suddenly halve the reference. A minimum weight of one preserves the
 natural envelope of a single note. CV voices each have full weight. This
 accounts for correlated unison voices as well as independently pitched notes;
-there is no fixed division by ten. Level remains applied
+there is no fixed division by the voice count. Level remains applied
 to the voices, so the loudness reference follows Level and the current waveform.
 Level uses the NT's dB/minus-infinity unit: integer steps from −60 through 0 dB,
 with −60 displayed as −inf and mapped to true zero gain. Other values use
@@ -256,27 +249,28 @@ the destination bus. Each voice has its own phase, pitch/gain slew and anti-alia
 selection. Persistent frequency caches and steady playback remain active.
 The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
 more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
-reserve thirty oscillator states and ten MIDI note slots; only active oscillators
+reserve 24 oscillator states and eight MIDI note-group slots; only active oscillators
 and short fading tails are processed.
-All ten voice pages and their parameters are always present.
+All 24 voice pages and their parameters are always present.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
 or a channel number to control every enabled voice with MIDI instead. In MIDI
-mode, Pitch CV inputs, manual Pitch, and per-voice Transpose are ignored. Shared
+mode, Pitch CV inputs and manual Pitch are ignored. Per-voice Transpose, shared
 Fine tune, per-voice Fine tune, and Level still apply. The ignored parameters are
 grayed out through the NT API while MIDI is enabled and restored when MIDI is
 Off, without changing their stored values. In the custom Tuning view, Pitch is
 dim and its pot is inactive in MIDI mode; Fine and Level remain editable.
-The MIDI pool always has ten slots; Active controls which members can be
-allocated (for example, five On voices give five-note polyphony). Unassigned MIDI
-voices remain silent; when no notes are held, the shared output is silent after
-release fades finish.
+Voice Group is enabled only in MIDI mode. There are eight note slots; available
+polyphony is the number of distinct groups with active members (at most eight),
+not the number of active oscillators. Unassigned groups and their oscillators
+remain silent, and all release tails finish when no keys remain held.
 
-Note On uses an idle voice first, then a releasing voice, then steals the oldest
-held note. Repeated Note On for an already-held key retriggers that voice. Note
-Off and velocity-zero Note On release the matching channel/note; releasing a
-stolen key does not stop its replacement. About 5 ms attack/release fades reduce
-clicks. A stolen voice fades out before starting its new pitch from silence.
+Note On uses an idle group first, then a releasing group, then steals the oldest
+held group's note. Repeated Note On for an already-held key retriggers that group.
+Note Off and velocity-zero Note On release the matching channel/note; a stale
+release cannot stop a replacement note. All members share the same approximately
+5 ms gate ramp, advanced once per audio frame regardless of group size. A stolen
+group fades out before every member retunes to the replacement note.
 Pitch bend uses the full 14-bit MIDI value with a fixed +/-2-semitone range.
 Bend is tracked independently per MIDI channel, affects held/releasing and new
 notes, and is reset when MIDI Channel changes. It combines with both fine-tune
@@ -291,8 +285,8 @@ in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
 and so on, ending with Curve N and Boundary 00. Each interior boundary appears
 once and is still shared by its neighboring segments in the custom editor.
 One editable parameter supplies both endpoint rows. There are four shared
-pages (Oscillator, Output, Shape, Waveform) plus ten voice pages and the NT's
-own Common page. The plugin always has 14 pages, independently of segment count. This avoids the firmware's page-count issue at
+pages (Oscillator, Output, Shape, Waveform) plus 24 voice pages and the NT's
+own Common page. The plugin always has 28 pages, (29 including Common), independently of segment count. This avoids the firmware's page-count issue at
 high segment counts.
 All numeric shape parameters are host-visible;
 dedicated segment modulation routing is deferred. Ordinary parameter values are
@@ -462,17 +456,16 @@ contribution ceiling. Asymmetric waves can have DC offset.
 
 ## Build and test
 
-**Sub-oscillator prototype:** the extra eight controls per note voice change
-parameter ordinals. Add a fresh Wavesmith instance after upgrading; existing
-instances/presets and mappings from the earlier layout are not migrated. The
-new layout stays stable when respecifying Segments. Voice pages still share one
-navigation group, and parent Active remains their last row.
+**Grouped-voice prototype:** add a fresh Wavesmith instance after upgrading
+from the three-oscillator stack checkpoint. Parameter ordinals have changed;
+existing instances, presets and mappings are not migrated automatically. The
+new layout stays stable when respecifying Segments, and Active remains last.
 
-The audio bank is fixed at six tables and the voice pool at ten slots.
+The audio bank is fixed at six tables, with 24 oscillators and eight MIDI groups.
 Only Voice 1 is active by default. Segments is the only specification.
-The page order is Oscillator, Output, Shape, Voice 1 through Voice 10, Waveform.
+The page order is Oscillator, Output, Shape, Voice 1 through Voice 24, Waveform.
 Underlying parameter ordinals now follow that same order: 19 shared controls,
-thirteen parameters for each of ten voices, then interleaved boundary/curve values.
+six parameters for each of 24 voices, then interleaved boundary/curve values.
 Boundary 00 is one shared seam parameter shown again at the end of Waveform.
 
 This revision changes parameter ordinals. Recreate earlier instances/presets and
@@ -501,13 +494,13 @@ procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
 independent segment-width editing, and per-boundary smoothing are deferred.
 
-There is no Voices specification. The 149 fixed shared/voice parameters precede
+There is no Voices specification. The 163 fixed shared/voice parameters precede
 all waveform boundaries and curves, which are appended as interleaved pairs.
-The total is 149 + 2 * Segments (153–213 parameters). Changing Segments preserves
+The total is 163 + 2 * Segments (167–227 parameters). Changing Segments preserves
 the identities and ordinals of all surviving controls. Removed segment values
 are discarded by the host; newly added segments receive their defaults.
 This is a one-time specification/layout change from older builds: review existing
-presets and CV mappings, especially presets saved with fewer than ten voices.
+presets and CV mappings, especially instances from the fixed-stack layout.
 
 Stereo adds Right Output and one Pan control per voice. This shifts later
 parameter ordinals once; review presets and CV mappings created with earlier
@@ -563,7 +556,7 @@ This keeps unsolicited reports out of the firmware upload protocol. No notes
 or musical parameter changes are sent. Run from the repository root:
 
 ```powershell
-python wavesmith/tools/monitor_cycles.py --seconds 100 --warmup 5 --label baseline --expect-voices 10 --expect-mode cv --expect-stereo
+python wavesmith/tools/monitor_cycles.py --seconds 100 --warmup 5 --label baseline --expect-voices 24 --expect-mode cv --expect-stereo
 ```
 
 CSV and JSON summaries are written under ignored `target/wavesmith-profiling/`.
@@ -578,8 +571,9 @@ Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
 version `1`; base report type `1` has the fields below. All integer fields are little-endian base-128:
 instance index (5 bytes), sequence (5), displayed average cycles (5), measured
 cycle sum (10), callback count (5), frame count (5), sample rate (5), last block
-size (5), followed by note-voice count, MIDI mode and stereo flags (one byte each).
-The voice count describes note groups, not the number of enabled sub-oscillators.
+size (5), followed by oscillator count, MIDI mode and stereo flags (one byte each).
+The count describes oscillators prepared for rendering, including release tails,
+rather than the number of MIDI note groups.
 The monitor calculates a weighted cycle average from sums and counts over the
 whole run rather than averaging occasional screen readings. One report covers
 approximately one second of audio, with no extra work inside the timed loops.

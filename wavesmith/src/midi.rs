@@ -1,9 +1,16 @@
 //! Fixed-size MIDI allocator and short click-suppression gates. No audio buffers.
 #![forbid(unsafe_code)]
-use super::VOICE_COUNT;
+pub const GROUP_COUNT: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateState {
+    Silent,
+    Steady,
+    Ramping,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NoteVoice {
+pub struct NoteGroup {
     note: u8,
     channel: u8,
     order: u8,
@@ -15,7 +22,7 @@ pub struct NoteVoice {
     gain: f32,
 }
 
-impl NoteVoice {
+impl NoteGroup {
     const fn new() -> Self {
         Self {
             note: 0,
@@ -44,6 +51,15 @@ impl NoteVoice {
     pub fn gate_is_steady(&self) -> bool {
         self.held && !self.switching && self.gain == 1.0
     }
+    pub fn gate_state(&self) -> GateState {
+        if self.gate_is_steady() {
+            GateState::Steady
+        } else if self.sounding() {
+            GateState::Ramping
+        } else {
+            GateState::Silent
+        }
+    }
     pub fn next_gain(&mut self, step: f32) -> f32 {
         self.gain = if self.held && !self.switching {
             (self.gain + step).min(1.0)
@@ -56,7 +72,7 @@ impl NoteVoice {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MidiState {
-    pub voices: [NoteVoice; VOICE_COUNT],
+    pub groups: [NoteGroup; GROUP_COUNT],
     pub gate_step: f32,
     // Cached octave offsets per MIDI channel; center is zero. Retain bend
     // before Note On and while the output is disabled, without retuning CV.
@@ -67,7 +83,7 @@ pub struct MidiState {
 impl MidiState {
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            voices: [NoteVoice::new(); VOICE_COUNT],
+            groups: [NoteGroup::new(); GROUP_COUNT],
             gate_step: 1.0 / (sample_rate / 200).max(1) as f32,
             channel_setting: 0,
             pitch_bends: [0.0; 16],
@@ -79,19 +95,19 @@ impl MidiState {
         }
         self.channel_setting = setting;
         self.pitch_bends = [0.0; 16];
-        self.voices = [NoteVoice::new(); VOICE_COUNT];
+        self.groups = [NoteGroup::new(); GROUP_COUNT];
         true
     }
-    pub fn sync_enabled(&mut self, enabled: &[bool; VOICE_COUNT]) {
+    pub fn sync_enabled(&mut self, enabled: &[bool; GROUP_COUNT]) {
         for (index, &enabled) in enabled.iter().enumerate() {
             if !enabled {
                 self.forget(index);
             }
         }
     }
-    /// Remove disabled voices from allocation immediately while allowing their
+    /// Remove disabled groups from allocation immediately while allowing their
     /// existing note to finish the normal short release gate.
-    pub fn release_disabled(&mut self, enabled: &[bool; VOICE_COUNT]) {
+    pub fn release_disabled(&mut self, enabled: &[bool; GROUP_COUNT]) {
         for (index, &on) in enabled.iter().enumerate() {
             if !on {
                 self.release(index);
@@ -100,39 +116,39 @@ impl MidiState {
     }
     pub fn forget(&mut self, index: usize) {
         self.release(index);
-        if let Some(voice) = self.voices.get_mut(index) {
-            *voice = NoteVoice::new();
+        if let Some(group) = self.groups.get_mut(index) {
+            *group = NoteGroup::new();
         }
     }
     fn release(&mut self, index: usize) {
-        let Some(voice) = self.voices.get(index) else {
+        let Some(group) = self.groups.get(index) else {
             return;
         };
-        if !voice.held {
+        if !group.held {
             return;
         }
-        let order = voice.order;
-        for (i, voice) in self.voices.iter_mut().enumerate() {
+        let order = group.order;
+        for (i, group) in self.groups.iter_mut().enumerate() {
             if i == index {
-                voice.held = false;
-            } else if voice.held && voice.order > order {
-                voice.order -= 1;
+                group.held = false;
+            } else if group.held && group.order > order {
+                group.order -= 1;
             }
         }
     }
     pub fn begin_block(&mut self) {
-        for voice in &mut self.voices {
-            if voice.switching && voice.gain == 0.0 {
-                if voice.held {
-                    voice.playing_note = voice.note;
-                    voice.playing_channel = voice.channel;
-                    voice.retune = true;
+        for group in &mut self.groups {
+            if group.switching && group.gain == 0.0 {
+                if group.held {
+                    group.playing_note = group.note;
+                    group.playing_channel = group.channel;
+                    group.retune = true;
                 }
-                voice.switching = false;
+                group.switching = false;
             }
         }
     }
-    pub fn message(&mut self, status: u8, data1: u8, data2: u8, enabled: &[bool; VOICE_COUNT]) {
+    pub fn message(&mut self, status: u8, data1: u8, data2: u8, enabled: &[bool; GROUP_COUNT]) {
         if self.channel_setting == 0 || data1 > 127 || data2 > 127 {
             return;
         }
@@ -151,19 +167,19 @@ impl MidiState {
             0x90 if data2 != 0 => self.note_on(channel, data1, enabled),
             0x80 | 0x90 => {
                 if let Some(index) = self
-                    .voices
+                    .groups
                     .iter()
-                    .position(|voice| voice.held && voice.note == data1 && voice.channel == channel)
+                    .position(|group| group.held && group.note == data1 && group.channel == channel)
                 {
                     self.release(index);
                 }
             }
             0xb0 if data1 == 123 || data1 == 120 => {
-                for index in 0..VOICE_COUNT {
+                for index in 0..GROUP_COUNT {
                     if self
-                        .voices
+                        .groups
                         .get(index)
-                        .is_some_and(|voice| voice.channel == channel)
+                        .is_some_and(|group| group.channel == channel)
                     {
                         if data1 == 120 {
                             self.forget(index);
@@ -176,27 +192,27 @@ impl MidiState {
             _ => {}
         }
     }
-    fn note_on(&mut self, channel: u8, note: u8, enabled: &[bool; VOICE_COUNT]) {
-        // Retrigger an already-held key; otherwise prefer fully idle voices,
-        // then released voices, then steal the oldest held note (order zero).
+    fn note_on(&mut self, channel: u8, note: u8, enabled: &[bool; GROUP_COUNT]) {
+        // Retrigger an already-held key; otherwise prefer fully idle groups,
+        // then released groups, then steal the oldest held note (order zero).
         let index = self
-            .voices
+            .groups
             .iter()
             .position(|v| v.held && v.channel == channel && v.note == note)
             .or_else(|| {
-                self.voices
+                self.groups
                     .iter()
                     .zip(enabled)
                     .position(|(v, &on)| on && !v.held && v.gain == 0.0 && !v.switching)
             })
             .or_else(|| {
-                self.voices
+                self.groups
                     .iter()
                     .zip(enabled)
                     .position(|(v, &on)| on && !v.held)
             })
             .or_else(|| {
-                self.voices
+                self.groups
                     .iter()
                     .enumerate()
                     .filter(|(_, v)| v.held)
@@ -207,17 +223,17 @@ impl MidiState {
             return;
         };
         self.release(index);
-        let newest = self.voices.iter().filter(|v| v.held).count() as u8;
-        if let Some(voice) = self.voices.get_mut(index) {
-            voice.note = note;
-            voice.channel = channel;
-            voice.order = newest;
-            voice.held = true;
-            voice.switching = voice.gain > 0.0;
-            if !voice.switching {
-                voice.playing_note = note;
-                voice.playing_channel = channel;
-                voice.retune = true;
+        let newest = self.groups.iter().filter(|v| v.held).count() as u8;
+        if let Some(group) = self.groups.get_mut(index) {
+            group.note = note;
+            group.channel = channel;
+            group.order = newest;
+            group.held = true;
+            group.switching = group.gain > 0.0;
+            if !group.switching {
+                group.playing_note = note;
+                group.playing_channel = channel;
+                group.retune = true;
             }
         }
     }

@@ -855,6 +855,10 @@ impl Oscillator {
         }
     }
 
+    pub fn is_silent(&self) -> bool {
+        self.level == 0.0
+    }
+
     pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
         self.pair_pending = false;
         let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;

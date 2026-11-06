@@ -3,8 +3,8 @@ use super::*;
 fn run_gate(midi: &mut MidiState, frames: usize) {
     for _ in 0..frames {
         midi.begin_block();
-        for voice in &mut midi.voices {
-            voice.next_gain(midi.gate_step);
+        for group in &mut midi.groups {
+            group.next_gain(midi.gate_step);
         }
     }
 }
@@ -13,121 +13,121 @@ fn run_gate(midi: &mut MidiState, frames: usize) {
 fn allocation_steals_oldest_and_old_note_off_cannot_release_its_replacement() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let enabled = [true; VOICE_COUNT];
-    for note in [60, 64, 67, 71, 72, 73, 75, 77, 80, 83] {
+    let enabled = [true; GROUP_COUNT];
+    for note in [60, 64, 67, 71, 72, 73, 75, 77] {
         midi.message(0x90, note, 100, &enabled);
     }
     run_gate(&mut midi, 250);
     midi.message(0x90, 74, 100, &enabled);
-    assert_eq!(midi.voices[0].note, 74);
-    assert_eq!(midi.voices[0].playing_note, 60);
-    assert!(midi.voices[0].switching);
+    assert_eq!(midi.groups[0].note, 74);
+    assert_eq!(midi.groups[0].playing_note, 60);
+    assert!(midi.groups[0].switching);
     midi.message(0x80, 60, 0, &enabled);
-    assert!(midi.voices[0].held);
+    assert!(midi.groups[0].held);
     run_gate(&mut midi, 500);
-    assert_eq!(midi.voices[0].playing_note, 74);
-    assert_eq!(midi.voices[0].gain, 1.0);
+    assert_eq!(midi.groups[0].playing_note, 74);
+    assert_eq!(midi.groups[0].gain, 1.0);
     midi.message(0x90, 76, 100, &enabled);
-    assert_eq!(midi.voices[1].note, 76);
+    assert_eq!(midi.groups[1].note, 76);
     midi.message(0x80, 67, 0, &enabled);
     midi.message(0x90, 79, 100, &enabled);
-    assert_eq!(midi.voices[2].note, 79);
-    assert_eq!(midi.voices[3].note, 71);
+    assert_eq!(midi.groups[2].note, 79);
+    assert_eq!(midi.groups[3].note, 71);
 }
 
 #[test]
 fn channel_filter_disabled_outputs_and_velocity_zero_note_off() {
     let mut midi = MidiState::new(48000);
-    let mut enabled = [false; VOICE_COUNT];
+    let mut enabled = [false; GROUP_COUNT];
     enabled[1] = true;
     enabled[3] = true;
     midi.message(0x90, 60, 100, &enabled);
-    assert!(midi.voices.iter().all(|v| !v.held));
+    assert!(midi.groups.iter().all(|v| !v.held));
     midi.set_channel(3); // channel 2
     midi.message(0x90, 60, 100, &enabled);
-    assert!(midi.voices.iter().all(|v| !v.held));
+    assert!(midi.groups.iter().all(|v| !v.held));
     midi.message(0x91, 60, 100, &enabled);
     midi.message(0x91, 64, 100, &enabled);
-    assert_eq!(midi.voices[1].note, 60);
-    assert_eq!(midi.voices[3].note, 64);
-    assert_eq!(midi.voices[0], NoteVoice::new());
+    assert_eq!(midi.groups[1].note, 60);
+    assert_eq!(midi.groups[3].note, 64);
+    assert_eq!(midi.groups[0], NoteGroup::new());
     midi.message(0x91, 67, 100, &enabled);
-    assert_eq!(midi.voices[1].note, 67);
+    assert_eq!(midi.groups[1].note, 67);
     midi.message(0x90, 67, 0, &enabled);
-    assert!(midi.voices[1].held);
+    assert!(midi.groups[1].held);
     midi.message(0x91, 67, 0, &enabled);
-    assert!(!midi.voices[1].held);
+    assert!(!midi.groups[1].held);
     midi.set_channel(0);
-    assert!(midi.voices.iter().all(|v| *v == NoteVoice::new()));
+    assert!(midi.groups.iter().all(|v| *v == NoteGroup::new()));
 }
 
 #[test]
-fn gates_fade_and_pending_note_off_does_not_restart_a_stolen_voice() {
+fn gates_fade_and_pending_note_off_does_not_restart_a_stolen_group() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let mut enabled = [false; VOICE_COUNT];
+    let mut enabled = [false; GROUP_COUNT];
     enabled[0] = true;
     midi.message(0x90, 60, 127, &enabled);
     run_gate(&mut midi, 120);
-    assert!((midi.voices[0].gain - 0.5).abs() < 0.001);
+    assert!((midi.groups[0].gain - 0.5).abs() < 0.001);
     run_gate(&mut midi, 130);
-    assert_eq!(midi.voices[0].gain, 1.0);
+    assert_eq!(midi.groups[0].gain, 1.0);
     midi.message(0x90, 67, 127, &enabled);
     midi.message(0x80, 67, 0, &enabled);
     run_gate(&mut midi, 500);
-    assert!(!midi.voices[0].sounding());
-    assert_eq!(midi.voices[0].gain, 0.0);
+    assert!(!midi.groups[0].sounding());
+    assert_eq!(midi.groups[0].gain, 0.0);
     midi.message(0x90, 72, 127, &enabled);
     midi.message(0x90, 72, 127, &enabled);
-    assert_eq!(midi.voices.iter().filter(|v| v.held).count(), 1);
+    assert_eq!(midi.groups.iter().filter(|v| v.held).count(), 1);
     midi.message(0xb0, 123, 0, &enabled);
     run_gate(&mut midi, 250);
-    assert!(!midi.voices[0].sounding());
+    assert!(!midi.groups[0].sounding());
     midi.message(0x90, 74, 127, &enabled);
     run_gate(&mut midi, 120);
     midi.message(0xb0, 120, 0, &enabled);
-    assert_eq!(midi.voices[0], NoteVoice::new());
+    assert_eq!(midi.groups[0], NoteGroup::new());
 }
 
 #[test]
-fn all_channels_track_note_off_by_channel_and_voice_order_stays_bounded() {
+fn all_channels_track_note_off_by_channel_and_group_order_stays_bounded() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let enabled = [true; VOICE_COUNT];
+    let enabled = [true; GROUP_COUNT];
     midi.message(0x90, 60, 127, &enabled);
     midi.message(0x91, 60, 127, &enabled);
     midi.message(0x80, 60, 0, &enabled);
-    assert!(!midi.voices[0].held && midi.voices[1].held);
+    assert!(!midi.groups[0].held && midi.groups[1].held);
     for i in 0..2000 {
         midi.message(0x90, (i % 128) as u8, 127, &enabled);
         if i % 3 == 0 {
             midi.message(0x80, ((i + 127) % 128) as u8, 0, &enabled);
         }
-        for voice in &midi.voices {
-            if voice.held {
-                assert!(voice.order < VOICE_COUNT as u8);
+        for group in &midi.groups {
+            if group.held {
+                assert!(group.order < GROUP_COUNT as u8);
             }
         }
-        for (a, voice) in midi.voices.iter().enumerate() {
-            if voice.held {
+        for (a, group) in midi.groups.iter().enumerate() {
+            if group.held {
                 assert!(midi
-                    .voices
+                    .groups
                     .iter()
                     .skip(a + 1)
-                    .all(|other| !other.held || other.order != voice.order));
+                    .all(|other| !other.held || other.order != group.order));
             }
         }
     }
-    midi.sync_enabled(&[false; VOICE_COUNT]);
-    assert!(midi.voices.iter().all(|v| *v == NoteVoice::new()));
+    midi.sync_enabled(&[false; GROUP_COUNT]);
+    assert!(midi.groups.iter().all(|v| *v == NoteGroup::new()));
 }
 
 #[test]
-fn every_configured_pool_uses_idle_voices_then_steals_only_its_oldest_note() {
-    for count in 1..=VOICE_COUNT {
+fn every_configured_pool_uses_idle_groups_then_steals_only_its_oldest_note() {
+    for count in 1..=GROUP_COUNT {
         let mut midi = MidiState::new(48000);
         midi.set_channel(1);
-        let mut enabled = [false; VOICE_COUNT];
+        let mut enabled = [false; GROUP_COUNT];
         for on in enabled.iter_mut().take(count) {
             *on = true;
         }
@@ -135,25 +135,25 @@ fn every_configured_pool_uses_idle_voices_then_steals_only_its_oldest_note() {
             midi.message(0x90, 60 + note as u8, 100, &enabled);
         }
         run_gate(&mut midi, 250);
-        assert_eq!(midi.voices.iter().filter(|v| v.held).count(), count);
+        assert_eq!(midi.groups.iter().filter(|v| v.held).count(), count);
         midi.message(0x90, 84, 100, &enabled);
-        assert_eq!(midi.voices[0].note, 84);
+        assert_eq!(midi.groups[0].note, 84);
         midi.message(0x80, 60, 0, &enabled);
-        assert!(midi.voices[0].held);
+        assert!(midi.groups[0].held);
         run_gate(&mut midi, 500);
-        assert_eq!(midi.voices[0].playing_note, 84);
+        assert_eq!(midi.groups[0].playing_note, 84);
         assert!(midi
-            .voices
+            .groups
             .iter()
             .skip(count)
-            .all(|v| *v == NoteVoice::new()));
+            .all(|v| *v == NoteGroup::new()));
     }
 }
 
 #[test]
 fn pitch_bend_decodes_all_fourteen_bits_and_respects_channel_filter_and_reset() {
     let mut midi = MidiState::new(48000);
-    let enabled = [true; VOICE_COUNT];
+    let enabled = [true; GROUP_COUNT];
     midi.message(0xe0, 0, 0, &enabled);
     assert_eq!(midi.pitch_bends, [0.0; 16]); // MIDI Off.
     midi.set_channel(3); // Channel 2 only.
@@ -176,59 +176,59 @@ fn pitch_bend_decodes_all_fourteen_bits_and_respects_channel_filter_and_reset() 
 }
 
 #[test]
-fn bend_follows_the_playing_channel_until_a_stolen_voice_finishes_fading() {
+fn bend_follows_the_playing_channel_until_a_stolen_group_finishes_fading() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let mut enabled = [false; VOICE_COUNT];
+    let mut enabled = [false; GROUP_COUNT];
     enabled[0] = true;
     midi.message(0xe0, 0, 0, &enabled);
     midi.message(0xe1, 0, 96, &enabled);
     midi.message(0x90, 60, 100, &enabled);
     run_gate(&mut midi, 250);
-    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+    assert_eq!(midi.groups[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
     midi.message(0x91, 72, 100, &enabled);
-    assert_eq!(midi.voices[0].pitch(), 60);
-    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+    assert_eq!(midi.groups[0].pitch(), 60);
+    assert_eq!(midi.groups[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
     run_gate(&mut midi, 500);
-    assert_eq!(midi.voices[0].pitch(), 72);
-    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), 1.0 / 12.0);
+    assert_eq!(midi.groups[0].pitch(), 72);
+    assert_eq!(midi.groups[0].bend_octaves(&midi.pitch_bends), 1.0 / 12.0);
     midi.message(0x81, 72, 0, &enabled);
     midi.message(0xe1, 0, 0, &enabled);
-    assert!(midi.voices[0].sounding());
-    assert_eq!(midi.voices[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
+    assert!(midi.groups[0].sounding());
+    assert_eq!(midi.groups[0].bend_octaves(&midi.pitch_bends), -2.0 / 12.0);
 }
 
 #[test]
-fn sparse_active_pool_excludes_off_voices_and_steals_only_among_five_enabled_voices() {
+fn sparse_active_pool_excludes_off_groups_and_steals_only_among_five_enabled_groups() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
-    let mut enabled = [false; VOICE_COUNT];
-    for voice in [1, 3, 5, 7, 9] {
-        enabled[voice] = true;
+    let mut enabled = [false; GROUP_COUNT];
+    for group in [1, 2, 3, 5, 7] {
+        enabled[group] = true;
     }
     for note in 60..65 {
         midi.message(0x90, note, 100, &enabled);
     }
     run_gate(&mut midi, 250);
-    for (voice, &on) in midi.voices.iter().zip(&enabled) {
-        assert_eq!(voice.held, on);
+    for (group, &on) in midi.groups.iter().zip(&enabled) {
+        assert_eq!(group.held, on);
     }
     midi.message(0x90, 72, 100, &enabled);
-    assert_eq!(midi.voices[1].note, 72);
+    assert_eq!(midi.groups[1].note, 72);
     midi.message(0x80, 60, 0, &enabled);
-    assert!(midi.voices[1].held);
+    assert!(midi.groups[1].held);
     enabled[1] = false;
     midi.release_disabled(&enabled);
-    assert!(!midi.voices[1].held);
+    assert!(!midi.groups[1].held);
     run_gate(&mut midi, 500);
-    assert!(!midi.voices[1].sounding());
+    assert!(!midi.groups[1].sounding());
     for note in 80..90 {
         midi.message(0x90, note, 100, &enabled);
     }
-    assert!(!midi.voices[1].held);
-    assert_eq!(midi.voices.iter().filter(|voice| voice.held).count(), 4);
-    midi.release_disabled(&[false; VOICE_COUNT]);
-    midi.message(0x90, 100, 100, &[false; VOICE_COUNT]);
+    assert!(!midi.groups[1].held);
+    assert_eq!(midi.groups.iter().filter(|group| group.held).count(), 4);
+    midi.release_disabled(&[false; GROUP_COUNT]);
+    midi.message(0x90, 100, 100, &[false; GROUP_COUNT]);
     run_gate(&mut midi, 250);
-    assert!(midi.voices.iter().all(|v| !v.sounding()));
+    assert!(midi.groups.iter().all(|v| !v.sounding()));
 }

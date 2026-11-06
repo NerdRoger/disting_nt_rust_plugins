@@ -825,3 +825,62 @@ and peak protection, mono pan bypass, and unison RMS within 20% of a single
 oscillator. Parameter limits are 153..213 with 14 pages; respecification tests
 check stable surviving ordinals across every segment count. This is a one-time
 preset-layout change requiring fresh instances from the preceding build.
+
+
+## Experimental 24 independent voices with ten MIDI groups
+
+This variant replaces the fixed main-plus-two-sub layout from checkpoint
+8ebd91e. Each physical voice has Pitch CV, Transpose, Fine tune, Pan, Voice Group
+and Active (last). Voice Group is 1..10, grayed in CV mode, with defaults cycling
+through those ten groups; only Voice 1 starts active. Transpose now applies in
+both CV and MIDI modes. There are 163 fixed parameters plus two per segment,
+167..227 total, and 28 plugin pages (29 including firmware Common).
+
+The MIDI allocator owns ten NoteGroup slots. Only groups with active members
+are eligible, and the oldest held group is stolen as a unit. Group gate ramps
+are generated once per chunk/frame and reused by every member; steady gates
+use unity directly. Silent groups cannot reuse stale ramps in a later chunk.
+Each oscillator retains its own pitch caches, phase, Active/membership fade and
+pan. Live group edits fade the old binding to silence before adopting the
+latest requested group, and joining an already-held group fades in its note.
+Removing one member leaves others playing; removing the last releases the group.
+CV mode bypasses group parameter reads and continues independent per-voice CV.
+
+Against the stack checkpoint, normal ARM ITC decreases 25,698 -> 24,262 bytes
+(-1,436), cold code 4,004 -> 3,684 (-320), and rodata grows 1,701 -> 1,799 (+98).
+State is 4,352 -> 4,520 (+168): fewer oscillators are offset by ten shared gate
+chunks, per-voice group bindings, and a larger 24-input CV factor cache. Waveform
+storage and FFT buffers remain unchanged. Arrays are initialized directly in
+host-allocated memory. Constructor and audio-callback local stack reservations
+are 928 and 1,008 bytes respectively, excluding saved registers/callees. No
+on-device CPU comparison is claimed for the changed voice model.
+
+125 normal and 128 profiling tests cover the retained DSP paths and new grouped
+behavior. Coverage includes unequal five/two-member groups, skipped empty
+slots, exact gate-state/sample-count equivalence to one update per group per
+frame, shared stealing/release/bend with independent transpose/fine/pan, live
+membership edits, Active changes, 24 oscillators driven by ten notes, All Sound
+Off, ignored groups in CV, and a sole active Voice 24 in Group 10. Existing
+all-segment respecification tests verify stable ordinal identities, and metadata
+tests verify the maximum parameter/page counts and default assignments.
+
+This is another experimental preset-layout change: add a fresh instance after
+deploying. The previous stacking implementation remains committed at 8ebd91e;
+this grouped variant is left uncommitted for hardware listening and CPU review.
+
+
+### Follow-up: eight groups with consecutive three-voice defaults
+
+The current grouped variant now uses eight MIDI slots. Voice Group is 1..8;
+Voices 1..3 default to Group 1, 4..6 to Group 2, through 22..24 to Group 8.
+The parameter ordinals/count and 28-page layout are unchanged. Existing saved
+group assignments are retained; newly created instances or reset parameters
+receive the new defaults. A voice that has never sounded can adopt its selected
+group immediately instead of fading a silent factory binding first.
+
+125 normal/optimized host and 128 profiling tests pass, and both ARM builds pass
+relocation validation. Tests distinguish factory triplet defaults from explicitly
+spread test pools used for independent-note regressions, and cover full eight-
+note allocation/stealing with all 24 oscillators. After device testing, the user
+preferred this eight-group variant and approved checkpointing it on the
+experiment branch; the original fixed-stack checkpoint remains available.
