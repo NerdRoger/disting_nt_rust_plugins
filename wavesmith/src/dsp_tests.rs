@@ -1651,3 +1651,56 @@ fn fixed_selection_proof_is_strict_and_tracks_identically_to_scalar_on_both_side
         }
     }
 }
+
+#[test]
+fn direct_cv_targets_match_frequency_path_with_bounded_rounding_across_rates_and_limits() {
+    let mut max_cents = 0.0f64;
+    for rate in [32000.0, 44100.0, 48000.0, 96000.0] {
+        for tuning in [-10.0, -3.25, 0.0, 4.125, 9.0] {
+            let mut direct = Oscillator::new();
+            let mut original = Oscillator::new();
+            for i in 0..=4000 {
+                let cv = -10.0 + i as f32 * 0.005;
+                let factor = 2.0f32.powf(cv);
+                direct.prepare_cv(tuning, factor, rate, 0.5);
+                let frequency = original.cv_frequency(tuning, factor);
+                original.prepare(frequency, rate, 0.5);
+                let expected = original.target_step;
+                let error = direct.target_step.abs_diff(expected) as f64;
+                assert!(error <= 4.0f64.max(expected as f64 * 4.0 * f32::EPSILON as f64));
+                // Below 20 Hz, compare the phase-unit bound above: a single
+                // pre-existing phase LSB is relatively large in cents there.
+                if expected as f64 * rate as f64 / PHASE_SCALE as f64 >= 20.0 {
+                    max_cents = max_cents
+                        .max(1200.0 * (direct.target_step as f64 / expected as f64).log2().abs());
+                }
+                assert_eq!(direct.target_level, original.target_level);
+                assert_eq!(direct.slew, original.slew);
+                assert_eq!(direct.pitch_slew, original.pitch_slew);
+            }
+        }
+    }
+    assert!(max_cents < 0.002, "{max_cents} cents");
+    std::println!("Maximum direct-target tuning difference: {max_cents} cents");
+}
+
+#[test]
+fn direct_cv_scale_rebuilds_for_tuning_rate_and_path_changes_without_a_deadband() {
+    let mut voice = Oscillator::new();
+    for (tuning, rate) in [
+        (0.0, 48000.0),
+        (1.0, 48000.0),
+        (1.0, 96000.0),
+        (-2.0, 32000.0),
+    ] {
+        voice.prepare_cv(tuning, 1.0, rate, 0.5);
+        let initial = voice.target_step;
+        let scale = voice.cv_phase_scale;
+        voice.prepare_cv(tuning, 1.0000005, rate, 0.5);
+        assert!(voice.target_step > initial);
+        assert_eq!(voice.cv_phase_scale, scale);
+        voice.prepare(220.0, rate, 0.5);
+        voice.prepare_cv(tuning, 1.0, rate, 0.5);
+        assert_eq!(voice.target_step, initial);
+    }
+}

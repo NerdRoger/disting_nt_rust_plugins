@@ -695,7 +695,9 @@ pub struct Oscillator {
     cached_octave: f32,
     cached_frequency: f32,
     cached_rate: f32,
-    prepared_frequency: f32,
+    prepared_input: f32,
+    cv_phase_scale: f32,
+    cv_minimum_step: f32,
     target_step: u32,
     target_level: f32,
     slew: f32,
@@ -731,7 +733,9 @@ impl Oscillator {
             cached_octave: f32::INFINITY,
             cached_frequency: 0.0,
             cached_rate: 0.0,
-            prepared_frequency: 0.0,
+            prepared_input: 0.0,
+            cv_phase_scale: 0.0,
+            cv_minimum_step: 0.0,
             target_step: 0,
             target_level: 0.0,
             slew: 0.0,
@@ -741,8 +745,8 @@ impl Oscillator {
         }
     }
     #[cfg(test)]
-    pub fn prepared_frequency_for_test(&self) -> f32 {
-        self.prepared_frequency
+    pub fn target_frequency_for_test(&self) -> f32 {
+        self.target_step as f32 * PHASE_SCALE_INVERSE * self.cached_rate
     }
 
     /// Cache the exact exponent: MIDI note/bend/fine, or CV-mode root/transpose/fine.
@@ -756,15 +760,47 @@ impl Oscillator {
         self.cached_frequency
     }
 
+    #[cfg(test)]
     pub fn cv_frequency(&mut self, tuning: f32, factor: f32) -> f32 {
         // exp2(tuning + CV) = exp2(tuning) * exp2(CV). The tuning factor is
         // cached per voice; the input factor is shared even for detuned voices.
         (self.frequency(tuning) * factor).clamp(440.0 / 65536.0, 440.0 * 65536.0)
     }
 
+    pub fn prepare_cv(&mut self, tuning: f32, factor: f32, sample_rate: f32, level: f32) {
+        let tuning_changed = tuning != self.cached_octave;
+        let rate_changed = sample_rate != self.cached_rate;
+        let root_frequency = self.frequency(tuning);
+        let rebuild_scale = tuning_changed || rate_changed || self.cv_phase_scale == 0.0;
+        if rebuild_scale {
+            self.cv_phase_scale = root_frequency / sample_rate * PHASE_SCALE;
+            self.cv_minimum_step = 0.01 / sample_rate * PHASE_SCALE;
+            if rate_changed {
+                self.cached_rate = sample_rate;
+                self.slew = (1000.0 / sample_rate).min(1.0);
+                self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
+            }
+        }
+        if rebuild_scale || factor != self.prepared_input {
+            self.prepared_input = factor;
+            self.target_step = (self.cv_phase_scale * factor)
+                .max(self.cv_minimum_step)
+                .min(0.45 * PHASE_SCALE) as u32;
+            self.pitch_moving = self.phase_step != self.target_step
+                || self.selection_high == 0
+                || self.phase_step >= self.selection_high
+                || self.phase_step <= self.selection_low;
+        }
+        if level != self.target_level {
+            self.target_level = level;
+            self.level_moving = true;
+        }
+    }
+
     pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {
-        if frequency != self.prepared_frequency || sample_rate != self.cached_rate {
-            self.prepared_frequency = frequency;
+        self.cv_phase_scale = 0.0;
+        if frequency != self.prepared_input || sample_rate != self.cached_rate {
+            self.prepared_input = frequency;
             if sample_rate != self.cached_rate {
                 self.cached_rate = sample_rate;
                 self.slew = (1000.0 / sample_rate).min(1.0);

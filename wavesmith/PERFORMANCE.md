@@ -533,3 +533,54 @@ Existing gain-regrouping sample-error bounds remain unchanged. Sweep, jitter,
 MIDI retune and waveform-publication tests cover fallback transitions. This is
 an exact integer-pitch optimization and does not require a listening decision.
 Raw data and rejected refinement sources stay in ignored target profiling files.
+
+
+## Round 8: direct CV phase targets
+
+This candidate was tested independently on top of the committed bounds proof.
+The same unchanged ten-voice stereo CV preset, 48 kHz, 24-frame callback and
+100-second/five-second-warmup measurements were used. Reports had no gaps or
+workload metadata changes.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| round7-bounds-repeat | 36,558 | 8,327 | 21,997 |
+| round7-direct | 36,238 | 8,041 | 21,966 |
+| round7-direct-control | 36,579 | 8,334 | 22,011 |
+| round7-direct-repeat | 36,266 | 8,079 | 21,955 |
+
+The returning bounds-only control agreed within 0.06% with its earlier run.
+Direct targets saved **0.87% initially** against the preceding bounds-only
+run and **0.86% on repeat** against the returning control. Setup saved roughly
+255-293 cycles against that returning control. Rendering has substantial
+variation as the strict bounds shortcut changes eligibility, so the modest
+whole-callback result is reported rather than attributing the whole reduction
+to arithmetic removal. The final direct-target mean is **4.72% below** the
+original returning pre-bounds control (38,063 cycles).
+
+CV-mode root/transpose/fine frequency is normalized once into phase-step units
+when tuning or sample rate changes. Each changing CV factor then produces the
+phase target with multiplication and limits, avoiding the intermediate Hertz
+calculation and division. Stable input factors reuse the target across callbacks.
+MIDI retains the existing conversion/target arithmetic; its general prepare
+invalidates the CV coefficient cache. No input deadband, quantization or pitch
+smoothing change is introduced.
+
+The reassociated arithmetic is not bit-identical. Tests cover 32/44.1/48/96 kHz,
+positive/negative input sweeps through frequency limits, tuning changes, path
+changes and tiny factor changes. Full-range comparisons use a phase-resolution
+aware bound; above 20 Hz maximum observed difference is **0.001870 cents**, below
+the 0.002-cent budget. At sub-audio rates a single existing phase LSB is relatively
+large in cents, so those cases use the absolute phase bound instead. Host tests
+now observe the actual target phase-derived frequency, explicitly including
+existing pitch limits and one integer phase LSB in their tolerance. The old
+Hertz calculation remains only as a test reference.
+
+ITC grows **336 bytes**, 24,440 -> **24,776**. Cold code and rodata remain 3,500
+and 1,603 bytes. Two cached floats add **80 state bytes across ten voices**.
+This modest but repeated saving was retained; no extra waveform tables or heap
+allocations are introduced. All 120 Wavesmith tests pass in debug and release,
+repository/ABI checks and ARM relocation validation pass. The direct-target
+version is deployed via the supplied scratch script; telemetry is stopped and
+ports closed after measurement. Listening-sensitive smoothing changes remain
+separate from this accepted arithmetic optimization.

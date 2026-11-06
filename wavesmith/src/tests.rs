@@ -1973,10 +1973,13 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
 // rounding when cents and semitones are combined in different orders.
 fn assert_cached_octave(instance: &Instance, voice: usize, expected: f32) {
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
-    let actual = context.state().oscillators[voice].prepared_frequency_for_test();
-    let expected_hz = 440.0 * 2.0f32.powf(expected);
+    let actual = context.state().oscillators[voice].target_frequency_for_test();
+    let rate = context.state().sample_rate;
+    let expected_hz = (440.0 * 2.0f32.powf(expected)).max(0.01).min(rate * 0.45);
+    // Observe the real target phase step, including the existing integer LSB.
+    let phase_lsb_hz = rate / 4_294_967_296.0;
     assert!(
-        (actual - expected_hz).abs() < expected_hz * 0.000001,
+        (actual - expected_hz).abs() < expected_hz * 0.000001 + phase_lsb_hz,
         "expected {expected_hz} Hz, got {actual}"
     );
 }

@@ -318,8 +318,10 @@ root/transpose/fine tuning factor. A per-instance cache converts each distinct
 input bus voltage to an exponential factor once and shares it across voices,
 including voices with different detuning. Exact unchanged inputs reuse that
 factor across callbacks; every representable voltage change invalidates it.
-The final frequency is the product of tuning and input factors, with the same
-frequency limits as before. This reassociates floating-point arithmetic, so
+The voice tuning factor is cached directly in phase-step units for the current
+sample rate. Multiplying it by the shared input factor produces the target
+without intermediate Hertz conversion and per-update sample-rate division.
+Existing minimum/maximum pitch limits are applied in phase-step units. This reassociates floating-point arithmetic, so
 small rounding differences are expected; tests bound tuning error and verify
 shared buses, independent buses, rerouting and tiny input changes. The cache
 adds 120 bytes to ARM instance state after padding, with no new waveform tables.

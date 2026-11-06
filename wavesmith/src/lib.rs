@@ -958,12 +958,16 @@ impl Plugin for Wavesmith {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }
                 *pitch = frequency;
+                if frames > 0 {
+                    oscillator.prepare(frequency, state.sample_rate, level);
+                }
             } else {
                 let factor = state.cv_pitch.factor(bus, cv);
-                *pitch = oscillator.cv_frequency(*pitch, factor);
-            }
-            if frames > 0 {
-                oscillator.prepare(*pitch, state.sample_rate, level);
+                if frames > 0 {
+                    oscillator.prepare_cv(*pitch, factor, state.sample_rate, level);
+                }
+                // Only used below as an enabled-voice marker in CV mode.
+                *pitch = 1.0;
             }
         }
         let setup_end = distingnt_api::api::cpu_cycle_count();
