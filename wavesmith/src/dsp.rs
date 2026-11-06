@@ -812,10 +812,15 @@ impl Oscillator {
         self.tick_prepared(engine, memory, frame)
     }
 
-    // Exponential pitch tracking in phase-step units. Current/target steps are
-    // bounded by 0.45 * 2^32, so their signed difference and Q30 product fit.
+    // Monotonic integer tracking cannot leave the interval between its current
+    // and target step. Strict bounds preserve the existing refresh thresholds.
+    fn selection_covers_target(&self) -> bool {
+        self.selection_high != 0
+            && self.phase_step.min(self.target_step) > self.selection_low
+            && self.phase_step.max(self.target_step) < self.selection_high
+    }
     #[inline(always)]
-    fn advance_pitch(&mut self, engine: &Engine) {
+    fn advance_pitch_step(&mut self) {
         if self.pitch_moving {
             let delta = (self.target_step as i32).wrapping_sub(self.phase_step as i32);
             if delta != 0 {
@@ -830,6 +835,12 @@ impl Oscillator {
                 self.phase_step = self.phase_step.wrapping_add(change as u32);
             }
             self.pitch_moving = self.phase_step != self.target_step;
+        }
+    }
+    #[inline(always)]
+    fn advance_pitch(&mut self, engine: &Engine) {
+        if self.pitch_moving {
+            self.advance_pitch_step();
             if self.selection_high == 0
                 || self.phase_step >= self.selection_high
                 || self.phase_step <= self.selection_low
@@ -902,8 +913,19 @@ impl Oscillator {
             return false;
         }
         if self.pitch_moving {
-            return self.render_moving_pitch(engine, memory, output);
+            if !self.selection_covers_target() {
+                return self.render_moving_pitch(engine, memory, output);
+            }
+            return self.render_fixed_selection::<true>(engine, memory, output);
         }
+        self.render_fixed_selection::<false>(engine, memory, output)
+    }
+    fn render_fixed_selection<const TRACK: bool>(
+        &mut self,
+        engine: &Engine,
+        memory: &Memory,
+        output: &mut [f32],
+    ) -> bool {
         let table_index = (engine.active & 1) * (engine.layout.count + 1) + self.playback_level;
         let Some(rich) = memory.get(table_index / 2) else {
             return false;
@@ -922,6 +944,9 @@ impl Oscillator {
         // Resolve table storage and interpolation mode outside the sample loop.
         if simple {
             for sample in output {
+                if TRACK {
+                    self.advance_pitch_step();
+                }
                 let index = (self.phase >> 24) as usize;
                 let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
                 let value = read(
@@ -934,13 +959,20 @@ impl Oscillator {
                 *sample += value * gain;
                 self.phase = self.phase.wrapping_add(self.phase_step);
                 #[cfg(test)]
-                tests::count_steady_tick();
+                if TRACK {
+                    tests::count_moving_pitch_tick();
+                } else {
+                    tests::count_steady_tick();
+                }
             }
         } else {
             let Some(lean) = memory.get((table_index + 1) / 2) else {
                 return false;
             };
             for sample in output {
+                if TRACK {
+                    self.advance_pitch_step();
+                }
                 let index = (self.phase >> 24) as usize;
                 let next = (index + 1) & (SIZE - 1);
                 let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
@@ -949,7 +981,11 @@ impl Oscillator {
                 *sample += (a + (b - a) * blend) * gain;
                 self.phase = self.phase.wrapping_add(self.phase_step);
                 #[cfg(test)]
-                tests::count_steady_tick();
+                if TRACK {
+                    tests::count_moving_pitch_tick();
+                } else {
+                    tests::count_steady_tick();
+                }
             }
         }
         true

@@ -337,8 +337,11 @@ tracking, tiny CV ramps and sample-rate changes. No CV-input deadband is used.
 With a fully open gate, constant level and no waveform crossfade, a block
 renderer resolves the active waveform bank outside the sample loop. Settled
 pitch uses the cached integer phase step, gain, table selection and blend.
-Changing pitch uses a dedicated loop with the same integer pitch recurrence as
-the general renderer and the existing anti-alias selection band. It resolves
+Changing pitch first checks whether both current and target phase steps are
+strictly inside the cached selection range. The monotonic integer slew cannot
+leave that interval, so the chunk can reuse fixed table bindings and skip
+selection checks while retaining the exact per-sample pitch recurrence.
+Possible crossings retain the original general moving-pitch path. It resolves
 table storage once, refreshing bindings only when the selected table level
 changes, and computes
 sample indices and fractions once even when blending two tables. A single

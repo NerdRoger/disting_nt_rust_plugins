@@ -487,3 +487,49 @@ protocol or musical parameter changes were needed. Both final runs received
 101 reports with no missed messages; streaming was disabled and ports closed
 when the monitor exited. Raw measurements and rejected alternatives remain
 only in ignored target/wavesmith-profiling for audit.
+
+
+## Round 7: anti-alias selection bounds proof
+
+Each 100-second run (five seconds warmup) used the unchanged ten-voice stereo
+CV preset at 48 kHz and 24 frames. All reports matched workload metadata and
+arrived without gaps. Only diagnostic commands were sent.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| round7-base | 38,054 | 8,018 | 23,771 |
+| round7-bounds | 36,302 | 8,116 | 21,953 |
+| round7-control | 38,063 | 8,018 | 23,780 |
+| round7-chunk-bounds | 36,213 | 8,258 | 21,710 |
+| round7-bounds-repeat | 36,558 | 8,327 | 21,997 |
+
+The original repeated within 0.03%. The selected strict current/target proof
+saved **4.60%** initially and **3.95%** on repeat versus the returning original.
+Render/mix saved about 7.5-7.7%; setup timing varied between loads. A useful
+claim is about **4% less whole-callback work in this workload**, not the larger
+render-only percentage or CPU-meter percentage points. The shortcut's eligibility
+varies near selection boundaries; fallback work remains necessary there.
+
+When both current and target phase steps are strictly within cached selection
+bounds, the monotonic integer slew cannot cross those bounds in the chunk.
+The fixed-selection renderer tracks exactly the original per-sample phase steps
+while omitting repeated range checks and table-binding decisions. Steady pitch
+retains its separate specialization. Gate/level transitions, waveform fades and
+possible table crossings retain the existing general paths. There is no CV
+quantization, smoothing approximation, new table, or extra persistent state.
+
+The selected object uses **24,440 ITC bytes**, up **604 bytes** from 23,836.
+Cold code and rodata remain 3,500 and 1,603 bytes. This trade-off was accepted
+for the repeated roughly 4% callback reduction. A tighter chunk-travel proof
+was also tested: its 24,512 ITC bytes cost another 72 bytes, while its 4.86%
+whole-callback saving did not establish a reliable incremental gain against the
+variable simpler-path measurements. That refinement and its dedicated test
+were removed, retaining the smaller proof.
+
+118 Wavesmith tests pass in debug and release, with repository/ABI checks and
+ARM relocations validated. Threshold-edge tests check strict bounds, and fast
+versus scalar paths retain exact oscillator/pitch/phase-state comparisons.
+Existing gain-regrouping sample-error bounds remain unchanged. Sweep, jitter,
+MIDI retune and waveform-publication tests cover fallback transitions. This is
+an exact integer-pitch optimization and does not require a listening decision.
+Raw data and rejected refinement sources stay in ignored target profiling files.

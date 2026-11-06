@@ -1610,3 +1610,44 @@ fn shared_cv_factor_preserves_tuning_clamps_and_reuses_conversion_across_detuned
     assert!(max_cents < 0.002, "{max_cents} cents");
     std::println!("Maximum factored tuning difference: {max_cents} cents");
 }
+
+#[test]
+fn fixed_selection_proof_is_strict_and_tracks_identically_to_scalar_on_both_sides() {
+    let engine = Engine::new(8, 48000);
+    let mut voice = Oscillator::new();
+    voice.selection_low = 1000;
+    voice.selection_high = 2000;
+    for current in [999, 1000, 1001, 1500, 1999, 2000, 2001] {
+        for target in [999, 1000, 1001, 1500, 1999, 2000, 2001] {
+            voice.phase_step = current;
+            voice.target_step = target;
+            assert_eq!(
+                voice.selection_covers_target(),
+                current > 1000 && current < 2000 && target > 1000 && target < 2000
+            );
+        }
+    }
+    for frequency in [100.0, 440.0, 3000.0, 9000.0, 19000.0] {
+        let mut engine = engine;
+        let mut memory = [Block::ZERO; BLOCKS];
+        finish_build(&mut engine, &mut memory, Wave::new(8), frequency);
+        for direction in [-1.0, 1.0] {
+            let mut fast = Oscillator::new();
+            fast.tune_when_silent(frequency, 48000.0);
+            fast.prepare(frequency, 48000.0, 0.5);
+            for _ in 0..2000 {
+                fast.tick_prepared(&engine, &memory, 0);
+            }
+            fast.prepare(frequency * (1.0 + direction * 0.0001), 48000.0, 0.5);
+            assert!(fast.selection_covers_target());
+            let mut scalar = fast;
+            let mut samples = [0.0f32; 24];
+            assert!(fast.render_open_gate(&engine, &memory, &mut samples));
+            for (i, actual) in samples.iter().enumerate() {
+                let expected = scalar.tick_prepared(&engine, &memory, i);
+                assert!((actual - expected).abs() <= 4.0 * f32::EPSILON * expected.abs().max(1.0));
+            }
+            assert_eq!(fast, scalar);
+        }
+    }
+}
