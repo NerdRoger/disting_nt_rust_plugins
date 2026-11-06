@@ -592,6 +592,18 @@ impl Block {
             }
         );
     }
+    /// Interpolate one real-valued table stored in either lane of this block.
+    /// Inline into the render loops so table/lane decisions stay hoisted there.
+    #[inline(always)]
+    fn interpolate(&self, imaginary: bool, index: usize, next: usize, fraction: f32) -> f32 {
+        let (left, right) = if imaginary {
+            (self.data[index].im, self.data[next].im)
+        } else {
+            (self.data[index].re, self.data[next].re)
+        };
+        left + (right - left) * fraction
+    }
+
     #[cfg(test)]
     pub const ZERO: Self = Self {
         data: [Complex { re: 0.0, im: 0.0 }; SIZE],
@@ -1015,14 +1027,6 @@ impl Oscillator {
         let Some(rich) = memory.get(table_index / 2) else {
             return false;
         };
-        let read = |block: &Block, imaginary: bool, index: usize, next: usize, fraction: f32| {
-            let (left, right) = if imaginary {
-                (block.data[index].im, block.data[next].im)
-            } else {
-                (block.data[index].re, block.data[next].re)
-            };
-            left + (right - left) * fraction
-        };
         let gain = self.level * 5.0;
         let blend = self.playback_blend;
         let simple = blend == 0.0 || self.playback_level + 1 == engine.layout.count;
@@ -1034,8 +1038,7 @@ impl Oscillator {
                 }
                 let index = (self.phase >> 24) as usize;
                 let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
-                let value = read(
-                    rich,
+                let value = rich.interpolate(
                     table_index & 1 != 0,
                     index,
                     (index + 1) & (SIZE - 1),
@@ -1061,8 +1064,8 @@ impl Oscillator {
                 let index = (self.phase >> 24) as usize;
                 let next = (index + 1) & (SIZE - 1);
                 let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
-                let a = read(rich, table_index & 1 != 0, index, next, fraction);
-                let b = read(lean, (table_index + 1) & 1 != 0, index, next, fraction);
+                let a = rich.interpolate(table_index & 1 != 0, index, next, fraction);
+                let b = lean.interpolate((table_index + 1) & 1 != 0, index, next, fraction);
                 *sample += (a + (b - a) * blend) * gain;
                 self.phase = self.phase.wrapping_add(self.phase_step);
                 #[cfg(test)]
@@ -1096,14 +1099,6 @@ impl Oscillator {
         let mut lean = first;
         let mut rich_imaginary = false;
         let mut lean_imaginary = false;
-        let read = |block: &Block, imaginary: bool, index: usize, next: usize, fraction: f32| {
-            let (a, b) = if imaginary {
-                (block.data[index].im, block.data[next].im)
-            } else {
-                (block.data[index].re, block.data[next].re)
-            };
-            a + (b - a) * fraction
-        };
         for sample in output {
             self.advance_pitch(engine);
             if self.playback_level != selected {
@@ -1117,11 +1112,11 @@ impl Oscillator {
             let index = (self.phase >> 24) as usize;
             let next = (index + 1) & (SIZE - 1);
             let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
-            let a = read(rich, rich_imaginary, index, next, fraction);
+            let a = rich.interpolate(rich_imaginary, index, next, fraction);
             let value = if self.playback_blend == 0.0 || selected + 1 == engine.layout.count {
                 a
             } else {
-                let b = read(lean, lean_imaginary, index, next, fraction);
+                let b = lean.interpolate(lean_imaginary, index, next, fraction);
                 a + (b - a) * self.playback_blend
             };
             *sample += value * gain;
@@ -1483,13 +1478,12 @@ impl Engine {
         let Some(block) = memory.get(table_index / 2) else {
             return 0.0;
         };
-        let table = &block.data;
-        let (left, right) = if table_index & 1 == 0 {
-            (table[index].re, table[(index + 1) & (SIZE - 1)].re)
-        } else {
-            (table[index].im, table[(index + 1) & (SIZE - 1)].im)
-        };
-        left + (right - left) * fraction
+        block.interpolate(
+            table_index & 1 != 0,
+            index,
+            (index + 1) & (SIZE - 1),
+            fraction,
+        )
     }
 
     #[cfg(test)]

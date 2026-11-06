@@ -733,3 +733,38 @@ The returning state-only control measured 35,419 callback cycles, 7,787 setup
 cycles and 21,308 render/mix cycles. It was 0.69% faster than its first run,
 matching the apparent callback gain of the refactor. This reinforces that no
 whole-callback speed improvement is established by these captures.
+
+
+## Refactor review: shared wavetable interpolation
+
+One explicitly inlined Block::interpolate implementation replaces equivalent
+closures in the fixed-selection and moving-pitch renderers and the scalar
+Engine lookup. Table selection and lane binding remain outside the fast sample
+loops. Arithmetic and sample ordering are preserved; the ARM diff shows
+register scheduling changes in scalar lookup and two exchanged multiply
+operands in playback, with unchanged section sizes and no helper call.
+
+All 122 tests pass in debug and optimized release builds, the full repository
+suite passes, and ARM relocation validation passes. Independent DSP reference
+methods, in-place initialization and both profiling mechanisms remain intact.
+No additional runtime arrays or allocations are introduced.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| explicit eligibility | 35,426 | 7,846 | 21,262 |
+| shared interpolation | 35,419 | 7,846 | 21,256 |
+| returning state-only control | 35,419 | 7,787 | 21,308 |
+
+Each run used the same 100-second capture protocol and workload described
+above, with no missing reports. Interpolation differs by only -0.02% from the
+preceding build; it is retained to remove duplicated interpolation code, with
+no CPU claim. Its ITC, cold code, rodata and instance state match the preceding
+build: 24,932 / 3,500 / 1,603 / 2,368 bytes respectively.
+
+The complete refactor pass reduces ITC by 20 bytes and instance State by
+40 bytes versus a40d3c3. Parameter metadata, waveform/table storage, MIDI/CV
+pitch behavior, level control, UI and the metrics protocol are unchanged.
+The existing separation of MIDI, stereo, levels and UI remains useful; broader
+render-loop merging or file splitting would add churn without a demonstrated
+size/performance benefit. Test-only historical DSP routines remain as numerical
+references rather than being deleted as dead firmware code.
