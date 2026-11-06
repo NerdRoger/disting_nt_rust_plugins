@@ -1973,7 +1973,7 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
 // rounding when cents and semitones are combined in different orders.
 fn assert_cached_octave(instance: &Instance, voice: usize, expected: f32) {
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
-    let actual = context.state().oscillators[voice].cached_frequency_for_test();
+    let actual = context.state().oscillators[voice].prepared_frequency_for_test();
     let expected_hz = 440.0 * 2.0f32.powf(expected);
     assert!(
         (actual - expected_hz).abs() < expected_hz * 0.000001,
@@ -2795,4 +2795,43 @@ fn profiling_stream_is_opt_in_usb_only_and_preserves_instance_identity() {
         instance.render(&mut samples);
     }
     SENT_SYSEX.with(|messages| assert_eq!(messages.borrow().len(), 1));
+}
+
+#[test]
+fn shared_cv_conversion_handles_detuning_distinct_inputs_rerouting_and_exact_jitter() {
+    let mut instance = Instance::with_active_voices(8, 10);
+    instance.change(PITCH, 69);
+    for voice in 0..10 {
+        instance.change(voice_pitch_parameter(voice), 1);
+        instance.change(voice_fine_parameter(voice), voice as i16 * 10 - 50);
+        instance.change(voice_transpose_parameter(voice), voice as i16 - 5);
+    }
+    let mut samples = [0.0; LAST_BUS * 24];
+    for voltage in [0.125f32, 0.125001, -0.25, 1.1] {
+        samples[..24].fill(voltage);
+        let before = dsp::playback_work_counts().1;
+        instance.render(&mut samples);
+        let calls = dsp::playback_work_counts().1 - before;
+        assert!(calls <= if voltage == 0.125 { 11 } else { 1 });
+        for voice in 0..10 {
+            let octave =
+                (voice as f32 - 5.0) / 12.0 + (voice as f32 * 10.0 - 50.0) / 1200.0 + voltage;
+            assert_cached_octave(&instance, voice, octave);
+        }
+    }
+    for voice in 0..10 {
+        instance.change(voice_pitch_parameter(voice), voice as i16 + 1);
+        samples[voice * 24..(voice + 1) * 24].fill(voice as f32 * 0.1);
+    }
+    instance.render(&mut samples);
+    for voice in 0..10 {
+        let octave = (voice as f32 - 5.0) / 12.0
+            + (voice as f32 * 10.0 - 50.0) / 1200.0
+            + voice as f32 * 0.1;
+        assert_cached_octave(&instance, voice, octave);
+    }
+    instance.change(voice_active_parameter(0), 0);
+    instance.change(voice_pitch_parameter(1), 10);
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 1, -4.0 / 12.0 - 40.0 / 1200.0 + 0.9);
 }

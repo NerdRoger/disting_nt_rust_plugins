@@ -373,3 +373,117 @@ scratch; the monitor stopped SysEx streaming and closed its ports on exit.
 CSV/JSON measurements and comparison binaries remain under ignored
 `target/wavesmith-profiling/`. A listening check on smooth CV glides remains
 useful because numerical agreement cannot establish subjective equivalence.
+
+
+## Round 6: lookup conversion and shared CV factors
+
+Two candidates were built independently against the fixed-point-pitch build.
+The existing ten-voice stereo CV preset, 48 kHz and 24-frame callbacks remained
+unchanged. Every run collected 100 seconds after five seconds of warmup, with
+100 or 101 reports, identical workload metadata and no missed messages.
+Only the supplied deployment script and scratch preset were used. No MIDI
+notes or musical parameter changes were sent.
+
+| Build | Callback-body cycles | Setup cycles | Rendering cycles |
+|---|---:|---:|---:|
+| round6-current | 39,516 | 8,601 | 24,668 |
+| round6-lookup | 39,168 | 8,255 | 24,666 |
+| round6-control | 39,515 | 8,606 | 24,662 |
+| round6-factored | 38,290 | 8,246 | 23,779 |
+| round6-lookup-repeat | 39,166 | 8,255 | 24,664 |
+| round6-combined | 38,050 | 8,007 | 23,778 |
+| round6-factored-repeat | 38,062 | 8,018 | 23,780 |
+| round6-combined-repeat | 38,047 | 8,007 | 23,774 |
+
+### Lookup-only experiment: discarded after interaction testing
+
+A 129-entry fractional-octave table was generated at runtime via
+calculateStaticRequirements/initialise, using 516 bytes of firmware-owned DRAM
+shared by the whole Wavesmith factory. It was not stored per instance or embedded
+in read-only data. The static API exposes factory DRAM, not DTC. A checked,
+immutable shared-table API handle was prototyped to keep raw pointers outside
+plugin code; initialization and memory-admission tests passed.
+
+Linear interpolation, integer octave scaling and the existing per-voice exact
+cache replaced frequency-conversion exp2 calls. A dense sweep from -16 through
++16 octaves measured maximum tuning error **0.0065601 cents**, checked
+monotonicity and exact octave points. Host integration tests used an explicit
+0.01-cent tuning budget instead of falsely requiring the old f32 rounding.
+The independent candidate passed all 116 Wavesmith tests and repository checks.
+
+Lookup-only used **23,576 ITC bytes (+108)**, **3,588 cold-code bytes (+128)**,
+unchanged 1,603-byte rodata and 516 factory DRAM bytes, plus a four-byte global
+handle. It repeated a **0.88% whole-callback saving** versus the returning
+original. However, its added value overlapped with CV sharing: the first
+combined comparison suggested another 0.63%, while the returning sharing-only
+build was faster than its initial run. Against that returning build the repeated
+combination saved only **0.04%**, within ordinary timing variation.
+
+The combined build cost 23,976 ITC bytes (+140 over sharing alone), 3,628 cold
+code bytes (+128), and the shared DRAM allocation. Its fixed voice tuning
+factors used the original exp2 so two lookup approximation errors would not
+compound. It passed 118 debug and optimized host tests. Those numerical tests
+do not establish an incremental CPU benefit, so the lookup, static callbacks,
+shared-table API, API accessor change, probe adjustment and candidate-only tests
+were all removed from final source. No factory allocation is retained.
+
+### Shared CV factors: selected
+
+CV frequency is factored into `440 * 2^tuning * 2^CV`. Root/transpose/fine
+conversion is cached per voice; input voltage conversion is cached per bus and
+shared even when voices have different fine tuning or transpose. Cache entries
+retain exact voltages across callbacks; no CV deadband or smoothing change is
+introduced. Zero volts has the exact unity factor. Each callback can use up to
+one distinct bus per voice, and rerouting validates both the bus and voltage.
+MIDI keeps its existing exact combined-pitch cache. Final frequencies retain
+the original limits, now applied after multiplication.
+
+This reassociation changes f32 rounding slightly. Numerical tests cover detuned
+voices, positive/negative inputs up to 10 V, frequency clamps, shared and separate
+buses, routing changes and input changes of one microvolt. Maximum measured
+tuning difference in the numerical test is **0.000643 cents**, below its
+0.002-cent budget. An integration test proves ten detuned voices share a single
+conversion per changing CV input and verify each actual prepared frequency.
+Unchanged signals require no repeated conversions across callbacks.
+
+Sharing alone costs **23,836 ITC bytes (+368)**, **3,500 cold-code bytes (+40)**
+and unchanged rodata. The cache itself is 124 bytes on ARM; compiler layout
+reports State increasing from **2,128 to 2,248 bytes (+120)**, and its storage
+wrapper from 2,168 to 2,288 bytes, because four bytes of padding are reused.
+No DTC, factory DRAM, additional waveform buffers or dynamic allocations are
+added. The source uses the voice-count constant for cache capacity.
+
+Sharing-only saved **3.10%** in its first callback comparison and **3.68%** on
+repeat versus the returning baseline. Its render means agree within 0.003%,
+but setup timing varied by about 228 cycles between loads. The marginal lookup
+claim is therefore rejected rather than interpreting that shift as an added
+lookup benefit. A final original/selected pair follows below to check the
+retained improvement again. These percentages are callback-body cycle changes,
+not percentage points of the firmware's total CPU meter.
+
+
+### Round-6 final verification
+
+| Build | Callback-body cycles | Setup cycles | Rendering cycles |
+|---|---:|---:|---:|
+| round6-final-control | 39,283 | 8,376 | 24,661 |
+| round6-final-selected | 38,060 | 8,018 | 23,777 |
+
+The final sharing-only pair saves **3.11% of callback-body cycles**, **4.27% of
+setup cycles** and **3.58% of rendering cycles**. The final selected mean agrees
+with the prior sharing-only repeat within 0.01%. The returning original itself
+is 0.59% faster than the first two original runs, primarily in setup, reinforcing
+why the marginal incremental lookup saving was not retained. A defensible
+result is about **3.1% additional end-to-end callback savings** in this workload,
+with the lookup experiment discarded. Improvements depend on the configured
+input sharing; independent-input timing was not benchmarked on the device.
+
+The final object is byte-identical to the independently tested sharing-only
+object, passes ARM relocation validation and is deployed using scratch.
+All 117 Wavesmith tests pass in debug and release builds; repository checks,
+other plugin tests, API tests/doctests and monitor tests pass. API/sys changes
+and candidate-only lookup tests are absent from the final diff. No telemetry
+protocol or musical parameter changes were needed. Both final runs received
+101 reports with no missed messages; streaming was disabled and ports closed
+when the monitor exited. Raw measurements and rejected alternatives remain
+only in ignored target/wavesmith-profiling for audit.

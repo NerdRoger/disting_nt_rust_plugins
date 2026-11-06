@@ -626,6 +626,61 @@ fn store_table(
     Some(())
 }
 
+#[derive(Clone, Copy)]
+struct CvFactor {
+    bus: i16,
+    voltage: f32,
+    factor: f32,
+}
+
+/// At most one distinct input per voice; retain exact inputs between callbacks.
+#[derive(Clone, Copy)]
+pub struct CvPitchCache {
+    entries: [CvFactor; super::VOICE_COUNT],
+    used: usize,
+}
+
+impl CvPitchCache {
+    pub const fn new() -> Self {
+        Self {
+            entries: [CvFactor {
+                bus: -1,
+                voltage: f32::INFINITY,
+                factor: 1.0,
+            }; super::VOICE_COUNT],
+            used: 0,
+        }
+    }
+    pub fn begin_block(&mut self) {
+        self.used = 0;
+    }
+    pub fn factor(&mut self, bus: i16, voltage: f32) -> f32 {
+        if voltage == 0.0 {
+            return 1.0;
+        }
+        let position = self
+            .entries
+            .iter()
+            .take(self.used)
+            .position(|entry| entry.bus == bus);
+        let index = position.unwrap_or(self.used);
+        let Some(entry) = self.entries.get_mut(index) else {
+            return distingnt_api::api::math::exp2(voltage);
+        };
+        if position.is_none() {
+            self.used += 1;
+        }
+        if entry.bus != bus || entry.voltage != voltage {
+            entry.bus = bus;
+            entry.voltage = voltage;
+            entry.factor = distingnt_api::api::math::exp2(voltage);
+            #[cfg(test)]
+            tests::count_frequency_conversion();
+        }
+        entry.factor
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Oscillator {
     phase: u32,
@@ -686,11 +741,11 @@ impl Oscillator {
         }
     }
     #[cfg(test)]
-    pub fn cached_frequency_for_test(&self) -> f32 {
-        self.cached_frequency
+    pub fn prepared_frequency_for_test(&self) -> f32 {
+        self.prepared_frequency
     }
 
-    /// Cache the exact exponent, including Fine and CV. No pitch deadband.
+    /// Cache the exact exponent: MIDI note/bend/fine, or CV-mode root/transpose/fine.
     pub fn frequency(&mut self, octave: f32) -> f32 {
         if octave != self.cached_octave {
             self.cached_octave = octave;
@@ -699,6 +754,12 @@ impl Oscillator {
             tests::count_frequency_conversion();
         }
         self.cached_frequency
+    }
+
+    pub fn cv_frequency(&mut self, tuning: f32, factor: f32) -> f32 {
+        // exp2(tuning + CV) = exp2(tuning) * exp2(CV). The tuning factor is
+        // cached per voice; the input factor is shared even for detuned voices.
+        (self.frequency(tuning) * factor).clamp(440.0 / 65536.0, 440.0 * 65536.0)
     }
 
     pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {

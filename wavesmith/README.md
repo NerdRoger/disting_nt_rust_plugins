@@ -312,8 +312,18 @@ slow glides still update the filter. Stable notes reuse the selection without
 repeating its table search and blend calculation on every sample. The accepted
 selection is stored as integer lower/upper phase-step thresholds; it adds no
 waveform buffers or FFT work.
-Voice caches also persist across audio blocks: note/CV-to-frequency conversion
-runs only when the exact combined pitch changes. Phase-step targets update only
+Voice caches persist across audio blocks. MIDI frequency conversion runs only
+when the exact note/bend/fine exponent changes. In CV mode each voice caches its
+root/transpose/fine tuning factor. A per-instance cache converts each distinct
+input bus voltage to an exponential factor once and shares it across voices,
+including voices with different detuning. Exact unchanged inputs reuse that
+factor across callbacks; every representable voltage change invalidates it.
+The final frequency is the product of tuning and input factors, with the same
+frequency limits as before. This reassociates floating-point arithmetic, so
+small rounding differences are expected; tests bound tuning error and verify
+shared buses, independent buses, rerouting and tiny input changes. The cache
+adds 120 bytes to ARM instance state after padding, with no new waveform tables.
+Phase-step targets update only
 when frequency or sample rate changes; slew coefficients update only when the
 sample rate changes. Level smoothing restarts only when Level changes.
 Pitch smoothing uses signed integer arithmetic on the existing 32-bit phase
@@ -526,9 +536,12 @@ The level controller combines stereo power/peak detection into one traversal
 and calculates each stereo gain-ramp value once. Left/right power sums and
 per-sample gain arithmetic retain the original accumulation and rounding order.
 
-Pitch conversion uses each voice's persistent exact cache. Cross-voice sharing
-was removed in the code-space review because its measured benefit was small.
-Independent detuning and every representable CV change remain intact.
+MIDI pitch conversion uses each voice's persistent exact cache. CV conversion
+separates cached per-voice tuning from a shared per-bus voltage factor. This
+shares work even when voices are detuned, unlike the earlier exact-combined-
+pitch sharing experiment. Independent detuning and tiny CV changes remain intact.
+The firmware exp2 function is retained; a factory-initialized lookup-table
+experiment was discarded because it added no reliable benefit on top of sharing.
 
 While Level is settled, block rendering calculates the volts-per-sample gain
 (`level * 5`) once per chunk instead of applying two multiplications per sample.

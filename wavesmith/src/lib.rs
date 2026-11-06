@@ -196,6 +196,7 @@ struct State {
     oscillators: [dsp::Oscillator; VOICE_COUNT],
     midi: midi::MidiState,
     cv_gains: [f32; VOICE_COUNT],
+    cv_pitch: dsp::CvPitchCache,
     levels: levels::LevelControl,
     level: levels::Level,
     mode_transition: levels::ModeTransition,
@@ -496,6 +497,7 @@ impl Plugin for Wavesmith {
                 oscillators: [dsp::Oscillator::new(); VOICE_COUNT],
                 midi: midi::MidiState::new(rate),
                 cv_gains: [0.0; VOICE_COUNT],
+                cv_pitch: dsp::CvPitchCache::new(),
                 levels: levels::LevelControl::new(rate),
                 level: levels::Level::new(),
                 mode_transition: levels::ModeTransition::new(rate),
@@ -875,6 +877,7 @@ impl Plugin for Wavesmith {
                     });
         }
         let mut pitches = [0.0f32; VOICE_COUNT];
+        let mut cv_inputs = [(0i16, 0.0f32); VOICE_COUNT];
         // Snapshot tuning/CV before clearing or writing the shared destination.
         if output_enabled {
             for (voice, (pitch, &render)) in pitches
@@ -901,14 +904,17 @@ impl Plugin for Wavesmith {
                     .unwrap_or(0)
                     .clamp(-48, 48) as f32
                     / 12.0;
-                let cv = buses.read_first(p.value(voice_pitch_parameter(voice)).unwrap_or(0));
+                let bus = p.value(voice_pitch_parameter(voice)).unwrap_or(0);
+                let cv = buses.read_first(bus);
                 let cv = if cv.is_finite() {
                     cv.clamp(-10.0, 10.0)
                 } else {
                     0.0
                 };
-                *pitch =
-                    ((note - 69.0) / 12.0 + fine + voice_fine + transpose + cv).clamp(-16.0, 16.0);
+                if let Some(input) = cv_inputs.get_mut(voice) {
+                    *input = (bus, cv);
+                }
+                *pitch = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
         let processing = context.processing();
@@ -925,13 +931,15 @@ impl Plugin for Wavesmith {
         }
         state.midi.begin_block();
         let pitch_bends = &state.midi.pitch_bends;
-        for (((midi, oscillator), pitch), &render) in state
+        state.cv_pitch.begin_block();
+        for ((((midi, oscillator), pitch), &render), &(bus, cv)) in state
             .midi
             .voices
             .iter_mut()
             .zip(state.oscillators.iter_mut())
             .zip(pitches.iter_mut())
             .zip(&render_voice)
+            .zip(&cv_inputs)
             .take(VOICE_COUNT)
         {
             if !render {
@@ -951,7 +959,8 @@ impl Plugin for Wavesmith {
                 }
                 *pitch = frequency;
             } else {
-                *pitch = oscillator.frequency(*pitch);
+                let factor = state.cv_pitch.factor(bus, cv);
+                *pitch = oscillator.cv_frequency(*pitch, factor);
             }
             if frames > 0 {
                 oscillator.prepare(*pitch, state.sample_rate, level);
