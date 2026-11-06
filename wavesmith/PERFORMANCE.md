@@ -584,3 +584,41 @@ repository/ABI checks and ARM relocation validation pass. The direct-target
 version is deployed via the supplied scratch script; telemetry is stopped and
 ports closed after measurement. Listening-sensitive smoothing changes remain
 separate from this accepted arithmetic optimization.
+
+
+## Round 9: two-sample pitch smoothing, accepted after listening
+
+Same ten-voice stereo CV workload at 48 kHz / 24 frames. Each run used 100
+seconds after five seconds warmup, with no missed reports or metadata changes.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| round7-direct-repeat | 36,266 | 8,079 | 21,955 |
+| round9-paired | 35,562 | 8,059 | 21,264 |
+| round9-control | 36,265 | 8,070 | 21,964 |
+| round9-paired-repeat | 35,315 | 7,828 | 21,248 |
+
+The original repeated within 0.01%. Pair smoothing saved **1.94%** initially
+and **2.62%** on repeat; render-only savings repeated at about 3.2%, while setup
+shifted about 230 cycles between loads. A conservative interpretation is about
+**2% additional whole-callback savings**, not CPU-meter percentage points.
+
+The prototype computes a two-sample exponential endpoint with Q30 coefficient
+alpha + alpha*(1-alpha), then uses a linear midpoint. New targets, sample-rate
+changes and silent retunes cancel pending endpoints. Level smoothing, waveform
+playback and existing target pitches remain unchanged. No input deadband or
+band quantization is introduced. This approximates transient pitch tracking;
+settled pitch remains the same.
+
+122 Wavesmith tests pass in debug/release, with repository/ABI/static-placement
+and relocation checks passing. New tests bound endpoint/midpoint/integrated
+phase errors against the original cfg(test) integer recurrence, and check
+monotonicity, no overshoot, settling and stale-endpoint cancellation. The older
+float reference comparison now includes an explicit midpoint-curvature error
+term instead of falsely requiring the unchanged trajectory.
+
+ITC grows **176 bytes**, 24,776 -> **24,952**; cold code 3,500 and rodata 1,603
+are unchanged. State grows **80 bytes**, 2,328 -> **2,408**, across ten voices.
+No additional waveform tables or heap allocations are introduced. The user
+reported CV glides and MIDI pitch bends sounded fine, so this improvement was
+accepted and committed separately before investigating shared smoothing.

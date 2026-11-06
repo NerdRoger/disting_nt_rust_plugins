@@ -329,9 +329,13 @@ Phase-step targets update only
 when frequency or sample rate changes; slew coefficients update only when the
 sample rate changes. Level smoothing restarts only when Level changes.
 Pitch smoothing uses signed integer arithmetic on the existing 32-bit phase
-steps, with a Q30 coefficient and the same approximately 1 ms exponential time
-constant. Rounding continues in one-phase-step increments near the target so
-tracking settles exactly instead of sticking short. At 48 kHz one step is about
+steps. A precomputed Q30 coefficient calculates the exponential endpoint every
+two samples, retaining the approximately 1 ms time constant; a linear midpoint
+supplies the intervening sample. New targets and silent retunes cancel pending
+endpoints. Rounding continues in one-phase-step increments near the target so
+tracking settles exactly instead of sticking short. This two-sample trajectory
+slightly approximates the original per-sample exponential; CV glides and MIDI
+pitch bends passed a human listening check. At 48 kHz one step is about
 0.000011 Hz. Level retains its original floating-point recurrence. Pitch is no
 longer bit-identical to the old floating-point recurrence: tests bound transient
 error against a double-precision reference and check steady tuning, monotonic

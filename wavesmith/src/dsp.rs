@@ -690,6 +690,9 @@ pub struct Oscillator {
     selection_low: u32,
     selection_high: u32,
     pitch_slew: i32,
+    pitch_pair_slew: i32,
+    pair_end: u32,
+    pair_pending: bool,
     #[cfg(test)]
     selection_step: u32,
     cached_octave: f32,
@@ -728,6 +731,9 @@ impl Oscillator {
             selection_low: 0,
             selection_high: 0,
             pitch_slew: 0,
+            pitch_pair_slew: 0,
+            pair_end: 0,
+            pair_pending: false,
             #[cfg(test)]
             selection_step: 0,
             cached_octave: f32::INFINITY,
@@ -779,10 +785,16 @@ impl Oscillator {
                 self.cached_rate = sample_rate;
                 self.slew = (1000.0 / sample_rate).min(1.0);
                 self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
+                // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
+                self.pitch_pair_slew = self.pitch_slew
+                    + ((self.pitch_slew as i64 * ((1i64 << 30) - self.pitch_slew as i64)
+                        + (1i64 << 29))
+                        >> 30) as i32;
             }
         }
         if rebuild_scale || factor != self.prepared_input {
             self.prepared_input = factor;
+            self.pair_pending = false;
             self.target_step = (self.cv_phase_scale * factor)
                 .max(self.cv_minimum_step)
                 .min(0.45 * PHASE_SCALE) as u32;
@@ -801,10 +813,16 @@ impl Oscillator {
         self.cv_phase_scale = 0.0;
         if frequency != self.prepared_input || sample_rate != self.cached_rate {
             self.prepared_input = frequency;
+            self.pair_pending = false;
             if sample_rate != self.cached_rate {
                 self.cached_rate = sample_rate;
                 self.slew = (1000.0 / sample_rate).min(1.0);
                 self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
+                // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
+                self.pitch_pair_slew = self.pitch_slew
+                    + ((self.pitch_slew as i64 * ((1i64 << 30) - self.pitch_slew as i64)
+                        + (1i64 << 29))
+                        >> 30) as i32;
             }
             let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
             self.target_step = (increment * PHASE_SCALE) as u32;
@@ -820,6 +838,7 @@ impl Oscillator {
     }
 
     pub fn tune_when_silent(&mut self, frequency: f32, sample_rate: f32) {
+        self.pair_pending = false;
         let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
         self.phase_step = (increment * PHASE_SCALE) as u32;
         self.pitch_moving = true;
@@ -855,8 +874,32 @@ impl Oscillator {
             && self.phase_step.min(self.target_step) > self.selection_low
             && self.phase_step.max(self.target_step) < self.selection_high
     }
+    // One two-sample exponential endpoint, with a
+    // linear midpoint. Keep the existing per-sample level slew unchanged.
     #[inline(always)]
     fn advance_pitch_step(&mut self) {
+        if self.pitch_moving {
+            if self.pair_pending {
+                self.phase_step = self.pair_end;
+                self.pair_pending = false;
+            } else {
+                let delta = (self.target_step as i32).wrapping_sub(self.phase_step as i32);
+                let rounded =
+                    ((delta as i64 * self.pitch_pair_slew as i64 + (1i64 << 29)) >> 30) as i32;
+                let change = if rounded == 0 {
+                    delta.signum()
+                } else {
+                    rounded
+                };
+                self.pair_end = self.phase_step.wrapping_add(change as u32);
+                self.phase_step = self.phase_step.wrapping_add((change / 2) as u32);
+                self.pair_pending = true;
+            }
+            self.pitch_moving = self.phase_step != self.target_step || self.pair_pending;
+        }
+    }
+    #[cfg(test)]
+    fn advance_pitch_step_exact(&mut self) {
         if self.pitch_moving {
             let delta = (self.target_step as i32).wrapping_sub(self.phase_step as i32);
             if delta != 0 {

@@ -563,7 +563,17 @@ fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_pat
                 - reference.increment as f64 * PHASE_SCALE as f64)
                 .abs();
             assert!(
-                error <= pitch_error_bound + 1.0,
+                error
+                    <= pitch_error_bound
+                        + 1.0
+                        + if oscillator.pair_pending {
+                            0.5 * alpha
+                                * alpha
+                                * (target - old_increment).abs()
+                                * PHASE_SCALE as f64
+                        } else {
+                            0.0
+                        },
                 "pitch error {error} > {pitch_error_bound}"
             );
             assert_eq!(oscillator.level, reference.level);
@@ -1530,7 +1540,6 @@ fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
 #[test]
 fn fixed_pitch_tracks_exponential_reference_without_overshoot_and_settles_exactly() {
     for rate in [32000, 44100, 48000, 96000] {
-        let engine = Engine::new(8, rate);
         let mut voice = Oscillator::new();
         for frequency in [20.0, 440.0, 12000.0, 20.0, 20.0001, 19.9999] {
             voice.prepare(frequency, rate as f32, 1.0);
@@ -1539,7 +1548,7 @@ fn fixed_pitch_tracks_exponential_reference_without_overshoot_and_settles_exactl
             for _ in 0..5000 {
                 let before = voice.phase_step;
                 exact += alpha * (voice.target_step as f64 - exact);
-                voice.advance_pitch(&engine);
+                voice.advance_pitch_step_exact();
                 assert!((voice.phase_step as f64 - exact).abs() <= 1.0 / alpha + 2.0);
                 assert!(
                     (before.min(voice.target_step)..=before.max(voice.target_step))
@@ -1703,4 +1712,65 @@ fn direct_cv_scale_rebuilds_for_tuning_rate_and_path_changes_without_a_deadband(
         voice.prepare_cv(tuning, 1.0, rate, 0.5);
         assert_eq!(voice.target_step, initial);
     }
+}
+
+#[test]
+fn paired_pitch_endpoints_track_exact_reference_monotonically_with_bounded_phase_error() {
+    for rate in [32000.0, 44100.0, 48000.0, 96000.0] {
+        for (start, target) in [
+            (20.0, 20000.0),
+            (20000.0, 20.0),
+            (440.0, 441.0),
+            (440.0, 440.0001),
+        ] {
+            let mut paired = Oscillator::new();
+            paired.tune_when_silent(start, rate);
+            paired.prepare(target, rate, 0.5);
+            let mut exact = paired;
+            let alpha = paired.pitch_slew as f64 / PITCH_SLEW_SCALE as f64;
+            let distance = paired.target_step.abs_diff(paired.phase_step) as f64;
+            let mut sum = 0i64;
+            for _ in 0..5000 {
+                let before = paired.phase_step;
+                paired.advance_pitch_step();
+                exact.advance_pitch_step_exact();
+                assert!(
+                    (before.min(paired.target_step)..=before.max(paired.target_step))
+                        .contains(&paired.phase_step)
+                );
+                let tolerance = 3.0 / alpha
+                    + 8.0
+                    + if paired.pair_pending {
+                        0.5 * alpha * alpha * distance
+                    } else {
+                        0.0
+                    };
+                assert!((paired.phase_step as f64 - exact.phase_step as f64).abs() <= tolerance);
+                sum += paired.phase_step as i64 - exact.phase_step as i64;
+            }
+            assert_eq!(paired.phase_step, paired.target_step);
+            assert!(!paired.pitch_moving);
+            assert!(!paired.pair_pending);
+            let theoretical = distance * alpha / (2.0 * (2.0 - alpha));
+            assert!((sum as f64).abs() <= theoretical + 0.001 * PHASE_SCALE as f64);
+        }
+    }
+}
+
+#[test]
+fn new_pitch_target_and_silent_retune_discard_pending_interpolation_endpoint() {
+    let mut voice = Oscillator::new();
+    voice.prepare(440.0, 48000.0, 0.5);
+    voice.advance_pitch_step();
+    assert!(voice.pair_pending);
+    voice.prepare(220.0, 48000.0, 0.5);
+    assert!(!voice.pair_pending);
+    voice.advance_pitch_step();
+    assert!(voice.pair_pending);
+    voice.prepare_cv(0.0, 1.1, 48000.0, 0.5);
+    assert!(!voice.pair_pending);
+    voice.advance_pitch_step();
+    assert!(voice.pair_pending);
+    voice.tune_when_silent(880.0, 48000.0);
+    assert!(!voice.pair_pending);
 }
