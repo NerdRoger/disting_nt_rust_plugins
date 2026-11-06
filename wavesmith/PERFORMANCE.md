@@ -707,3 +707,29 @@ or regression is established. This refactor is retained for one implementation
 of shared setup and smaller production state. Metrics and independent numerical
 reference tests remain in place. Raw captures and comparison binaries live only
 under ignored `target/wavesmith-refactor/`.
+
+
+## Refactor review: explicit render eligibility
+
+The callback's tuning array now holds octave offsets throughout setup. A
+separate existing boolean array controls rendering and telemetry voice counts,
+including MIDI release tails. CV no longer overwrites its tuning entries with
+1.0, and MIDI no longer overwrites them with frequency values solely to use
+zero as a disabled sentinel. This removes mixed units and duplicate eligibility
+bookkeeping without adding arrays or persistent state.
+
+All 122 Wavesmith tests pass in debug and release, the repository-wide test
+suite passes, and the ARM object passes relocation validation. ITC decreases
+by 36 bytes relative to the state-only refactor, 24,968 -> 24,932. Instance RAM,
+cold code and rodata are unchanged.
+
+A 100-second device capture after five seconds warmup recorded 35,426 callback
+cycles, 7,846 setup cycles and 21,262 render/mix cycles, versus 35,667/8,010/21,333
+for the state-only build. The apparent 0.68% callback reduction is small relative
+to the variation demonstrated above; this is retained for clearer control flow
+and reduced instruction size, with no established overall CPU gain.
+
+The returning state-only control measured 35,419 callback cycles, 7,787 setup
+cycles and 21,308 render/mix cycles. It was 0.69% faster than its first run,
+matching the apparent callback gain of the refactor. This reinforces that no
+whole-callback speed improvement is established by these captures.

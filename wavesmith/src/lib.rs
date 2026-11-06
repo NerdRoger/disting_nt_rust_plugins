@@ -876,11 +876,13 @@ impl Plugin for Wavesmith {
                             .is_some_and(|v| v.sounding())
                     });
         }
-        let mut pitches = [0.0f32; VOICE_COUNT];
+        // Tuning remains in octaves throughout setup; render_voice owns eligibility,
+        // including release tails. No pitch value doubles as an enabled flag.
+        let mut tuning_octaves = [0.0f32; VOICE_COUNT];
         let mut cv_inputs = [(0i16, 0.0f32); VOICE_COUNT];
         // Snapshot tuning/CV before clearing or writing the shared destination.
         if output_enabled {
-            for (voice, (pitch, &render)) in pitches
+            for (voice, (pitch, &render)) in tuning_octaves
                 .iter_mut()
                 .zip(&render_voice)
                 .take(VOICE_COUNT)
@@ -932,42 +934,38 @@ impl Plugin for Wavesmith {
         state.midi.begin_block();
         let pitch_bends = &state.midi.pitch_bends;
         state.cv_pitch.begin_block();
-        for ((((midi, oscillator), pitch), &render), &(bus, cv)) in state
+        for ((((midi, oscillator), &tuning), render), &(bus, cv)) in state
             .midi
             .voices
             .iter_mut()
             .zip(state.oscillators.iter_mut())
-            .zip(pitches.iter_mut())
-            .zip(&render_voice)
+            .zip(&tuning_octaves)
+            .zip(render_voice.iter_mut())
             .zip(&cv_inputs)
             .take(VOICE_COUNT)
         {
-            if !render {
-                *pitch = 0.0;
+            if !*render {
                 continue;
             }
             if midi_setting != 0 {
                 if !midi.sounding() {
-                    *pitch = 0.0;
+                    *render = false;
                     continue;
                 }
                 let octave =
-                    (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + *pitch;
+                    (midi.pitch() as f32 - 69.0) / 12.0 + midi.bend_octaves(pitch_bends) + tuning;
                 let frequency = oscillator.frequency(octave.clamp(-16.0, 16.0));
                 if midi.take_retune() {
                     oscillator.tune_when_silent(frequency, state.sample_rate);
                 }
-                *pitch = frequency;
                 if frames > 0 {
                     oscillator.prepare(frequency, state.sample_rate, level);
                 }
             } else {
                 let factor = state.cv_pitch.factor(bus, cv);
                 if frames > 0 {
-                    oscillator.prepare_cv(*pitch, factor, state.sample_rate, level);
+                    oscillator.prepare_cv(tuning, factor, state.sample_rate, level);
                 }
-                // Only used below as an enabled-voice marker in CV mode.
-                *pitch = 1.0;
             }
         }
         let setup_end = distingnt_api::api::cpu_cycle_count();
@@ -996,17 +994,17 @@ impl Plugin for Wavesmith {
                 let mut voice_power = 0.0;
                 let mut gate_power = 0.0;
                 let render_start = distingnt_api::api::cpu_cycle_count();
-                for (((((oscillator, midi), &frequency), cv_gain), &on), pan) in state
+                for (((((oscillator, midi), &render), cv_gain), &on), pan) in state
                     .oscillators
                     .iter_mut()
                     .zip(state.midi.voices.iter_mut())
-                    .zip(&pitches)
+                    .zip(&render_voice)
                     .zip(state.cv_gains.iter_mut())
                     .zip(&enabled)
                     .zip(state.pans.iter_mut())
                     .take(VOICE_COUNT)
                 {
-                    if frequency == 0.0 {
+                    if !render {
                         continue;
                     }
                     voice_mix.fill(0.0);
@@ -1128,7 +1126,7 @@ impl Plugin for Wavesmith {
             frames,
             state.sample_rate as u32,
             state.render_cycles.average,
-            pitches.iter().filter(|&&f| f > 0.0).count() as u8,
+            render_voice.iter().filter(|&&render| render).count() as u8,
             midi_setting != 0,
             routing.stereo(),
             [
