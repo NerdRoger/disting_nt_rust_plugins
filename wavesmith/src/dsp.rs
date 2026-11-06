@@ -740,7 +740,7 @@ impl Oscillator {
 
     // Preserve the original per-sample recurrence and table-selection cadence.
     #[inline(always)]
-    fn advance_pitch(&mut self, engine: &Engine) -> bool {
+    fn advance_pitch(&mut self, engine: &Engine) {
         if self.pitch_moving {
             let previous = self.increment;
             self.increment += self.slew * (self.target_increment - self.increment);
@@ -758,10 +758,8 @@ impl Oscillator {
                 (self.playback_level, self.playback_blend) =
                     engine.layout.playback_levels(self.increment);
                 self.selection_increment = self.increment;
-                return true;
             }
         }
-        false
     }
 
     pub fn tick_prepared(&mut self, engine: &Engine, memory: &Memory, frame: usize) -> f32 {
@@ -883,85 +881,45 @@ impl Oscillator {
         if memory.get((base + engine.layout.count - 1) / 2).is_none() {
             return false;
         }
-        if output.is_empty() {
-            return true;
-        }
-        // Each run starts with pitch already advanced for its first sample.
-        self.advance_pitch(engine);
-        let mut remaining = output;
-        while !remaining.is_empty() {
-            let selected = self.playback_level;
-            let index = base + selected;
-            let rich = memory.get(index / 2).unwrap_or(first);
-            let lean = memory.get((index + 1) / 2).unwrap_or(rich);
-            let blended = self.playback_blend != 0.0 && selected + 1 < engine.layout.count;
-            let consumed = match (blended, index & 1 != 0) {
-                (false, false) => {
-                    self.render_pitch_run::<false, false>(engine, rich, lean, remaining)
-                }
-                (false, true) => {
-                    self.render_pitch_run::<false, true>(engine, rich, lean, remaining)
-                }
-                (true, false) => {
-                    self.render_pitch_run::<true, false>(engine, rich, lean, remaining)
-                }
-                (true, true) => self.render_pitch_run::<true, true>(engine, rich, lean, remaining),
+        let mut selected = usize::MAX;
+        let mut rich = first;
+        let mut lean = first;
+        let mut rich_imaginary = false;
+        let mut lean_imaginary = false;
+        let read = |block: &Block, imaginary: bool, index: usize, next: usize, fraction: f32| {
+            let (a, b) = if imaginary {
+                (block.data[index].im, block.data[next].im)
+            } else {
+                (block.data[index].re, block.data[next].re)
             };
-            let Some(rest) = remaining.get_mut(consumed..) else {
-                return true;
-            };
-            remaining = rest;
-        }
-        true
-    }
-
-    // Lane and one/two-table decisions are made once per stable selection run.
-    // A selection update prepares the next sample before returning to dispatch.
-    fn render_pitch_run<const BLENDED: bool, const IMAGINARY: bool>(
-        &mut self,
-        engine: &Engine,
-        rich: &Block,
-        lean: &Block,
-        output: &mut [f32],
-    ) -> usize {
-        let selected = self.playback_level;
-        let length = output.len();
-        for (frame, sample) in output.iter_mut().enumerate() {
+            a + (b - a) * fraction
+        };
+        for sample in output {
+            self.advance_pitch(engine);
+            if self.playback_level != selected {
+                selected = self.playback_level;
+                let index = base + selected;
+                rich = memory.get(index / 2).unwrap_or(first);
+                lean = memory.get((index + 1) / 2).unwrap_or(rich);
+                rich_imaginary = index & 1 != 0;
+                lean_imaginary = (index + 1) & 1 != 0;
+            }
             let index = (self.phase >> 24) as usize;
             let next = (index + 1) & (SIZE - 1);
             let fraction = (self.phase & 0x00ff_ffff) as f32 / 16_777_216.0;
-            let (a, b) = if IMAGINARY {
-                (rich.data[index].im, rich.data[next].im)
-            } else {
-                (rich.data[index].re, rich.data[next].re)
-            };
-            let a = a + (b - a) * fraction;
-            let value = if BLENDED {
-                let (c, d) = if IMAGINARY {
-                    (lean.data[index].re, lean.data[next].re)
-                } else {
-                    (lean.data[index].im, lean.data[next].im)
-                };
-                let b = c + (d - c) * fraction;
-                a + (b - a) * self.playback_blend
-            } else {
+            let a = read(rich, rich_imaginary, index, next, fraction);
+            let value = if self.playback_blend == 0.0 || selected + 1 == engine.layout.count {
                 a
+            } else {
+                let b = read(lean, lean_imaginary, index, next, fraction);
+                a + (b - a) * self.playback_blend
             };
             *sample += value * self.level * 5.0;
             self.phase = self.phase.wrapping_add(self.phase_step);
             #[cfg(test)]
             tests::count_moving_pitch_tick();
-            if frame + 1 < length
-                && self.advance_pitch(engine)
-                && (self.playback_level != selected
-                    || (self.playback_blend != 0.0
-                        && self.playback_level + 1 < engine.layout.count)
-                        != BLENDED)
-            {
-                return frame + 1;
-            }
         }
-        length
+        true
     }
 }
 
