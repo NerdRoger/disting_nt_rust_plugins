@@ -689,6 +689,7 @@ pub struct Oscillator {
     playback_blend: f32,
     selection_low: u32,
     selection_high: u32,
+    #[cfg(test)]
     pitch_slew: i32,
     pitch_pair_slew: i32,
     pair_end: u32,
@@ -730,6 +731,7 @@ impl Oscillator {
             playback_blend: 0.0,
             selection_low: 0,
             selection_high: 0,
+            #[cfg(test)]
             pitch_slew: 0,
             pitch_pair_slew: 0,
             pair_end: 0,
@@ -782,14 +784,7 @@ impl Oscillator {
             self.cv_phase_scale = root_frequency / sample_rate * PHASE_SCALE;
             self.cv_minimum_step = 0.01 / sample_rate * PHASE_SCALE;
             if rate_changed {
-                self.cached_rate = sample_rate;
-                self.slew = (1000.0 / sample_rate).min(1.0);
-                self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
-                // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
-                self.pitch_pair_slew = self.pitch_slew
-                    + ((self.pitch_slew as i64 * ((1i64 << 30) - self.pitch_slew as i64)
-                        + (1i64 << 29))
-                        >> 30) as i32;
+                self.update_sample_rate(sample_rate);
             }
         }
         if rebuild_scale || factor != self.prepared_input {
@@ -798,15 +793,9 @@ impl Oscillator {
             self.target_step = (self.cv_phase_scale * factor)
                 .max(self.cv_minimum_step)
                 .min(0.45 * PHASE_SCALE) as u32;
-            self.pitch_moving = self.phase_step != self.target_step
-                || self.selection_high == 0
-                || self.phase_step >= self.selection_high
-                || self.phase_step <= self.selection_low;
+            self.update_pitch_moving();
         }
-        if level != self.target_level {
-            self.target_level = level;
-            self.level_moving = true;
-        }
+        self.set_target_level(level);
     }
 
     pub fn prepare(&mut self, frequency: f32, sample_rate: f32, level: f32) {
@@ -815,22 +804,39 @@ impl Oscillator {
             self.prepared_input = frequency;
             self.pair_pending = false;
             if sample_rate != self.cached_rate {
-                self.cached_rate = sample_rate;
-                self.slew = (1000.0 / sample_rate).min(1.0);
-                self.pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
-                // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
-                self.pitch_pair_slew = self.pitch_slew
-                    + ((self.pitch_slew as i64 * ((1i64 << 30) - self.pitch_slew as i64)
-                        + (1i64 << 29))
-                        >> 30) as i32;
+                self.update_sample_rate(sample_rate);
             }
             let increment = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
             self.target_step = (increment * PHASE_SCALE) as u32;
-            self.pitch_moving = self.phase_step != self.target_step
-                || self.selection_high == 0
-                || self.phase_step >= self.selection_high
-                || self.phase_step <= self.selection_low;
+            self.update_pitch_moving();
         }
+        self.set_target_level(level);
+    }
+
+    // Both input modes share the same slew coefficients and transition flags.
+    fn update_sample_rate(&mut self, sample_rate: f32) {
+        self.cached_rate = sample_rate;
+        self.slew = (1000.0 / sample_rate).min(1.0);
+        let pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
+        #[cfg(test)]
+        {
+            // The independent one-sample reference uses the original coefficient.
+            self.pitch_slew = pitch_slew;
+        }
+        // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
+        self.pitch_pair_slew = pitch_slew
+            + ((pitch_slew as i64 * ((1i64 << 30) - pitch_slew as i64) + (1i64 << 29)) >> 30)
+                as i32;
+    }
+
+    fn update_pitch_moving(&mut self) {
+        self.pitch_moving = self.phase_step != self.target_step
+            || self.selection_high == 0
+            || self.phase_step >= self.selection_high
+            || self.phase_step <= self.selection_low;
+    }
+
+    fn set_target_level(&mut self, level: f32) {
         if level != self.target_level {
             self.target_level = level;
             self.level_moving = true;

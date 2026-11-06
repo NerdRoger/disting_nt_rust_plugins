@@ -675,3 +675,35 @@ validation, and the accepted build is deployed with the recreated scratch
 preset. Streaming is disabled and monitor ports are closed. Candidate source,
 patch, binary and raw measurements remain only under ignored
 `target/wavesmith-profiling/`. No shared-smoothing implementation is retained.
+
+
+## Refactor review: shared oscillator setup
+
+CV and MIDI preparation now share sample-rate coefficient setup, pitch-moving
+flag maintenance and level-target updates. The helper-only build has identical
+ARM instruction sections to the preceding build (only source-location data
+changed), with unchanged ITC/cold-code/rodata: 24,952/3,500/1,603 bytes.
+
+The original one-sample smoothing coefficient is now local during setup and
+stored only in test builds for the independent reference implementation.
+Production oscillators shrink from 80 to 76 bytes, reducing ARM State from
+2,408 to 2,368 bytes (framework storage from 2,448 to 2,408). ITC becomes
+24,968 bytes (+16); cold code and rodata are unchanged. No table memory changes.
+
+All 122 Wavesmith tests and ARM relocation validation pass. Each device capture
+lasted 100 seconds after five seconds warmup, with ten CV voices, stereo,
+48 kHz and 24 frames, and no missing telemetry reports.
+
+| Build | Callback-body cycles | Setup cycles | Render/mix cycles |
+|---|---:|---:|---:|
+| refactor-base | 38,129 | 8,054 | 23,775 |
+| refactor-setup (identical instructions) | 35,565 | 8,051 | 21,209 |
+| refactor-state (40 fewer RAM bytes) | 35,667 | 8,010 | 21,333 |
+
+The helper-only reload changed callback timing by 6.7% despite identical
+instructions, illustrating the workload variability already observed in round
+10. The state reduction differs from that run by only +0.29%; no CPU improvement
+or regression is established. This refactor is retained for one implementation
+of shared setup and smaller production state. Metrics and independent numerical
+reference tests remain in place. Raw captures and comparison binaries live only
+under ignored `target/wavesmith-refactor/`.
