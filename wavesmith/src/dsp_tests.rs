@@ -1465,37 +1465,3 @@ fn moving_pitch_renderer_is_bit_exact_across_sweeps_jitter_and_table_transitions
         assert!(MOVING_PITCH_TICKS.with(|counter| counter.get()) > before + 20000);
     }
 }
-
-#[test]
-fn shared_exact_frequency_cache_matches_original_and_retains_sub_microvolt_changes() {
-    let mut optimized = [Oscillator::new(); 10];
-    let mut reference = optimized;
-    for block in 0..1000 {
-        let octave = (block % 5) as f32 * 0.0000001;
-        let mut shared = (f32::INFINITY, 0.0);
-        let before = playback_work_counts().1;
-        for voice in &mut optimized {
-            voice.frequency_shared(octave, &mut shared);
-        }
-        assert_eq!(playback_work_counts().1 - before, 1);
-        for (voice, reference) in optimized.iter().zip(&mut reference) {
-            reference.frequency(octave);
-            assert_eq!(voice, reference);
-        }
-        // Persistent stable caches bypass the shared cache without conversions.
-        let before = playback_work_counts().1;
-        for voice in &mut optimized {
-            voice.frequency_shared(octave, &mut shared);
-        }
-        assert_eq!(playback_work_counts().1, before);
-    }
-    let mut shared = (f32::INFINITY, 0.0);
-    for (i, (voice, reference)) in optimized.iter_mut().zip(&mut reference).enumerate() {
-        let octave = i as f32 / 12.0;
-        assert_eq!(
-            voice.frequency_shared(octave, &mut shared).to_bits(),
-            reference.frequency(octave).to_bits()
-        );
-        assert_eq!(voice, reference);
-    }
-}

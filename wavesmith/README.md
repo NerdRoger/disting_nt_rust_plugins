@@ -515,7 +515,6 @@ The level controller combines stereo power/peak detection into one traversal
 and calculates each stereo gain-ramp value once. Left/right power sums and
 per-sample gain arithmetic retain the original accumulation and rounding order.
 
-Pitch conversion also has a one-entry, callback-local exact-value cache shared
-by voices. Each voice checks its own persistent cache first. Reuse requires a
-bit-identical combined octave value; detuned pitches remain independent. This
-adds no deadband, tuning factorization or persistent memory.
+Pitch conversion uses each voice's persistent exact cache. Cross-voice sharing
+was removed in the code-space review because its measured benefit was small.
+Independent detuning and every representable CV change remain intact.
