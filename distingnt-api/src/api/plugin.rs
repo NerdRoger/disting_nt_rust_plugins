@@ -296,6 +296,8 @@ pub trait Plugin: Sized + 'static {
     /// Place requirements calculation and instance construction in DRAM.
     /// Exclusive callees follow when packaging with --dram-callees.
     const INITIALIZATION_IN_DRAM: bool = false;
+    /// Place drawing and its exclusive callees in DRAM when packaging with --dram-callees.
+    const DRAWING_IN_DRAM: bool = false;
     /// Place preset serialization/deserialization callbacks in DRAM.
     /// Exclusive callees follow when packaging with --dram-callees.
     const SERIALIZATION_IN_DRAM: bool = false;
@@ -739,7 +741,11 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         }),
         parameter_changed: Some(Self::parameter_changed),
         step: Some(Self::step),
-        draw: Some(Self::draw),
+        draw: Some(if P::DRAWING_IN_DRAM {
+            Self::draw_in_dram
+        } else {
+            Self::draw
+        }),
         midi_realtime: if P::MIDI {
             Some(Self::midi_realtime)
         } else {
@@ -834,6 +840,13 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 .allocation
                 .align(),
         )
+    }
+    crate::nt_dram_section! {
+        /// # Safety
+        /// Same live algorithm pointer requirements as draw.
+        unsafe extern "C" fn draw_in_dram(base: *mut NtAlgorithm) -> bool {
+            unsafe { Self::draw(base) }
+        }
     }
     crate::nt_dram_section! {
         /// # Safety

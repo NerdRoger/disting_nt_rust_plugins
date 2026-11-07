@@ -607,6 +607,7 @@ impl Plugin for Wavesmith {
         | ENCODER_R
         | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
+    const DRAWING_IN_DRAM: bool = true;
     const MIDI: bool = true;
     const MIDI_SYSEX: bool = cfg!(feature = "profiling");
     const PARAMETER_TEXT: bool = true;
@@ -1494,7 +1495,14 @@ impl Plugin for Wavesmith {
     }
 
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {
+        #[cfg(feature = "profiling")]
+        let start = distingnt_api::api::cpu_cycle_count();
         ui::draw(context, canvas);
+        #[cfg(feature = "profiling")]
+        {
+            let cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(start);
+            context.state_mut().profiling.telemetry.record_draw(cycles);
+        }
         // The waveform editor owns the controls while this view is active.
         true
     }

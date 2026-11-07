@@ -45,6 +45,19 @@ class MonitorTests(unittest.TestCase):
             decode(data)
 
 
+    def test_draw_counters_wrap_and_use_draw_count(self):
+        def draw_packet(sequence, cycles, calls):
+            data = packet(sequence=sequence)
+            data[4] = 3
+            for value in [40000000, 0, 0, 0, 0]:
+                data.extend((value >> (7*i)) & 127 for i in range(10))
+            for value in [cycles, calls]:
+                data.extend((value >> (7*i)) & 127 for i in range(5))
+            return decode(data)
+        result = summarize([draw_packet(0, 0xfffffff0, 10), draw_packet(1, 984, 12)], "draw")
+        self.assertEqual(result["mean_draw_cycles"], 500)
+        self.assertEqual(result["draw_calls_per_second"], 2)
+
     def test_sequence_wrap_and_large_counts(self):
         first = decode(packet(sequence=0xffffffff,total_cycles=0xffffffffffffffff))
         second = decode(packet(sequence=0))

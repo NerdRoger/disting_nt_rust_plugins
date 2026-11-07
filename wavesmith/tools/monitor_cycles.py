@@ -18,16 +18,17 @@ FIELDS = ("instance", "sequence", "display_cycles", "total_cycles", "callbacks",
           "frames", "sample_rate", "block_frames", "voices", "midi", "stereo")
 WIDTHS = (5, 5, 5, 10, 5, 5, 5, 5, 1, 1, 1)
 STAGE_FIELDS = ("callback_cycles", "setup_cycles", "build_cycles", "level_cycles", "output_cycles")
-CSV_FIELDS = FIELDS + STAGE_FIELDS
+DRAW_FIELDS = ("draw_cycles_total", "draw_calls_total")
+CSV_FIELDS = FIELDS + STAGE_FIELDS + DRAW_FIELDS
 WORKLOAD = ("instance", "sample_rate", "block_frames", "voices", "midi", "stereo")
 
 
 def decode(data):
     """mido SysEx data excludes F0 and F7; ignore unrelated vendor messages."""
     data = tuple(data)
-    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2):
+    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2, 3):
         return None
-    if len(data) != (103 if data[4] == 2 else 53) or any(not 0 <= byte < 128 for byte in data):
+    if len(data) != ({1: 53, 2: 103, 3: 113}[data[4]]) or any(not 0 <= byte < 128 for byte in data):
         raise ValueError("Malformed Wavesmith telemetry")
     result, offset = {}, 5
     for field, width in zip(FIELDS, WIDTHS):
@@ -41,12 +42,16 @@ def decode(data):
             or not result["block_frames"] or result["voices"] > 10
             or result["midi"] > 1 or result["stereo"] > 1):
         raise ValueError("Invalid profiling window or workload")
-    if data[4] == 2:
+    if data[4] >= 2:
         for field in STAGE_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+10]))
             offset += 10
     if any(result.get(field, 0) > 0xFFFFFFFFFFFFFFFF for field in STAGE_FIELDS):
         raise ValueError("Stage counter overflow")
+    if data[4] == 3:
+        for field in DRAW_FIELDS:
+            result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
+            offset += 5
     result["cycles_per_callback"] = result["total_cycles"] / result["callbacks"]
     return result
 
@@ -80,6 +85,12 @@ def summarize(rows, label):
             values = [row[field]/row["callbacks"] for row in rows]
             summary["mean_"+field] = sum(row[field] for row in rows)/sum(row["callbacks"] for row in rows)
             summary["stderr_"+field] = statistics.stdev(values)/math.sqrt(len(values)) if len(values)>1 else 0.0
+    if "draw_calls_total" in rows[0] and len(rows) > 1:
+        cycles = sum((b["draw_cycles_total"]-a["draw_cycles_total"]) & 0xffffffff for a,b in zip(rows,rows[1:]))
+        calls = sum((b["draw_calls_total"]-a["draw_calls_total"]) & 0xffffffff for a,b in zip(rows,rows[1:]))
+        seconds = sum(row["frames"]/row["sample_rate"] for row in rows[1:])
+        summary.update(draw_calls=calls, mean_draw_cycles=cycles/calls if calls else None,
+                       draw_calls_per_second=calls/seconds, draw_cycles_per_second=cycles/seconds)
     return summary
 
 
@@ -188,6 +199,8 @@ def main(argv=None):
         summary["change_percent"] = 100 * (summary["mean_cycles_per_callback"] / baseline["mean_cycles_per_callback"] - 1)
         if "mean_callback_cycles" in summary and "mean_callback_cycles" in baseline:
             summary["callback_change_percent"] = 100 * (summary["mean_callback_cycles"]/baseline["mean_callback_cycles"]-1)
+        if summary.get("mean_draw_cycles") and baseline.get("mean_draw_cycles"):
+            summary["draw_change_percent"] = 100 * (summary["mean_draw_cycles"]/baseline["mean_draw_cycles"]-1)
     path.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Saved {path} and {path.with_suffix('.json')}", flush=True)
