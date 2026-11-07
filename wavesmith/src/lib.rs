@@ -1021,11 +1021,13 @@ impl Plugin for Wavesmith {
     }
 
     fn parameter_string(
-        _: &mut Callback<'_, ReadOnly>,
+        _context: &mut Callback<'_, ReadOnly>,
         parameter: i32,
         value: i32,
         buffer: &mut [c_char],
     ) -> i32 {
+        #[cfg(feature = "profiling")]
+        _context.state_mut().profiling.telemetry.record_label(0);
         if !SHAPE_TRIGGERS.iter().any(|&p| p as i32 == parameter) {
             return 0;
         }
@@ -1041,6 +1043,8 @@ impl Plugin for Wavesmith {
     }
 
     fn prefix(_context: &mut Callback<'_, ReadOnly>, parameter: i32, buffer: &mut [c_char]) -> i32 {
+        #[cfg(feature = "profiling")]
+        _context.state_mut().profiling.telemetry.record_label(1);
         let Ok(parameter) = usize::try_from(parameter) else {
             return 0;
         };

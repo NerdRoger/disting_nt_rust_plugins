@@ -21,16 +21,17 @@ STAGE_FIELDS = ("callback_cycles", "setup_cycles", "build_cycles", "level_cycles
 DRAW_FIELDS = ("draw_cycles_total", "draw_calls_total")
 UI_FIELDS = tuple(f"{kind}_{metric}" for kind in ("ui_idle", "ui_edit", "ui_setup")
                   for metric in ("cycles_total", "calls_total", "max_cycles"))
-CSV_FIELDS = FIELDS + STAGE_FIELDS + DRAW_FIELDS + UI_FIELDS
+LABEL_FIELDS = ("parameter_string_calls_total", "prefix_calls_total")
+CSV_FIELDS = FIELDS + STAGE_FIELDS + DRAW_FIELDS + UI_FIELDS + LABEL_FIELDS
 WORKLOAD = ("instance", "sample_rate", "block_frames", "voices", "midi", "stereo")
 
 
 def decode(data):
     """mido SysEx data excludes F0 and F7; ignore unrelated vendor messages."""
     data = tuple(data)
-    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2, 3, 4):
+    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2, 3, 4, 5):
         return None
-    if len(data) != ({1: 53, 2: 103, 3: 113, 4: 158}[data[4]]) or any(not 0 <= byte < 128 for byte in data):
+    if len(data) != ({1: 53, 2: 103, 3: 113, 4: 158, 5: 168}[data[4]]) or any(not 0 <= byte < 128 for byte in data):
         raise ValueError("Malformed Wavesmith telemetry")
     result, offset = {}, 5
     for field, width in zip(FIELDS, WIDTHS):
@@ -54,8 +55,12 @@ def decode(data):
         for field in DRAW_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
             offset += 5
-    if data[4] == 4:
+    if data[4] >= 4:
         for field in UI_FIELDS:
+            result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
+            offset += 5
+    if data[4] == 5:
+        for field in LABEL_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
             offset += 5
     result["cycles_per_callback"] = result["total_cycles"] / result["callbacks"]
@@ -104,6 +109,14 @@ def summarize(rows, label):
             summary[kind+"_calls"] = calls
             summary[kind+"_mean_cycles"] = cycles/calls if calls else None
             summary[kind+"_max_cycles_since_instantiation"] = max(row[kind+"_max_cycles"] for row in rows)
+    if "parameter_string_calls_total" in rows[0] and len(rows) > 1:
+        seconds = sum(row["frames"]/row["sample_rate"] for row in rows[1:])
+        for field in LABEL_FIELDS:
+            calls = sum((b[field]-a[field]) & 0xffffffff for a,b in zip(rows,rows[1:]))
+            name = field.removesuffix("_total")
+            summary[name] = calls
+            summary[name+"_per_second"] = calls/seconds
+            summary[name+"_at_first_report"] = rows[0][field]
     return summary
 
 

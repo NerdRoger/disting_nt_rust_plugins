@@ -81,6 +81,21 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(summary["ui_setup_mean_cycles"])
         self.assertEqual(summary["ui_setup_calls"], 0)
 
+    def test_label_callback_counts_and_wrap(self):
+        def labels(sequence, string_calls, prefix_calls):
+            data = packet(sequence=sequence)
+            data[4] = 5
+            data.extend([0] * 105)
+            for value in [string_calls, prefix_calls]:
+                data.extend((value >> (7*i)) & 127 for i in range(5))
+            return decode(data)
+        rows = [labels(0, 0xfffffffe, 50), labels(1, 3, 60)]
+        summary = summarize(rows, "labels")
+        self.assertEqual(summary["parameter_string_calls"], 5)
+        self.assertEqual(summary["prefix_calls"], 10)
+        self.assertEqual(summary["prefix_calls_per_second"], 10)
+        self.assertEqual(summary["prefix_calls_at_first_report"], 50)
+
     def test_sequence_wrap_and_large_counts(self):
         first = decode(packet(sequence=0xffffffff,total_cycles=0xffffffffffffffff))
         second = decode(packet(sequence=0))

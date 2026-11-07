@@ -1,7 +1,7 @@
 //! Temporary USB profiling stream, enabled only while a monitor requests it.
 use core::sync::atomic::{AtomicBool, Ordering};
 static STREAMING: AtomicBool = AtomicBool::new(false);
-pub const PACKET_LEN: usize = 159;
+pub const PACKET_LEN: usize = 169;
 
 // Non-commercial manufacturer ID 7D, Wavesmith identifier WS, protocol 1.
 // Commands include F0/F7 as supplied by the firmware's factory-wide callback.
@@ -31,6 +31,7 @@ pub struct Telemetry {
     draw_calls: u32,
     // idle handling, edits/selections/mode changes, and setup: sum/count/max.
     ui: [[u32; 3]; 3],
+    label_calls: [u32; 2],
 }
 impl Telemetry {
     pub const fn new() -> Self {
@@ -43,7 +44,11 @@ impl Telemetry {
             draw_cycles: 0,
             draw_calls: 0,
             ui: [[0; 3]; 3],
+            label_calls: [0; 2],
         }
+    }
+    pub fn record_label(&mut self, category: usize) {
+        self.label_calls[category] = self.label_calls[category].wrapping_add(1);
     }
     pub fn record_ui(&mut self, category: usize, cycles: u32) {
         let totals = &mut self.ui[category];
@@ -107,7 +112,7 @@ impl Telemetry {
             return None;
         }
         let mut packet = [0u8; PACKET_LEN];
-        packet[..6].copy_from_slice(&[0xf0, 0x7d, b'W', b'S', 1, 4]);
+        packet[..6].copy_from_slice(&[0xf0, 0x7d, b'W', b'S', 1, 5]);
         // 6..11 is filled with the instance index by the callback after releasing
         // all borrowed state. All numeric fields are little-endian base 128.
         encode(self.sequence as u64, &mut packet[11..16]);
@@ -132,6 +137,9 @@ impl Telemetry {
         {
             encode(*total as u64, bytes);
         }
+        for (bytes, calls) in packet[159..169].chunks_exact_mut(5).zip(self.label_calls) {
+            encode(calls as u64, bytes);
+        }
         self.sequence = self.sequence.wrapping_add(1);
         // Whole callbacks are included; their actual frame count is transmitted.
         self.frames = 0;
@@ -149,6 +157,9 @@ mod tests {
     fn telemetry_uses_audio_time_encodes_exact_counts_and_resets_when_stopped() {
         let mut meter = Telemetry::new();
         meter.record_draw(456);
+        meter.record_label(0);
+        meter.record_label(1);
+        meter.record_label(1);
         meter.record_ui(0, 100);
         meter.record_ui(1, 200);
         meter.record_ui(1, 300);
@@ -187,7 +198,7 @@ mod tests {
                 .enumerate()
                 .fold(0u64, |value, (i, &b)| value | ((b as u64) << (7 * i)))
         };
-        assert_eq!(&packet[..6], &[0xf0, 0x7d, b'W', b'S', 1, 4]);
+        assert_eq!(&packet[..6], &[0xf0, 0x7d, b'W', b'S', 1, 5]);
         assert!(packet[1..].iter().all(|&b| b < 128));
         assert_eq!(decode(&packet[16..21]), 999);
         assert_eq!(decode(&packet[21..31]), 2_000_000);
@@ -198,6 +209,8 @@ mod tests {
         assert_eq!(&packet[51..54], &[15, 0, 1]);
         assert_eq!(decode(&packet[104..109]), 456);
         assert_eq!(decode(&packet[109..114]), 1);
+        assert_eq!(decode(&packet[159..164]), 1);
+        assert_eq!(decode(&packet[164..169]), 2);
         for (bytes, expected) in packet[114..159]
             .chunks_exact(5)
             .zip([100, 1, 100, 500, 2, 300, 50, 1, 50])
