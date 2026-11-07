@@ -236,6 +236,64 @@ fn editor_parameter(n: usize, segment: usize, field: usize) -> Option<usize> {
     }
 }
 
+// Only entered for a confirmed rising reshape trigger. Keep normal parameter
+// notifications in ITC while publishing the complete action from DRAM.
+distingnt_api::nt_dram_section! {
+    fn apply_reshape(context: &mut Callback<'_, Audio>, trigger: usize) {
+        let n = context.state().count;
+        let triggers = SHAPE_TRIGGERS;
+        if trigger >= 4 {
+            let shape = match trigger {
+                4 => dsp::BoundaryShape::Sine,
+                5 => dsp::BoundaryShape::Triangle,
+                6 => dsp::BoundaryShape::Square,
+                _ => dsp::BoundaryShape::Sawtooth,
+            };
+            let _ = context
+                .parameters()
+                .set(WAVEFORM_START, dsp::preset_boundary(shape, 0, n));
+            for boundary in 1..n {
+                let _ = context.parameters().set(
+                    boundary_parameter(boundary),
+                    dsp::preset_boundary(shape, boundary, n),
+                );
+            }
+            for segment in 0..n {
+                let _ = context.parameters().set(curve_parameter(segment), 0);
+            }
+            let _ = context.parameters().set(triggers[trigger], 0);
+            context.state_mut().trigger_high[trigger] = false;
+            return;
+        }
+        // Publish real host parameters so the editor, modulation and presets
+        // all see the randomized shape. Release the state borrow before setters.
+        let mut seed = context.state().random_seed;
+        if trigger == 0 || trigger == 1 {
+            let _ = context
+                .parameters()
+                .set(WAVEFORM_START, random_level(&mut seed));
+            for boundary in 1..n {
+                let _ = context
+                    .parameters()
+                    .set(boundary_parameter(boundary), random_level(&mut seed));
+            }
+        }
+        if trigger == 0 || trigger == 2 || trigger == 3 {
+            for segment in 0..n {
+                let value = if trigger == 3 {
+                    0
+                } else {
+                    random_level(&mut seed)
+                };
+                let _ = context.parameters().set(curve_parameter(segment), value);
+            }
+        }
+        context.state_mut().random_seed = seed;
+        let _ = context.parameters().set(triggers[trigger], 0);
+        context.state_mut().trigger_high[trigger] = false;
+    }
+}
+
 fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
     let mut wave = dsp::Wave::new(n);
     wave.boundaries[0] = value(WAVEFORM_START).unwrap_or(0).clamp(-100, 100);
@@ -912,7 +970,6 @@ impl Plugin for Wavesmith {
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         sync_segment_graying(context);
-        let n = context.state().count;
         if parameter == MIDI_ATTACK as i32 || parameter == MIDI_RELEASE as i32 {
             let p = context.read_parameters();
             let attack = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
@@ -960,55 +1017,7 @@ impl Plugin for Wavesmith {
         if !rising {
             return;
         }
-        if trigger >= 4 {
-            let shape = match trigger {
-                4 => dsp::BoundaryShape::Sine,
-                5 => dsp::BoundaryShape::Triangle,
-                6 => dsp::BoundaryShape::Square,
-                _ => dsp::BoundaryShape::Sawtooth,
-            };
-            let _ = context
-                .parameters()
-                .set(WAVEFORM_START, dsp::preset_boundary(shape, 0, n));
-            for boundary in 1..n {
-                let _ = context.parameters().set(
-                    boundary_parameter(boundary),
-                    dsp::preset_boundary(shape, boundary, n),
-                );
-            }
-            for segment in 0..n {
-                let _ = context.parameters().set(curve_parameter(segment), 0);
-            }
-            let _ = context.parameters().set(triggers[trigger], 0);
-            context.state_mut().trigger_high[trigger] = false;
-            return;
-        }
-        // Publish real host parameters so the editor, modulation and presets
-        // all see the randomized shape. Release the state borrow before setters.
-        let mut seed = context.state().random_seed;
-        if trigger == 0 || trigger == 1 {
-            let _ = context
-                .parameters()
-                .set(WAVEFORM_START, random_level(&mut seed));
-            for boundary in 1..n {
-                let _ = context
-                    .parameters()
-                    .set(boundary_parameter(boundary), random_level(&mut seed));
-            }
-        }
-        if trigger == 0 || trigger == 2 || trigger == 3 {
-            for segment in 0..n {
-                let value = if trigger == 3 {
-                    0
-                } else {
-                    random_level(&mut seed)
-                };
-                let _ = context.parameters().set(curve_parameter(segment), value);
-            }
-        }
-        context.state_mut().random_seed = seed;
-        let _ = context.parameters().set(triggers[trigger], 0);
-        context.state_mut().trigger_high[trigger] = false;
+        apply_reshape(context, trigger);
     }
 
     fn parameter_string(
