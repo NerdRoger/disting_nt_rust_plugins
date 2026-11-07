@@ -539,6 +539,36 @@ Both outputs continue to share the same oscillator bank and linked level
 controller. Stereo uses independent configured-voice pans; the waveform/FFT
 storage is shared rather than duplicated per channel or per voice.
 
+### Code placement and shared implementations
+
+Drawing uses the framework's opt-in `DRAWING_IN_DRAM` policy. The draw callback
+and its exclusive transitive callees are placed in DRAM by `--dram-callees`;
+helpers also needed by audio stay in ITC, and firmware drawing functions retain
+the firmware's placement.
+
+The custom UI entry remains in ITC. Its small idle gate uses the firmware's pot
+change flags, button states (including held buttons and releases), encoder
+deltas, and the first-callback initialization state. Unflagged pot positions
+still refresh pickup history. Active editing runs in the explicitly placed DRAM
+handler. Parameter-change trigger detection also stays in ITC; confirmed Reshape
+actions and their exclusive shape-generation helper run in DRAM. These actions
+publish host parameters synchronously. Audio table rebuilding remains incremental
+in the inactive bank, followed by the existing edit crossfade; DRAM placement
+is not background scheduling.
+
+Voice-enabled/group readers use concrete, non-inlined shared functions instead
+of separate generic reader instantiations. Mono and stereo level control also
+share one non-inlined implementation with a runtime channel-mode argument;
+separate internal sample loops avoid a mode test on every sample. These shared
+functions remain in ITC. Parameter-string and voice-prefix callbacks also remain
+in ITC. No parameter ordinals, ranges, defaults, or intended sound behavior change.
+
+The measured normal build uses 20,016 bytes of ITC code and 9,368 bytes of DRAM
+code, compared with 26,264 and 3,884 before this placement/refactoring round.
+These are executable section sizes, not instance RAM requirements; compiler or
+source changes can alter them. Decisions and measurements are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).
+
 ### Optional profiling build
 
 Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer
@@ -567,8 +597,7 @@ cp plugins/wavesmith-profile.o plugins/wavesmith.o
 
 Then deploy `wavesmith.o` using the supplied push script and the `scratch`
 preset. Restore the production artifact afterwards with
-`make -B plugins/wavesmith.o` and deploy that file again. The Python monitor is
-unchanged; it requires the instrumented build.
+`make -B plugins/wavesmith.o` and deploy that file again. The Python monitor requires the instrumented build.
 
 In a profiling build, a temporary overlay draws over the existing help footer. `Render cyc:`
 shows the average CPU cycles spent rendering and mixing all voices per audio
@@ -619,7 +648,30 @@ instrumentation and normal processing but excludes the ABI wrapper and USB send.
 The original render measurement and displayed footer average are unchanged.
 Use `mean_callback_cycles` and `callback_change_percent` for whole-body
 comparisons; moving work between stages must not count as a CPU improvement.
-The monitor also decodes the original report type 1.
+Current builds send report type 5. Types 3 through 5 extend the preceding
+layout with cumulative 32-bit counters encoded in five base-128 bytes each:
+
+| Report type | Appended fields |
+|---|---|
+| 3 | Draw-cycle sum and draw-call count. |
+| 4 | Cycle sum, call count, and lifetime maximum cycles for each of idle/non-edit UI handling, actual editing/selection/mode changes, and UI setup. |
+| 5 | Parameter-string and voice-prefix callback counts. |
+
+The monitor accepts report types 1–5. It calculates draw/UI means using their
+own call counts and wrapping differences between reports, rather than the audio
+callback count. UI maxima are since instance creation, not just the capture
+window. Non-edit UI calls can include flagged pot movement that does not change
+a parameter; use an untouched-control capture to isolate the ITC idle gate.
+Label summaries include calls per second and the cumulative total at the first
+retained report. They count callback invocations, not execution cycles.
+
+Draw and UI timings cover plugin callback bodies and can include audio interrupt
+service time. Whole-audio timing excludes the ABI wrapper and telemetry send.
+Keep the same screen visible across comparisons, and separate stationary-screen
+captures from manual navigation. Label callbacks can run repeatedly while a
+firmware menu is visible, even when controls are untouched; they were not called
+in the custom waveform-editor capture. The diagnostic voice count supports all
+24 voices. None of these counters or SysEx extensions exist in normal builds.
 
 Oscillator pitch/level targets are prepared once per audio callback, before
 internal chunk rendering. Pitch smoothing uses the integer recurrence described

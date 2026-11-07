@@ -1061,3 +1061,92 @@ script disabled streaming and closed its MIDI ports. Main's implementation is
 unchanged; only these performance notes are pending. No commits were made.
 CSV/JSON measurements and the stage comparison script are retained under ignored
 target/wavesmith-dtc-bench with the warp-* prefix.
+
+
+## ITC code placement and sharing — 2026-11-07
+
+This round followed the MIDI Attack/Release update. The user guide's controls,
+parameters, defaults, and intended audio behavior remain unchanged. Section sizes
+below are measured normal, non-profiling builds from the same toolchain; CPU
+measurements use optimized profiling builds. Historical figures earlier in this
+file describe their respective builds, not the current artifact.
+
+| Accepted change | ITC bytes after change | ITC bytes saved by change |
+|---|---:|---:|
+| Starting build | 26,264 | — |
+| Drawing and exclusive callees in DRAM (`fcc359c`) | 23,342 | 2,922 |
+| ITC idle UI gate / DRAM active editor (`1e607b8`) | 21,858 | 1,484 |
+| Shared voice-routing readers (`17bd192`) | 21,426 | 432 |
+| Shared mono/stereo level controller (`f51e0ff`) | 21,042 | 384 |
+| DRAM Reshape action bodies (`b295c18`) | 20,016 | 1,026 |
+
+Cumulative ITC saving: 6,248 bytes (23.8%). DRAM executable code increased from
+3,884 to 9,368 bytes; read-only data remained 1,799 bytes. Total executable code
+therefore decreased by 764 bytes. Relocation trades ITC capacity for DRAM code
+space; it does not move the waveform buffers or reserve additional DTC memory.
+
+### Drawing and control handling
+
+Three approximately 100-second captures with warp modulation compared drawing
+in ITC, DRAM, and ITC again. Mean cycles/redraw were 1,162,099, 1,170,128, and
+1,168,223 respectively, at about 30.3 redraws/second. DRAM was 0.43% above the
+pooled ITC mean. The preset was MIDI-enabled with no sounding voices, so these
+results do not benchmark loaded polyphonic playback. Draw timing includes audio
+interrupt elapsed time.
+
+Moving the entire control handler into DRAM increased idle cost, so that version
+was replaced with the split entry/editor arrangement. With controls untouched,
+mean callback-body cost fell from 607 to 35 cycles. In separate manual editing
+captures, original ITC, full-DRAM, and split handlers averaged 12,351, 12,512, and
+14,120 cycles per actual edit. Those captures used different interaction mixes
+and cannot establish the cost of identical edits. Existing pickup, held/released
+button, initialization, and post-reset hold behavior passed regression tests.
+
+### Shared level controller
+
+Four approximately 100-second captures compared the original specialized
+controller and shared implementation with 15 CV voices at 48 kHz / 24 frames.
+Stereo used different per-voice pans; mono retained the other preset settings.
+
+| Mean cycles per audio callback | Specialized | Shared | Change |
+|---|---:|---:|---:|
+| Mono level stage | 2,536 | 2,670 | +5.3% |
+| Stereo level stage | 3,307 | 3,373 | +2.0% |
+| Mono whole callback | 48,796 | 48,880 | +0.17% |
+| Stereo whole callback | 50,681 | 50,756 | +0.15% |
+
+The level stage adds about 135 mono or 66 stereo cycles per audio callback,
+roughly 0.28% or 0.13% of the original full callback cost. Measured whole-callback
+differences are smaller than the variation in CV/playback work. These are
+relative cycle changes, not percentage points on the module's total CPU meter.
+Output/state comparisons against the original test reference passed. The user
+accepted this cost for the 384-byte ITC saving. Shared routing readers also passed
+regression tests; the user observed no visible CPU difference, and no precise
+cycle comparison was made for that refactoring. Reshape relocation passed all
+145 normal and 148 profiling tests; its action latency was not benchmarked.
+
+### Rejected sharing and retained diagnostics
+
+A shared waveform-parameter reader was rebuilt after drawing moved to DRAM.
+It reduced total executable code by 188 bytes but increased ITC by 116 bytes
+(21,042 to 21,158), while reducing DRAM code by 304 bytes. It was rejected and
+reverted. The earlier offline estimate assumed both duplicated readers were in
+ITC and no longer applied. Tests passed; audio setup was about 0.13% higher,
+whole-callback timing 0.37% higher within observed variation, and drawing 2.14%
+lower in the two captures. Those averages did not justify the ITC increase.
+
+Profiling-only label callback counters were retained in `a340a11`; the callbacks
+were not relocated. Stationary captures of about 30 seconds measured:
+
+| Visible screen | Parameter-string calls/second | Voice-prefix calls/second |
+|---|---:|---:|
+| Custom waveform editor | 0 | 0 |
+| Reshape parameter page | 243 | 0 |
+| Voice parameter-mapping menu | 0 | 30 |
+
+These were call counts, not timing measurements. Both callbacks can run
+repeatedly while their text is displayed. The user chose to keep them in ITC.
+Normal builds exclude these counters and all profiling telemetry. The raw
+artifacts, patches, disassemblies, CSVs, and JSON summaries for this round live
+in ignored `target/wavesmith-*-bench` and experiment directories; the tables here
+retain the decisions independently of those local artifacts.
