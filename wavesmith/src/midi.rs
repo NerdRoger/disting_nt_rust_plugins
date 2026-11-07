@@ -1,7 +1,9 @@
-//! Fixed-size MIDI allocator and short click-suppression gates. No audio buffers.
+//! Fixed-size MIDI allocator with attack/release envelopes and short stealing fades.
 #![forbid(unsafe_code)]
 pub const GROUP_COUNT: usize = 10;
 pub const NO_GROUP: u8 = GROUP_COUNT as u8;
+pub const ATTACK_DEFAULT: i16 = 5;
+pub const RELEASE_DEFAULT: i16 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateState {
@@ -21,6 +23,8 @@ pub struct NoteGroup {
     switching: bool,
     retune: bool,
     gain: f32,
+    release_step: f32,
+    release_remaining: u32,
 }
 
 impl NoteGroup {
@@ -35,6 +39,8 @@ impl NoteGroup {
             switching: false,
             retune: false,
             gain: 0.0,
+            release_step: 0.0,
+            release_remaining: 0,
         }
     }
     pub fn sounding(&self) -> bool {
@@ -61,11 +67,17 @@ impl NoteGroup {
             GateState::Silent
         }
     }
-    pub fn next_gain(&mut self, step: f32) -> f32 {
-        self.gain = if self.held && !self.switching {
-            (self.gain + step).min(1.0)
+    pub fn next_gain(&mut self, attack_step: f32, steal_step: f32) -> f32 {
+        self.gain = if self.switching {
+            (self.gain - steal_step).max(0.0)
+        } else if self.held {
+            (self.gain + attack_step).min(1.0)
+        } else if self.release_remaining > 1 {
+            self.release_remaining -= 1;
+            (self.gain - self.release_step).max(0.0)
         } else {
-            (self.gain - step).max(0.0)
+            self.release_remaining = 0;
+            0.0
         };
         self.gain
     }
@@ -75,6 +87,11 @@ impl NoteGroup {
 pub struct MidiState {
     pub groups: [NoteGroup; GROUP_COUNT],
     pub gate_step: f32,
+    pub attack_step: f32,
+    samples_per_ms: f32,
+    attack_ms: i16,
+    release_ms: i16,
+    release_frames: u32,
     // Cached octave offsets per MIDI channel; center is zero. Retain bend
     // before Note On and while the output is disabled, without retuning CV.
     pub pitch_bends: [f32; 16],
@@ -86,8 +103,25 @@ impl MidiState {
         Self {
             groups: [NoteGroup::new(); GROUP_COUNT],
             gate_step: 1.0 / (sample_rate / 200).max(1) as f32,
+            attack_step: 1.0 / (sample_rate / 200).max(1) as f32,
+            samples_per_ms: sample_rate as f32 * 0.001,
+            attack_ms: ATTACK_DEFAULT,
+            release_ms: RELEASE_DEFAULT,
+            release_frames: (sample_rate as u64 * RELEASE_DEFAULT as u64 / 1000).max(1) as u32,
             channel_setting: 0,
             pitch_bends: [0.0; 16],
+        }
+    }
+    pub fn set_envelope(&mut self, attack_ms: i16, release_ms: i16) {
+        let attack_ms = attack_ms.clamp(1, 500);
+        let release_ms = release_ms.clamp(1, 1000);
+        if attack_ms != self.attack_ms {
+            self.attack_ms = attack_ms;
+            self.attack_step = 1.0 / (self.samples_per_ms * attack_ms as f32).max(1.0);
+        }
+        if release_ms != self.release_ms {
+            self.release_ms = release_ms;
+            self.release_frames = (self.samples_per_ms * release_ms as f32 + 0.5).max(1.0) as u32;
         }
     }
     pub fn set_channel(&mut self, setting: u8) -> bool {
@@ -132,6 +166,8 @@ impl MidiState {
         for (i, group) in self.groups.iter_mut().enumerate() {
             if i == index {
                 group.held = false;
+                group.release_remaining = self.release_frames;
+                group.release_step = group.gain / self.release_frames as f32;
             } else if group.held && group.order > order {
                 group.order -= 1;
             }

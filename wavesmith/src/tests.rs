@@ -234,7 +234,14 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             assert_eq!(CStr::from_ptr(oscillator.name), c"Oscillator");
             assert_eq!(
                 core::slice::from_raw_parts(oscillator.params, oscillator.num_params as usize),
-                &[MIDI_CHANNEL as u8, PITCH as u8, FINE as u8, LEVEL as u8]
+                &[
+                    MIDI_CHANNEL as u8,
+                    PITCH as u8,
+                    FINE as u8,
+                    LEVEL as u8,
+                    MIDI_ATTACK as u8,
+                    MIDI_RELEASE as u8
+                ]
             );
             for (index, page_name, expected_names) in [
                 (
@@ -742,14 +749,14 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                 }
                 assert_eq!(
                     next_ordinal,
-                    GLOBALS + MAX_VOICES * VOICE_PARAMETERS + n as usize * 2
+                    GLOBALS + 2 + MAX_VOICES * VOICE_PARAMETERS + n as usize * 2
                 );
                 for (p, references) in seen.into_iter().enumerate() {
                     assert_eq!(
                         references,
                         if p == WAVEFORM_START {
                             2
-                        } else if (WAVEFORM_START..VOICE_START).contains(&p)
+                        } else if (WAVEFORM_START..MIDI_ATTACK).contains(&p)
                             && (p - WAVEFORM_START) / 2 >= n as usize
                         {
                             0
@@ -881,6 +888,7 @@ fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
     const FRAMES: usize = 24;
     for voices in 1..=MAX_VOICES {
         let mut instance = Instance::with_voices(8, voices as i32);
+        instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
         instance.change(OUTPUT_MODE, 1);
         instance.change(MIDI_CHANNEL, 2);
         instance.change(PITCH, 0);
@@ -924,7 +932,7 @@ fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
             instance.midi(0x90, 60 + voice as u8, 0);
         }
         instance.midi(0x90, 84, 0);
-        for _ in 0..30 {
+        for _ in 0..60 {
             instance.render(&mut samples);
         }
         let before = dsp::oscillator_tick_count();
@@ -1782,6 +1790,7 @@ unsafe extern "C" fn NT_drawShapeF(kind: u8, x0: f32, y0: f32, x1: f32, y1: f32,
 fn shared_midi_output_normalizes_independent_notes_with_the_existing_gate_fades() {
     for voices in [1, 4, 8] {
         let mut mixed = Instance::with_voices(8, voices);
+        mixed.change(MIDI_RELEASE, 25);
         mixed.change(OUTPUT_MODE, 1);
         mixed.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
@@ -1792,6 +1801,7 @@ fn shared_midi_output_normalizes_independent_notes_with_the_existing_gate_fades(
         let mut references: Vec<_> = (0..voices)
             .map(|voice| {
                 let mut mono = Instance::new(8);
+                mono.change(MIDI_RELEASE, 25);
                 mono.change(OUTPUT_MODE, 1);
                 mono.change(MIDI_CHANNEL, 1);
                 mono.midi(0x90, 60 + voice as u8, 100);
@@ -1829,7 +1839,7 @@ fn shared_midi_output_normalizes_independent_notes_with_the_existing_gate_fades(
                 reference_gate = if block < 120 {
                     (reference_gate + 1.0 / 240.0).min(1.0)
                 } else {
-                    (reference_gate - 1.0 / 240.0).max(0.0)
+                    (reference_gate - 1.0 / 1200.0).max(0.0)
                 };
                 *weight = voices as f32 * reference_gate * reference_gate;
             }
@@ -1967,7 +1977,7 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
         let original = instance.values.clone();
         let mut samples = [0.0; LAST_BUS * 24];
         instance.render(&mut samples);
-        let mut expected = std::vec![(PITCH, false)];
+        let mut expected = std::vec![(PITCH, false), (MIDI_ATTACK, true), (MIDI_RELEASE, true)];
         for voice in 0..voices as usize {
             expected.push((voice_pitch_parameter(voice), false));
             expected.push((voice_midi_group_parameter(voice), true));
@@ -2006,13 +2016,11 @@ fn restored_midi_mode_grays_controls_on_first_audio_callback() {
     instance.render(&mut [0.0; LAST_BUS * 24]);
     GRAY_CALLS.with(|calls| {
         let calls = calls.borrow();
-        assert_eq!(calls.len(), 1 + 10 * 3);
-        assert!(
-            calls
-                .iter()
-                .all(|&(p, gray)| gray
-                    == !(0..MAX_VOICES).any(|v| p == voice_midi_group_parameter(v)))
-        );
+        assert_eq!(calls.len(), 3 + 10 * 3);
+        assert!(calls.iter().all(|&(p, gray)| gray
+            == !(p == MIDI_ATTACK
+                || p == MIDI_RELEASE
+                || (0..MAX_VOICES).any(|v| p == voice_midi_group_parameter(v)))));
         assert!(!calls.iter().any(|&(p, _)| p == FINE || p == LEVEL));
     });
 }
@@ -2890,7 +2898,7 @@ fn grouped_layout_has_none_and_ten_individual_defaults_then_none() {
         let instance = Instance::configured(segments, MAX_VOICES as i32);
         let config = Wavesmith::configuration(&[MAX_VOICES as i32, segments]).unwrap();
         assert_eq!(config.pages, 29);
-        assert_eq!(config.parameters, 203);
+        assert_eq!(config.parameters, 205);
         assert!(config.parameters <= 256 && config.pages <= 31);
         for voice in 0..MAX_VOICES {
             let group = voice_midi_group_parameter(voice);
@@ -2912,6 +2920,7 @@ fn grouped_layout_has_none_and_ten_individual_defaults_then_none() {
 #[test]
 fn unequal_groups_skip_empty_slots_and_share_notes_bend_and_release() {
     let mut instance = Instance::with_voices(8, 7);
+    instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     instance.change(RIGHT_OUTPUT, 14);
@@ -2966,7 +2975,7 @@ fn unequal_groups_skip_empty_slots_and_share_notes_bend_and_release() {
     instance.render(&mut samples);
     assert_eq!(dsp::oscillator_tick_count() - before, 2 * 24);
     instance.midi(0x80, 76, 0);
-    for _ in 0..50 {
+    for _ in 0..51 {
         instance.render(&mut samples);
     }
     assert!(samples[12 * 24..14 * 24].iter().all(|&v| v == 0.0));
@@ -2975,6 +2984,7 @@ fn unequal_groups_skip_empty_slots_and_share_notes_bend_and_release() {
 #[test]
 fn shared_group_gates_advance_once_even_with_five_and_two_members() {
     let mut instance = Instance::with_voices(8, 7);
+    instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     for voice in 0..7 {
@@ -2987,9 +2997,10 @@ fn shared_group_gates_advance_once_even_with_five_and_two_members() {
     enabled[0] = true;
     enabled[3] = true;
     let mut expected = midi::MidiState::new(48000);
+    expected.set_envelope(5, 25);
     expected.set_channel(1);
     let mut samples = [0.0; LAST_BUS * 24];
-    for block in 0..110 {
+    for block in 0..125 {
         let event = match block {
             0 => Some((0x90, 60, 100)),
             1 => Some((0x90, 64, 100)),
@@ -3010,7 +3021,7 @@ fn shared_group_gates_advance_once_even_with_five_and_two_members() {
         let mut expected_ticks = 0;
         for _ in 0..24 {
             for (index, group) in expected.groups.iter_mut().enumerate() {
-                if group.next_gain(expected.gate_step) > 0.0 {
+                if group.next_gain(expected.attack_step, expected.gate_step) > 0.0 {
                     expected_ticks += if index == 0 {
                         5
                     } else if index == 3 {
@@ -3037,6 +3048,7 @@ fn shared_group_gates_advance_once_even_with_five_and_two_members() {
 #[test]
 fn live_group_reassignment_and_none_changes_leave_other_members_playing() {
     let mut instance = Instance::with_voices(8, 3);
+    instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     instance.change(voice_midi_group_parameter(2), 1);
@@ -3197,7 +3209,7 @@ fn voices_specification_creates_only_requested_parameters_pages_and_processing_s
         let config = Wavesmith::configuration(&[voices as i32, 8]).unwrap();
         assert_eq!(
             (config.parameters, config.pages),
-            (83 + voices * 5, 5 + voices)
+            (85 + voices * 5, 5 + voices)
         );
         assert_eq!(instance.values.len(), config.parameters);
         assert_eq!(Wavesmith::SPECIFICATIONS[1].name, c"Segments");
@@ -3265,10 +3277,10 @@ fn segment_specification_hides_unused_rows_but_keeps_them_allocated_and_grayed()
         for voices in [1, 3, 24] {
             let mut instance = Instance::configured(segments, voices);
             let config = Wavesmith::configuration(&[voices, segments]).unwrap();
-            assert_eq!(config.parameters, 83 + voices as usize * 5);
+            assert_eq!(config.parameters, 85 + voices as usize * 5);
             assert_eq!(
                 config.page_indices,
-                GLOBALS + voices as usize * 5 + segments as usize * 2 + 1
+                GLOBALS + 2 + voices as usize * 5 + segments as usize * 2 + 1
             );
             let pages = unsafe { &*(*instance.base).parameter_pages };
             let waveform = unsafe { &*(*pages).pages.add(voices as usize + 4) };
@@ -3500,6 +3512,7 @@ fn factory_defaults_allocate_ten_notes_and_later_voices_join_only_when_assigned(
 #[test]
 fn midi_tuning_setup_only_runs_for_sounding_voices_including_release_tails() {
     let mut instance = Instance::configured(8, 24);
+    instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
     instance.change(MIDI_CHANNEL, 1);
     let mut samples = [0.0; LAST_BUS * 24];
     for _ in 0..200 {
@@ -3628,5 +3641,144 @@ fn reshape_confirmation_labels_are_non_mutating_and_actions_reset_after_completi
         let after = instance.values.clone();
         instance.change(trigger, 0);
         assert_eq!(instance.values, after);
+    }
+}
+
+#[test]
+fn envelope_metadata_is_midi_only_and_cv_audio_is_unchanged() {
+    let mut a = Instance::new(8);
+    let mut b = Instance::new(8);
+    for (parameter, maximum, default) in [(MIDI_ATTACK, 500, 5), (MIDI_RELEASE, 1000, 500)] {
+        let d = unsafe { &*(*a.base).parameters.add(parameter) };
+        assert_eq!(
+            (d.min, d.max, d.default, d.unit),
+            (1, maximum, default, UNIT_MS)
+        );
+    }
+    a.change(MIDI_ATTACK, 500);
+    a.change(MIDI_RELEASE, 1000);
+    let mut x = [0.0; LAST_BUS * 24];
+    let mut y = x;
+    for _ in 0..300 {
+        x.fill(0.0);
+        y.fill(0.0);
+        a.render(&mut x);
+        b.render(&mut y);
+        assert_eq!(x, y);
+    }
+}
+
+#[test]
+fn restored_envelope_values_apply_before_the_first_midi_note_and_release_tail_stops() {
+    let mut instance = Instance::new(8);
+    instance.values[MIDI_CHANNEL] = 1;
+    instance.values[MIDI_ATTACK] = 500;
+    instance.values[MIDI_RELEASE] = 1000;
+    instance.change(OUTPUT_MODE, 1);
+    instance.midi(0x90, 60, 100);
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..1100 {
+        instance.render(&mut samples);
+    }
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    assert_eq!(
+        context.state().midi.groups[0].gate_state(),
+        midi::GateState::Steady
+    );
+    instance.midi(0x80, 60, 0);
+    for _ in 0..1900 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert!(dsp::oscillator_tick_count() > before);
+    for _ in 0..105 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count(), before);
+    assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
+}
+
+#[test]
+fn midi_single_note_release_is_audible_and_is_not_undone_by_level_control() {
+    let mut instance = Instance::new(8);
+    instance.change(MIDI_RELEASE, 25); // Explicit timing fixture, independent of defaults.
+    instance.change(MIDI_CHANNEL, 1);
+    instance.change(OUTPUT_MODE, 1);
+    for i in 0..8 {
+        instance.change(boundary_parameter(i), 80);
+    }
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..300 {
+        instance.render(&mut samples);
+    }
+    instance.midi(0x90, 60, 100);
+    for _ in 0..100 {
+        instance.render(&mut samples);
+    }
+    let full = samples[13 * 24 - 1];
+    assert!(full > 1.0);
+    instance.midi(0x80, 60, 0);
+    instance.render(&mut samples);
+    assert!((samples[12 * 24] - full).abs() < full * 0.002);
+    for _ in 1..25 {
+        instance.render(&mut samples);
+    }
+    assert!((samples[13 * 24 - 1] / full - 0.5).abs() < 0.002);
+    for _ in 0..26 {
+        instance.render(&mut samples);
+    }
+    assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
+}
+
+#[test]
+fn midi_attacks_and_long_releases_use_batched_playback_for_all_group_members() {
+    for voices in [1, 7] {
+        let mut instance = Instance::with_voices(8, voices);
+        for voice in 0..voices as usize {
+            instance.change(voice_midi_group_parameter(voice), 1);
+        }
+        instance.change(OUTPUT_MODE, 1);
+        instance.change(RIGHT_OUTPUT, 14);
+        instance.change(MIDI_ATTACK, 500);
+        instance.change(MIDI_RELEASE, 1000);
+        instance.change(MIDI_CHANNEL, 1);
+        let mut samples = [0.0; LAST_BUS * 24];
+        for _ in 0..300 {
+            instance.render(&mut samples);
+        }
+        instance.midi(0x90, 60, 100);
+        // Let oscillator tuning and output-level slews settle during the slow attack.
+        for _ in 0..100 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::playback_work_counts();
+        instance.render(&mut samples);
+        assert_eq!(
+            dsp::playback_work_counts().0 - before.0,
+            voices as usize * 24
+        );
+        assert_eq!(dsp::playback_work_counts().1, before.1);
+        for _ in 0..1000 {
+            instance.render(&mut samples);
+        }
+        instance.midi(0x80, 60, 0);
+        let before = dsp::playback_work_counts();
+        instance.render(&mut samples);
+        assert_eq!(
+            dsp::playback_work_counts().0 - before.0,
+            voices as usize * 24
+        );
+        assert_eq!(dsp::playback_work_counts().1, before.1);
+        assert!(samples[12 * 24..14 * 24].iter().any(|&v| v != 0.0));
+        for _ in 0..2005 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        assert!(samples[12 * 24..14 * 24].iter().all(|&v| v == 0.0));
     }
 }

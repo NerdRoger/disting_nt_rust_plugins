@@ -282,9 +282,15 @@ and all release tails finish when no keys remain held.
 Note On uses an idle group first, then a releasing group, then steals the oldest
 held group's note. Repeated Note On for an already-held key retriggers that group.
 Note Off and velocity-zero Note On release the matching channel/note; a stale
-release cannot stop a replacement note. All members share the same approximately
-5 ms gate ramp, advanced once per audio frame regardless of group size. A stolen
-group fades out before every member retunes to the replacement note.
+release cannot stop a replacement note. All members share the same
+MIDI Attack/Release envelope, advanced once per audio frame regardless of group
+size. Attack is 1–500 ms (default 5); Release is 1–1,000 ms (default 500). A stolen
+group keeps the separate approximately 5 ms fade before every member retunes,
+then the new note uses Attack. A release captures the current group gain and
+selected duration at Note Off. It uses a cached slope and remaining-frame counter
+to reach zero without a discontinuity, including Note Off during attack. Timing
+conversions are cached when values change. CV startup and membership fades remain
+independent of the musical envelope, and CV output is unchanged.
 Pitch bend uses the full 14-bit MIDI value with a fixed +/-2-semitone range.
 Bend is tracked independently per MIDI channel, affects held/releasing and new
 notes, and is reset when MIDI Channel changes. It combines with both fine-tune
@@ -490,9 +496,14 @@ parameter ordinals changed once. Earlier instances, presets and mappings are
 not migrated automatically. Removing Active also changes the per-voice stride
 from six parameters to five; add a fresh instance when testing this build.
 
-There are 19 shared controls, then 64 fixed waveform controls, followed by five
-parameters per configured voice. Waveform ordinals start at 19; voices start at
-83. Totals are 83 + 5 * Voices (88..203 parameters), independent of Segments.
+There are 19 original shared controls, then 64 fixed waveform controls, followed
+by two fixed MIDI envelope controls (Attack at 83, Release at 84), then five
+parameters per configured voice. Waveform ordinals still start at 19; voices now
+start at 85. Totals are 85 + 5 * Voices (90..205 parameters), independent of
+Segments. Attack/Release appear on Oscillator after Level; their fixed allocation
+before the variable voice block keeps their identities stable on respecification.
+Upgrading from the earlier voice block at 83 requires a fresh instance; saved
+voice values and mappings are not automatically migrated.
 Changing either specification preserves all shared/waveform ordinals and all
 surviving voice ordinals. Removed voice settings are discarded by the host;
 appended voices receive their defaults. Inactive waveform settings remain
@@ -630,3 +641,29 @@ While Level is settled, block rendering calculates the volts-per-sample gain
 Level transitions retain the general renderer. Regrouping can change final
 floating-point rounding; numerical tests bound the difference and keep pitch,
 phase and oscillator-state comparisons exact. No persistent state is added.
+
+
+## MIDI envelope playback optimization
+
+Shared MIDI group envelopes are computed once per audio frame. When the voice's
+membership gain and oscillator level are settled and no waveform edit crossfade
+is active, attacks and releases now use the same bound-table rendering loop as
+sustained notes. A second lightweight pass applies the group's envelope to the
+cleared per-voice buffer and accumulates the same squared gate energy for RMS
+normalization. Rendering stops before the first zero gate, preserving phase and
+pitch state when a tail finishes or a stolen note reaches silence. Changing
+level, membership and waveform edit fades retain the existing scalar fallback.
+No waveform tables, buffers, memory requirements or parameter layouts change
+as a result of this optimization.
+
+
+Validation: 143 native tests pass in debug/release and 146 with profiling, plus
+the full repository suite and both ARM relocation checks. Direct comparisons
+cover attack/release ramps, every silent-tail position within a chunk, fixed
+and moving pitch, table interpolation and failed-fast-path state preservation.
+Callback tests verify fast-loop use for one- and seven-member groups through
+500 ms attacks and 1,000 ms releases, including exact silence/no processing after
+the tail ends. Normal ITC grows from 25,948 to 26,248 bytes (+300); cold code
+remains 3,892 bytes. Device CPU savings await the user's comparison. The previous
+envelope implementation/artifact is preserved under ignored
+target/wavesmith-envelope-optimization for rollback of this optimization alone.

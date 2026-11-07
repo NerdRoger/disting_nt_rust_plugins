@@ -105,6 +105,8 @@ Voice pages, and Waveform.
 | `Pitch` | Root note for CV/manual playback. Each voice's Pitch CV and Transpose are added to it. Default: C3. Ignored and grayed out in MIDI mode. |
 | `Fine tune` | Shared tuning adjustment from −100 to +100 cents, applied in both CV and MIDI modes. Default: 0. |
 | `Level` | Overall output level, from −60 to 0 dB. The bottom setting displays −inf and mutes the output. Default: −6 dB. |
+| `Attack` | MIDI note fade-in time, from 1 to 500 ms. Shared by all MIDI groups. Default: 5 ms. Grayed out in CV mode. |
+| `Release` | MIDI note fade-out time after Note Off, from 1 to 1,000 ms. Shared by all MIDI groups. Default: 500 ms. Grayed out in CV mode. |
 
 ### Output
 
@@ -213,7 +215,11 @@ want to articulate the output.
 
 Set MIDI Channel to All or to your controller's channel. MIDI takes over note
 control for all assigned voices; Pitch CV and the shared Pitch setting are
-ignored. Notes sound while held, with short attack and release fades.
+ignored. Each note fades in using Attack, stays at full level while held, and
+fades out using Release after Note Off. Every MIDI group has its own envelope,
+so one note can release while another attacks. All oscillators in a group share
+that envelope. A Note Off during attack starts the release at the current level;
+Release is sampled when the note is released.
 
 MIDI allocates notes to groups, rather than to individual oscillators. For
 example, with six voices you could assign Voices 1–3 to Group 1 and Voices 4–6
@@ -222,7 +228,9 @@ Detune and pan the members of each group independently to create a stereo stack.
 
 Available polyphony is the number of groups with at least one assigned voice,
 up to ten notes. If all available groups are busy, the newest note steals the
-oldest held note and all oscillators in that group follow the replacement.
+oldest held note. The old note uses a short, approximately 5 ms fade instead of
+waiting for its full Release, then the replacement starts with its own Attack.
+All oscillators in that group follow the replacement.
 A voice assigned to None does not play in MIDI mode; it still plays in CV mode.
 
 Pitch bend is supported with a fixed range of ±2 semitones. Shared and per-voice
@@ -258,5 +266,9 @@ Copy `wavesmith.o` to `/programs/plug-ins/` on the NT's SD card, then rescan plu
 or restart the module and add Wavesmith. Use firmware that supports plugin API 14.
 
 Report bugs and suggestions on [GitHub](https://github.com/NerdRoger/disting_nt_rust_plugins/issues).
+When upgrading from a build without Attack and Release, add a fresh Wavesmith
+instance and review your voice settings and mappings; the voice parameter
+positions have changed.
+
 For build instructions, implementation notes, and profiling, see
 [Developer.md](Developer.md).

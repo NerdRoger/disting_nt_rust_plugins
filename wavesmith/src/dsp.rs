@@ -1021,6 +1021,31 @@ impl Oscillator {
         }
         self.render_fixed_selection::<false>(engine, memory, output)
     }
+    /// Render into a cleared voice buffer using the same bound-table loop as
+    /// sustained playback, then apply a precomputed group envelope. Stop before
+    /// the first zero gate, matching the scalar path's phase/pitch advancement.
+    pub fn render_enveloped(
+        &mut self,
+        engine: &Engine,
+        memory: &Memory,
+        output: &mut [f32],
+        gates: &[f32],
+    ) -> Option<f32> {
+        let gates = gates.get(..output.len())?;
+        let audible = gates
+            .iter()
+            .position(|&gate| gate == 0.0)
+            .unwrap_or(gates.len());
+        if !self.render_open_gate(engine, memory, output.get_mut(..audible)?) {
+            return None;
+        }
+        let mut power = 0.0;
+        for (sample, &gate) in output.iter_mut().zip(gates).take(audible) {
+            *sample *= gate;
+            power += gate * gate;
+        }
+        Some(power)
+    }
     fn render_fixed_selection<const TRACK: bool>(
         &mut self,
         engine: &Engine,

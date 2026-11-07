@@ -1774,3 +1774,88 @@ fn new_pitch_target_and_silent_retune_discard_pending_interpolation_endpoint() {
     voice.tune_when_silent(880.0, 48000.0);
     assert!(!voice.pair_pending);
 }
+
+#[test]
+fn batched_envelope_playback_matches_scalar_samples_phase_and_gate_energy() {
+    let mut wave = Wave::new(32);
+    wave.curves.fill(87);
+    let mut engine = Engine::new(32, 48000);
+    let mut memory = [Block::ZERO; BLOCKS];
+    finish_build(&mut engine, &mut memory, wave, 440.0);
+    for frequency in [20.0, 440.0, 2800.0, 12500.0] {
+        let mut initial = Oscillator::new();
+        for _ in 0..5000 {
+            initial.prepare(frequency, 48000.0, 0.5);
+            initial.tick_prepared(&engine, &memory, 0);
+        }
+        for target in [frequency, frequency * 1.001, frequency * 2.0] {
+            for silent_at in 0..=16 {
+                for attacking in [false, true] {
+                    let mut fast = initial;
+                    fast.prepare(target, 48000.0, 0.5);
+                    let mut scalar = fast;
+                    let mut gates = [0.0; 16];
+                    for (i, gate) in gates.iter_mut().enumerate().take(silent_at) {
+                        *gate = if attacking {
+                            (i + 1) as f32 / 16.0
+                        } else {
+                            1.0 - i as f32 / 16.0
+                        };
+                    }
+                    let mut expected = [0.0; 16];
+                    let mut expected_power = 0.0;
+                    for (i, sample) in expected.iter_mut().enumerate().take(silent_at) {
+                        *sample = gates[i] * scalar.tick_prepared(&engine, &memory, i);
+                        expected_power += gates[i] * gates[i];
+                    }
+                    let before = STEADY_TICKS.with(|count| count.get());
+                    let mut actual = [0.0; 16];
+                    let power = fast
+                        .render_enveloped(&engine, &memory, &mut actual, &gates)
+                        .unwrap();
+                    assert_eq!(power, expected_power);
+                    assert_eq!(fast, scalar, "phase/pitch must stop at first silent gate");
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        assert!((actual - expected).abs() < 0.000001);
+                    }
+                    if target == frequency {
+                        assert_eq!(STEADY_TICKS.with(|count| count.get()) - before, silent_at);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_envelope_rejection_does_not_advance_or_modify_output() {
+    let mut engine = Engine::new(8, 48000);
+    let mut memory = [Block::ZERO; BLOCKS];
+    finish_build(&mut engine, &mut memory, Wave::new(8), 440.0);
+    let mut voice = Oscillator::new();
+    voice.prepare(440.0, 48000.0, 0.5);
+    let before = voice;
+    let mut samples = [0.0; 16];
+    assert_eq!(
+        voice.render_enveloped(&engine, &memory, &mut samples, &[1.0; 15]),
+        None
+    );
+    assert_eq!(voice, before);
+    assert_eq!(
+        voice.render_enveloped(&engine, &memory, &mut samples, &[1.0; 16]),
+        None
+    );
+    assert_eq!(voice, before);
+    assert_eq!(samples, [0.0; 16]);
+    for _ in 0..5000 {
+        voice.tick_prepared(&engine, &memory, 0);
+    }
+    engine.fade = 100;
+    let before = voice;
+    assert_eq!(
+        voice.render_enveloped(&engine, &memory, &mut samples, &[1.0; 16]),
+        None
+    );
+    assert_eq!(voice, before);
+    assert_eq!(samples, [0.0; 16]);
+}

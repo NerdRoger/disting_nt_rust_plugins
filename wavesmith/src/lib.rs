@@ -58,7 +58,9 @@ const GLOBALS: usize = 19;
 const VOICE_PARAMETERS: usize = 5;
 const MAX_VOICES: usize = 24;
 const WAVEFORM_START: usize = GLOBALS;
-const VOICE_START: usize = WAVEFORM_START + dsp::MAX_SEGMENTS * 2;
+const MIDI_ATTACK: usize = WAVEFORM_START + dsp::MAX_SEGMENTS * 2;
+const MIDI_RELEASE: usize = MIDI_ATTACK + 1;
+const VOICE_START: usize = MIDI_RELEASE + 1;
 const VOICE_PAGE_NAMES: [&CStr; MAX_VOICES] = [
     c"Voice 1",
     c"Voice 2",
@@ -457,6 +459,8 @@ fn sync_midi_parameter_graying(context: &mut Callback<'_, Audio>) {
     let voices = context.state().voices;
     let mut parameters = context.parameters();
     let mut applied = parameters.gray(PITCH, midi).is_some();
+    applied &= parameters.gray(MIDI_ATTACK, !midi).is_some();
+    applied &= parameters.gray(MIDI_RELEASE, !midi).is_some();
     for voice in 0..voices {
         applied &= parameters
             .gray(voice_pitch_parameter(voice), midi)
@@ -614,7 +618,7 @@ impl Plugin for Wavesmith {
         Some(Configuration {
             parameters,
             pages: 5 + voices,
-            page_indices: GLOBALS + voices * VOICE_PARAMETERS + segments * 2 + 1,
+            page_indices: GLOBALS + 2 + voices * VOICE_PARAMETERS + segments * 2 + 1,
             regions: dsp::blocks(dsp::DEFAULT_TABLES),
         })
     }
@@ -694,6 +698,14 @@ impl Plugin for Wavesmith {
             ),
             (PITCH, definition(c"Pitch", 0, 127, 48, UNIT_MIDI_NOTE)),
             (FINE, definition(c"Fine tune", -100, 100, 0, UNIT_CENTS)),
+            (
+                MIDI_ATTACK,
+                definition(c"Attack", 1, 500, midi::ATTACK_DEFAULT, UNIT_MS),
+            ),
+            (
+                MIDI_RELEASE,
+                definition(c"Release", 1, 1000, midi::RELEASE_DEFAULT, UNIT_MS),
+            ),
             (SMOOTHING, definition(c"Smoothing", 0, 100, 0, UNIT_PERCENT)),
             (
                 LEVEL,
@@ -711,7 +723,14 @@ impl Plugin for Wavesmith {
         metadata.add_page(
             c"Oscillator",
             1,
-            &[MIDI_CHANNEL as u8, PITCH as u8, FINE as u8, LEVEL as u8],
+            &[
+                MIDI_CHANNEL as u8,
+                PITCH as u8,
+                FINE as u8,
+                LEVEL as u8,
+                MIDI_ATTACK as u8,
+                MIDI_RELEASE as u8,
+            ],
         )?;
         metadata.add_page(
             c"Output",
@@ -877,6 +896,13 @@ impl Plugin for Wavesmith {
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
         sync_segment_graying(context);
         let n = context.state().count;
+        if parameter == MIDI_ATTACK as i32 || parameter == MIDI_RELEASE as i32 {
+            let p = context.read_parameters();
+            let attack = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
+            let release = p.value(MIDI_RELEASE).unwrap_or(midi::RELEASE_DEFAULT);
+            context.state_mut().midi.set_envelope(attack, release);
+            return;
+        }
         if parameter == MIDI_CHANNEL as i32 {
             sync_parameter_graying(context);
             let setting = context
@@ -1023,7 +1049,10 @@ impl Plugin for Wavesmith {
         let enabled = enabled_voices(context.state().voices, setting != 0, |index| p.value(index));
         let groups = read_groups(context.state().voices, |index| p.value(index));
         let available = enabled_groups(&enabled, &groups);
+        let attack = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
+        let release = p.value(MIDI_RELEASE).unwrap_or(midi::RELEASE_DEFAULT);
         let state = context.state_mut();
+        state.midi.set_envelope(attack, release);
         state.set_midi_channel(setting, &enabled);
         state.midi.message(status, data1, data2, &available);
     }
@@ -1039,6 +1068,8 @@ impl Plugin for Wavesmith {
         let note = p.value(PITCH).unwrap_or(48).clamp(0, 127) as f32;
         let fine = p.value(FINE).unwrap_or(0).clamp(-100, 100) as f32 / 1200.0;
         let level_db = p.value(LEVEL).unwrap_or(levels::LEVEL_DEFAULT);
+        let attack_ms = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
+        let release_ms = p.value(MIDI_RELEASE).unwrap_or(midi::RELEASE_DEFAULT);
         let midi_setting = p.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) as u8;
         let Some(mut buses) = AudioBuses::new(samples, frames) else {
             return;
@@ -1116,6 +1147,7 @@ impl Plugin for Wavesmith {
         let processing = context.processing();
         let state = processing.state;
         state.ui.advance(frames);
+        state.midi.set_envelope(attack_ms, release_ms);
         let level = state.level.amplitude(level_db);
         let memory = processing.regions;
         state.set_midi_channel(midi_setting, &enabled);
@@ -1227,6 +1259,7 @@ impl Plugin for Wavesmith {
         let mut output_cycles = 0u32;
         if output_enabled {
             let gate_step = state.midi.gate_step;
+            let attack_step = state.midi.attack_step;
             for (chunk_index, start) in (0..frames).step_by(levels::CHUNK).enumerate() {
                 let end = start.saturating_add(levels::CHUNK).min(frames);
                 let length = end - start;
@@ -1260,7 +1293,7 @@ impl Plugin for Wavesmith {
                                 return;
                             };
                             for gate in gates {
-                                *gate = group.next_gain(gate_step);
+                                *gate = group.next_gain(attack_step, gate_step);
                             }
                         }
                     }
@@ -1294,12 +1327,21 @@ impl Plugin for Wavesmith {
                     } else {
                         None
                     };
-                    if gate_on
-                        && *gain == 1.0
-                        && shared_gate_steady
-                        && oscillator.render_open_gate(&state.engine, memory, voice_mix)
-                    {
-                        gate_power += length as f32;
+                    let fast_power = if gate_on && *gain == 1.0 {
+                        if shared_gate_steady {
+                            oscillator
+                                .render_open_gate(&state.engine, memory, voice_mix)
+                                .then_some(length as f32)
+                        } else {
+                            gates.and_then(|gates| {
+                                oscillator.render_enveloped(&state.engine, memory, voice_mix, gates)
+                            })
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(power) = fast_power {
+                        gate_power += power;
                     } else {
                         for (frame, sample) in voice_mix.iter_mut().enumerate() {
                             *gain = if gate_on {
