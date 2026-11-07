@@ -41,7 +41,7 @@ def decode(data):
     ):
         raise ValueError("Telemetry integer overflow")
     if (not result["callbacks"] or not result["frames"] or not result["sample_rate"]
-            or not result["block_frames"] or result["voices"] > 10
+            or not result["block_frames"] or result["voices"] > 24
             or result["midi"] > 1 or result["stereo"] > 1):
         raise ValueError("Invalid profiling window or workload")
     if data[4] >= 2:

@@ -89,7 +89,7 @@ impl LevelControl {
     /// `voice_weight` is the mean sum of squared MIDI gates (unity gates in CV).
     /// A barely-open voice therefore contributes barely any normalization weight.
     pub fn process(&mut self, mix: &mut [f32], voice_power: f32, voice_weight: f32, ceiling: f32) {
-        self.process_channels::<false>(mix, &mut [], voice_power, voice_weight, ceiling);
+        self.process_channels(mix, &mut [], voice_power, voice_weight, ceiling, false);
     }
 
     pub fn process_stereo(
@@ -100,18 +100,20 @@ impl LevelControl {
         voice_weight: f32,
         ceiling: f32,
     ) {
-        self.process_channels::<true>(left, right, voice_power, voice_weight, ceiling);
+        self.process_channels(left, right, voice_power, voice_weight, ceiling, true);
     }
 
-    fn process_channels<const STEREO: bool>(
+    #[inline(never)]
+    fn process_channels(
         &mut self,
         mix: &mut [f32],
         right: &mut [f32],
         voice_power: f32,
         voice_weight: f32,
         ceiling: f32,
+        stereo: bool,
     ) {
-        if STEREO && mix.len() != right.len() {
+        if stereo && mix.len() != right.len() {
             mix.fill(0.0);
             right.fill(0.0);
             self.reset();
@@ -122,7 +124,7 @@ impl LevelControl {
         }
         if voice_weight <= 0.0 || ceiling <= 0.0 {
             mix.fill(0.0);
-            if STEREO {
+            if stereo {
                 right.fill(0.0);
             }
             self.reset();
@@ -131,7 +133,7 @@ impl LevelControl {
         let frames = mix.len();
         let (mut left_power, mut right_power) = (0.0, 0.0);
         let (mut left_peak, mut right_peak) = (0.0f32, 0.0f32);
-        if STEREO {
+        if stereo {
             for (&left, &right) in mix.iter().zip(right.iter()) {
                 left_power += left * left;
                 right_power += right * right;
@@ -144,12 +146,12 @@ impl LevelControl {
                 left_peak = left_peak.max(sample.abs());
             }
         }
-        let total_power = if STEREO {
+        let total_power = if stereo {
             left_power + right_power
         } else {
             left_power
         };
-        let peak = if STEREO {
+        let peak = if stereo {
             left_peak.max(right_peak)
         } else {
             left_peak
@@ -162,7 +164,7 @@ impl LevelControl {
             for sample in mix {
                 *sample *= gain;
             }
-            if STEREO {
+            if stereo {
                 for sample in right {
                     *sample *= gain;
                 }
@@ -207,7 +209,7 @@ impl LevelControl {
         }
         let start = self.gain;
         let gain_step = (next_gain - start) / frames as f32;
-        if STEREO {
+        if stereo {
             for (i, (left, right)) in mix.iter_mut().zip(right.iter_mut()).enumerate() {
                 let gain = (start + gain_step * (i + 1) as f32).min(self.peak_gain);
                 *left *= gain;

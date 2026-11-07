@@ -117,7 +117,7 @@ impl Telemetry {
         encode(self.frames as u64, &mut packet[36..41]);
         encode(sample_rate as u64, &mut packet[41..46]);
         encode(frames as u64, &mut packet[46..51]);
-        packet[51] = voices.min(10);
+        packet[51] = voices.min(super::MAX_VOICES as u8);
         packet[52] = u8::from(midi);
         packet[53] = u8::from(stereo);
         for (bytes, total) in packet[54..104].chunks_exact_mut(10).zip(self.stages) {
@@ -161,7 +161,7 @@ mod tests {
                     24,
                     48000,
                     999,
-                    10,
+                    15,
                     false,
                     true,
                     [2000, 100, 200, 300, 400]
@@ -175,7 +175,7 @@ mod tests {
                 24,
                 48000,
                 999,
-                10,
+                15,
                 false,
                 true,
                 [2000, 100, 200, 300, 400],
@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(decode(&packet[36..41]), 48000);
         assert_eq!(decode(&packet[54..64]), 4_000_000);
         assert_eq!(decode(&packet[94..104]), 800_000);
-        assert_eq!(&packet[51..54], &[10, 0, 1]);
+        assert_eq!(&packet[51..54], &[15, 0, 1]);
         assert_eq!(decode(&packet[104..109]), 456);
         assert_eq!(decode(&packet[109..114]), 1);
         for (bytes, expected) in packet[114..159]

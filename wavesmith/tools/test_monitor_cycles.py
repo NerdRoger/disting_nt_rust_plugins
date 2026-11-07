@@ -21,6 +21,12 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(result["mean_cycles_per_callback"],37000000/3000)
         self.assertEqual(result["missed_reports"],0)
 
+    def test_supports_full_voice_count(self):
+        for voices in [0, 10, 15, 24]:
+            self.assertEqual(decode(packet(voices=voices))["voices"], voices)
+        with self.assertRaises(ValueError):
+            decode(packet(voices=25))
+
     def test_reject_malformed_and_changed_workload(self):
         self.assertIsNone(decode([0,33,39]))
         with self.assertRaises(ValueError): decode(packet()[:-1])

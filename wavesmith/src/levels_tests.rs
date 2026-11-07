@@ -276,12 +276,13 @@ fn fused_detector_and_stereo_gain_match_original_controller_bit_for_bit() {
                 };
                 let ceiling = if block % 43 == 0 { 0.0 } else { 5.0 };
                 if stereo {
-                    actual.process_channels::<true>(
+                    actual.process_channels(
                         &mut left[..frames],
                         &mut right[..frames],
                         voice_power,
                         weight,
                         ceiling,
+                        true,
                     );
                     expected.process_channels_reference::<true>(
                         &mut el[..frames],
@@ -291,12 +292,13 @@ fn fused_detector_and_stereo_gain_match_original_controller_bit_for_bit() {
                         ceiling,
                     );
                 } else {
-                    actual.process_channels::<false>(
+                    actual.process_channels(
                         &mut left[..frames],
                         &mut [],
                         voice_power,
                         weight,
                         ceiling,
+                        false,
                     );
                     expected.process_channels_reference::<false>(
                         &mut el[..frames],
