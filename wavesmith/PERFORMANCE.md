@@ -991,3 +991,73 @@ mode-switching, tuning, voice-stealing and CV regressions continue to pass.
 131 native tests pass in debug and release, 134 pass with profiling enabled, and
 the repository suite and normal ARM plugin checks pass. No device CPU measurement
 has been taken for this change; savings must be confirmed on the module.
+
+
+## DTC placement playback experiments (rejected)
+
+Measured committed main (8b48939), with profiling enabled and no LFO work, under
+the user's unchanged preset: 10 CV voices, mono, 48 kHz, 24-frame callbacks.
+Each capture ran for 100 seconds after a 5-second warmup; all four runs had zero
+missing reports. The original profiling artifact was redeployed for the final
+baseline rather than rebuilding it with experimental framework changes.
+
+| Placement | DTC bytes per instance (profiling build) | Mean callback cycles | Change vs first baseline |
+|---|---:|---:|---:|
+| Original SRAM | 0 | 68,543.97 | +0.00% |
+| State only in DTC | 4,624 | 68,087.72 | -0.67% |
+| Waveform/workspace regions in DTC; state in SRAM | 24,576 | 69,208.43 | +0.97% |
+| Original SRAM repeated | 0 | 68,433.26 | -0.16% |
+
+These percentages describe the measured callback body, not percentage points of
+module CPU usage. State placement's approximately 0.7% apparent saving is small
+relative to timing variation (about 284–344 cycles standard error per measured
+callback mean for the individual captures). It does not justify reserving DTC
+on this evidence. Moving all waveform/workspace buffers into DTC did not improve
+steady playback. Both experimental implementations were discarded.
+
+The state candidate used the existing StateMemory=Dtc API policy. The buffer
+candidate temporarily added a separate region-array DTC policy to the framework,
+with admitted aligned region pointers and state still in SRAM. Existing API
+unit tests and all 136 profiling Wavesmith tests passed for that candidate, and
+both candidates passed ARM plugin checks. The buffer array is contiguous, so
+its 14 KiB table banks and 10 KiB builder workspace moved together; this steady
+workload does not measure FFT rebuilding performance. That requires waveform
+parameter modulation in a follow-up run.
+
+Profiling artifacts used 27,014 ITC bytes for baseline/state and 26,890 for the
+buffer candidate; cold code was 3,788 / 3,836 / 3,884 bytes respectively, with
+1,794 bytes of rodata throughout. These are instrumented artifacts, not normal
+release size measurements. Rejected candidate sources/artifacts and all CSV/JSON
+captures remain under ignored target/wavesmith-dtc-bench for reproducibility.
+The device is back on the original SRAM profiling build with streaming disabled;
+main's implementation and normal build remain unchanged. No commits were made.
+
+
+### Warp-modulated waveform/workspace DTC follow-up (rejected)
+
+The user enabled Warp Position modulation in the same ten-CV-voice, mono, 48 kHz,
+24-frame preset. Three 100-second captures with 5-second warmups compared the
+original SRAM profiling binary, the preserved buffer-only DTC artifact, and that
+same original SRAM binary again. All had zero missing reports. No source changes
+or new builds were needed: these are the validated artifacts from the preceding
+placement experiment, with instance state in SRAM in every run.
+
+| Configuration | Mean rebuild-stage cycles | Mean whole-callback cycles |
+|---|---:|---:|
+| Original SRAM | 8,284.45 | 115,590.40 |
+| 24 KiB waveform/workspace allocation in DTC | 8,193.45 | 115,955.35 |
+| Original SRAM repeated | 8,283.49 | 115,625.69 |
+
+Against the mean of the two bracketing SRAM baselines, DTC changed rebuild-stage
+cost by -1.09% and whole-callback cost by +0.30%.
+The baseline whole-callback drift was only +0.03%. Rebuild timing includes all
+builder stages, not isolated FFT calls. Its approximately 91-cycle saving amounts
+to only 0.08% of the original callback cost, and produced no overall benefit.
+The DTC reservation is therefore still not worthwhile and the candidate remains
+rejected. These figures are relative cycle changes, not CPU percentage points.
+
+The device is restored to the original SRAM profiling artifact and the capture
+script disabled streaming and closed its MIDI ports. Main's implementation is
+unchanged; only these performance notes are pending. No commits were made.
+CSV/JSON measurements and the stage comparison script are retained under ignored
+target/wavesmith-dtc-bench with the warp-* prefix.
