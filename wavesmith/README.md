@@ -19,7 +19,9 @@ change either count. MIDI Voice Group controls which voices participate in MIDI 
   presses zero the selected endpoint and the curve press restores its default
   zero curve. Warp and Tuning controls use their declared parameter defaults.
   The starting waveform's nonzero boundary defaults are unchanged. Reset occurs
-  once per press; pickup resumes from the current physical position.
+  once per press. Pot motion is ignored while held and for 100 ms after release;
+  pickup then resumes from the current physical position without accumulating
+  the ignored movement. Other pots and external parameter modulation remain available.
   MIDI-disabled Pitch stays inactive.
 - Right encoder press: cycle Segment → Warp → Tuning → Segment.
 - Segment mode (initial): left pot edits the selected segment's starting boundary

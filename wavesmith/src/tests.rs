@@ -3511,3 +3511,58 @@ fn midi_tuning_setup_only_runs_for_sounding_voices_including_release_tails() {
     MIDI_TUNING_READS.with(|reads| assert_eq!(reads.get(), 0));
     instance.assert_guard();
 }
+
+#[test]
+fn pot_reset_ignores_release_motion_for_100ms_then_resumes_from_current_position() {
+    for mode in 0..3 {
+        for pot in 0..3 {
+            let mut instance = Instance::new(8);
+            let mut pots = [0.5; 3];
+            instance.event(pots, [0, 0]);
+            for _ in 0..mode {
+                instance.click_right(pots);
+            }
+            let parameter = match mode {
+                0 => editor_parameter(8, 0, [0, 2, 1][pot]).unwrap(),
+                1 => [WARP_POSITION, WARP_AMOUNT, SMOOTHING][pot],
+                _ => [PITCH, FINE, LEVEL][pot],
+            };
+            let button = [POT_BUTTON_L, POT_BUTTON_C, POT_BUTTON_R][pot];
+            let definition = unsafe { *(*instance.base).parameters.add(parameter) };
+            let reset = if mode == 0 && pot != 1 {
+                0
+            } else {
+                definition.default
+            };
+            instance.change(parameter, definition.max);
+            instance.event_buttons(pots, [0, 0], button, 0);
+            assert_eq!(instance.values[parameter], reset);
+            let mut samples = [0.0; LAST_BUS * 24];
+            // A long press must still get a fresh hold interval on release.
+            for _ in 0..300 {
+                instance.render(&mut samples);
+            }
+            pots[pot] = 0.505;
+            instance.event_buttons(pots, [0, 0], 0, button);
+            for _ in 0..198 {
+                instance.render(&mut samples);
+            } // 99 ms at 48 kHz.
+            pots[pot] = 0.510;
+            instance.event(pots, [0, 0]);
+            assert_eq!(instance.values[parameter], reset);
+            for _ in 0..2 {
+                instance.render(&mut samples);
+            }
+            // Stationary after expiry: ignored movement must not be accumulated.
+            instance.event(pots, [0, 0]);
+            assert_eq!(instance.values[parameter], reset);
+            // Resume normal pickup; move away from whichever rail is the default.
+            let direction = if reset == definition.max { -1.0 } else { 1.0 };
+            for _ in 0..8 {
+                pots[pot] += direction * 0.005;
+                instance.event(pots, [0, 0]);
+            }
+            assert_ne!(instance.values[parameter], reset);
+        }
+    }
+}

@@ -28,6 +28,7 @@ pub struct UiState {
     residual: [f32; 3],
     last_written: [i16; 3],
     primed: bool,
+    reset_hold: [usize; 3],
 }
 
 impl UiState {
@@ -39,6 +40,13 @@ impl UiState {
             residual: [0.0; 3],
             last_written: [0; 3],
             primed: false,
+            reset_hold: [0; 3],
+        }
+    }
+
+    pub fn advance(&mut self, frames: usize) {
+        for remaining in &mut self.reset_hold {
+            *remaining = remaining.saturating_sub(frames);
         }
     }
 }
@@ -137,6 +145,12 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
             .and_then(|p| context.read_parameters().value(p))
             .unwrap_or(0);
         let pressed = data.controls as u32 & button != 0 && data.last_buttons as u32 & button == 0;
+        // Suppress release-induced movement for 100 ms after the button is let
+        // go too, even if it was held longer than the initial press interval.
+        if !locked && (data.controls | data.last_buttons) as u32 & button != 0 {
+            let hold_frames = (context.state().sample_rate as usize).div_ceil(10);
+            context.state_mut().ui.reset_hold[pot] = hold_frames;
+        }
         if pressed && !locked {
             if let Some(parameter) = parameter {
                 let reset_value = if mode == EditMode::Segment && pot != 1 {
@@ -164,6 +178,7 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 && !changed_selection
                 && !changed_mode
                 && !locked
+                && ui.reset_hold[pot] == 0
                 && data.controls as u32 & mask != 0
                 && (data.controls | data.last_buttons) as u32 & button == 0;
             if value != ui.last_written[pot] {

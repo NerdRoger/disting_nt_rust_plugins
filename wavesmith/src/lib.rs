@@ -1082,6 +1082,7 @@ impl Plugin for Wavesmith {
         }
         let processing = context.processing();
         let state = processing.state;
+        state.ui.advance(frames);
         let level = state.level.amplitude(level_db);
         let memory = processing.regions;
         state.set_midi_channel(midi_setting, &enabled);
