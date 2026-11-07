@@ -13,6 +13,7 @@ use std::{
 };
 
 std::thread_local! {
+    pub(super) static MIDI_TUNING_READS: Cell<usize> = const { Cell::new(0) };
     static SENT_SYSEX: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static CYCLE_COUNTER: Cell<u32> = const { Cell::new(0) };
     static FOOTER_COVER_AFTER_HELP: Cell<bool> = const { Cell::new(false) };
@@ -56,16 +57,23 @@ struct Instance {
 
 impl Instance {
     fn new(n: i32) -> Self {
-        let mut instance = Self::with_active_voices(n, 1);
-        // Factory-default construction, including consecutive three-voice groups.
-        for voice in 0..VOICE_COUNT {
-            instance.values[voice_group_parameter(voice)] = default_group(voice) as i16 + 1;
+        Self::configured(n, 1)
+    }
+    fn with_voices(n: i32, voices: i32) -> Self {
+        let mut instance = Self::configured(n, voices);
+        // Explicitly spread groups for independent-note/stack regression tests.
+        for voice in 0..voices as usize {
+            instance.values[voice_midi_group_parameter(voice)] =
+                (voice % midi::GROUP_COUNT) as i16 + 1;
         }
         instance
     }
-    fn with_active_voices(n: i32, voices: i32) -> Self {
+    fn with_specified_voices(voices: i32) -> Self {
+        Self::configured(DEFAULT_SEGMENTS as i32, voices)
+    }
+    fn configured(n: i32, specified: i32) -> Self {
         unsafe {
-            let specs = [n];
+            let specs = [specified, n];
             let f = factory();
             let mut req = NtAlgorithmRequirements {
                 num_parameters: 0,
@@ -77,7 +85,7 @@ impl Instance {
             f.calculate_requirements.unwrap()(&mut req, specs.as_ptr());
             assert_eq!(
                 req.num_parameters as usize,
-                GLOBALS + n as usize * 2 + VOICE_COUNT * VOICE_PARAMETERS
+                VOICE_START + specified as usize * VOICE_PARAMETERS
             );
             assert!(
                 req.sram
@@ -86,7 +94,7 @@ impl Instance {
             );
             assert!(core::mem::size_of::<State>() < 8192);
             let alignment =
-                distingnt_api::api::plugin::Registration::<Wavesmith, 1>::alignment(&specs)
+                distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
                     .unwrap();
             let layout = Layout::from_size_align(req.sram as usize + 64, alignment).unwrap();
             let memory = alloc_zeroed(layout);
@@ -106,15 +114,17 @@ impl Instance {
             let mut values: Vec<_> = (0..req.num_parameters as usize)
                 .map(|i| (*(*base).parameters.add(i)).default)
                 .collect();
-            // Test convenience: select an active pool and spread it across groups
-            // for independent-note tests. Instance::new restores factory groups.
-            for voice in 0..VOICE_COUNT {
-                values[voice_active_parameter(voice)] = i16::from(voice < voices as usize);
-                values[voice_group_parameter(voice)] = (voice % midi::GROUP_COUNT) as i16 + 1;
+            for boundary in 1..dsp::MAX_SEGMENTS {
+                values[boundary_parameter(boundary)] = if boundary < n as usize {
+                    dsp::default_level(boundary, n as usize)
+                } else {
+                    0
+                };
             }
             (*base).v = values.as_ptr();
             CURRENT.with(|current| current.set(base));
             CURRENT_SEGMENTS.with(|current| current.set(n as usize));
+            f.parameter_changed.unwrap()(base, curve_parameter(0) as i32);
             GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
             Self {
                 base,
@@ -205,11 +215,11 @@ impl Drop for Instance {
 #[test]
 fn every_segment_count_builds_complete_metadata_and_shared_seam() {
     for n in 2..=32 {
-        let instance = Instance::new(n);
+        let instance = Instance::configured(n, MAX_VOICES as i32);
         unsafe {
             assert_eq!(
                 (*(*instance.base).parameter_pages).num_pages as usize,
-                4 + VOICE_COUNT
+                4 + MAX_VOICES
             );
             assert_eq!(editor_parameter(n as usize, 0, 0), Some(WAVEFORM_START));
             assert_eq!(
@@ -252,7 +262,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
             let oscillator_group = (*pages.pages).group;
             let routing_group = (*pages.pages.add(1)).group;
-            let page = &*pages.pages.add(VOICE_COUNT + 3);
+            let page = &*pages.pages.add(MAX_VOICES + 3);
             assert_eq!(CStr::from_ptr(page.name), c"Waveform");
             assert_ne!(page.group, 0);
             assert_ne!(page.group, oscillator_group);
@@ -265,7 +275,8 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             );
             assert_eq!(instance.values[LEFT_OUTPUT], 13);
             assert_eq!(instance.values[OUTPUT_MODE], 0);
-            assert_eq!(instance.values[voice_pitch_parameter(0)], 0);
+            assert_eq!(instance.values[voice_pitch_parameter(0)], 1);
+            assert_eq!(instance.values[PITCH], 48);
             assert_eq!(
                 CStr::from_ptr((*(*instance.base).parameters.add(voice_pitch_parameter(0))).name),
                 c"Pitch CV"
@@ -305,8 +316,11 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                     std::format!("Boundary {boundary:02}")
                 );
             }
-            for segment in 0..n as usize {
-                assert_eq!(references[curve_parameter(segment)], 1);
+            for segment in 0..dsp::MAX_SEGMENTS {
+                assert_eq!(
+                    references[curve_parameter(segment)],
+                    usize::from(segment < n as usize)
+                );
             }
             assert_eq!(references[WAVEFORM_START], 2);
             assert_eq!(references[RANDOMIZE_ALL], 1);
@@ -350,21 +364,23 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
             }
         }
     }
-    for n in [0, 1, 33, -1] {
-        assert!(Wavesmith::configuration(&[n]).is_none());
+    for n in [0, 25, 33, -1] {
+        assert!(Wavesmith::configuration(&[n, DEFAULT_SEGMENTS as i32]).is_none());
     }
     assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_14);
 }
 
 #[test]
-fn specification_layout_keeps_six_tables_and_twenty_four_voices_with_one_active_by_default() {
-    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 1);
-    assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Segments");
-    assert_eq!(unsafe { factory() }.num_specifications, 1);
+fn specification_selects_voices_while_live_segments_keep_six_tables() {
+    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 2);
+    assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Voices");
+    assert_eq!(unsafe { factory() }.num_specifications, 2);
     for segments in 2..=32 {
         let mut instance = Instance::new(segments);
         assert_eq!(
-            Wavesmith::configuration(&[segments]).unwrap().regions,
+            Wavesmith::configuration(&[MAX_VOICES as i32, segments])
+                .unwrap()
+                .regions,
             dsp::blocks(dsp::DEFAULT_TABLES)
         );
         let mut samples = [0.0; LAST_BUS * 24];
@@ -671,11 +687,11 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
 
 #[test]
 fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
-    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 1);
+    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 2);
     for n in 2..=32 {
-        for voices in [VOICE_COUNT] {
-            let instance = Instance::new(n);
-            let config = Wavesmith::configuration(&[n]).unwrap();
+        for voices in [MAX_VOICES] {
+            let instance = Instance::configured(n, MAX_VOICES as i32);
+            let config = Wavesmith::configuration(&[MAX_VOICES as i32, n]).unwrap();
             assert_eq!(config.pages, voices + 4);
             assert_eq!(
                 config.regions * core::mem::size_of::<dsp::Block>(),
@@ -700,18 +716,28 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                     let page = &*pages.pages.add(i);
                     for &p in core::slice::from_raw_parts(page.params, page.num_params as usize) {
                         if seen[p as usize] == 0 {
-                            assert_eq!(
-                                p as usize, next_ordinal,
-                                "ordinal must match first appearance in menu order"
-                            );
                             next_ordinal += 1;
                         }
                         seen[p as usize] += 1;
                     }
                 }
-                assert_eq!(next_ordinal, instance.values.len());
+                assert_eq!(
+                    next_ordinal,
+                    GLOBALS + MAX_VOICES * VOICE_PARAMETERS + n as usize * 2
+                );
                 for (p, references) in seen.into_iter().enumerate() {
-                    assert_eq!(references, if p == WAVEFORM_START { 2 } else { 1 });
+                    assert_eq!(
+                        references,
+                        if p == WAVEFORM_START {
+                            2
+                        } else if (WAVEFORM_START..VOICE_START).contains(&p)
+                            && (p - WAVEFORM_START) / 2 >= n as usize
+                        {
+                            0
+                        } else {
+                            1
+                        }
+                    );
                 }
                 for voice in 0..voices {
                     let page = &*pages.pages.add(voice + 3);
@@ -730,8 +756,7 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                             transpose as u8,
                             fine as u8,
                             voice_pan_parameter(voice) as u8,
-                            voice_group_parameter(voice) as u8,
-                            voice_active_parameter(voice) as u8
+                            voice_midi_group_parameter(voice) as u8
                         ]
                     );
                     let pan = voice_pan_parameter(voice);
@@ -745,27 +770,29 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                         parameter_prefix(&instance, pan as i32),
                         std::format!("V{}:", voice + 1)
                     );
-                    let active = voice_active_parameter(voice);
-                    let d = &*(*instance.base).parameters.add(active);
-                    assert_eq!(CStr::from_ptr(d.name), c"Active");
+                    let group = voice_midi_group_parameter(voice);
+                    let d = &*(*instance.base).parameters.add(group);
+                    assert_eq!(CStr::from_ptr(d.name), c"MIDI Voice Group");
                     assert_eq!(
                         (d.min, d.max, d.default, d.unit),
-                        (0, 1, if voice == 0 { 1 } else { 0 }, UNIT_ENUM)
+                        (0, 10, default_group_value(voice), UNIT_ENUM)
                     );
-                    assert_eq!(CStr::from_ptr(*d.enum_strings), c"Off");
-                    assert_eq!(CStr::from_ptr(*d.enum_strings.add(1)), c"On");
-                    assert_eq!(
-                        parameter_prefix(&instance, active as i32),
-                        std::format!("V{}:", voice + 1)
-                    );
-                    for (index, name, min, max, unit) in [
-                        (cv, c"Pitch CV", 0, LAST_BUS as i16, UNIT_CV_INPUT),
-                        (transpose, c"Transpose", -48, 48, UNIT_SEMITONES),
-                        (fine, c"Fine tune", -100, 100, UNIT_CENTS),
+                    for (i, label) in [
+                        c"None", c"1", c"2", c"3", c"4", c"5", c"6", c"7", c"8", c"9", c"10",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        assert_eq!(CStr::from_ptr(*d.enum_strings.add(i)), *label);
+                    }
+                    for (index, name, min, max, default, unit) in [
+                        (cv, c"Pitch CV", 0, LAST_BUS as i16, 1, UNIT_CV_INPUT),
+                        (transpose, c"Transpose", -48, 48, 0, UNIT_SEMITONES),
+                        (fine, c"Fine tune", -100, 100, 0, UNIT_CENTS),
                     ] {
                         let d = &*(*instance.base).parameters.add(index);
                         assert_eq!(CStr::from_ptr(d.name), name);
-                        assert_eq!((d.min, d.max, d.default, d.unit), (min, max, 0, unit));
+                        assert_eq!((d.min, d.max, d.default, d.unit), (min, max, default, unit));
                         assert_eq!(
                             parameter_prefix(&instance, index as i32),
                             std::format!("V{}:", voice + 1)
@@ -776,14 +803,14 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
         }
     }
     assert!(Wavesmith::configuration(&[]).is_none());
-    assert!(Wavesmith::configuration(&[8]).is_some());
+    assert!(Wavesmith::configuration(&[8, 8]).is_some());
 }
 
 #[test]
 fn stable_midi_and_cv_reuse_caches_for_only_the_configured_pool() {
     const FRAMES: usize = 24;
-    for voices in 1..=VOICE_COUNT {
-        let mut instance = Instance::with_active_voices(8, voices as i32);
+    for voices in 1..=MAX_VOICES {
+        let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         for voice in 0..voices {
             instance.change(
@@ -833,8 +860,8 @@ fn stable_midi_and_cv_reuse_caches_for_only_the_configured_pool() {
 #[test]
 fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
     const FRAMES: usize = 24;
-    for voices in 1..=VOICE_COUNT {
-        let mut instance = Instance::with_active_voices(8, voices as i32);
+    for voices in 1..=MAX_VOICES {
+        let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         instance.change(MIDI_CHANNEL, 2);
         instance.change(PITCH, 0);
@@ -895,8 +922,8 @@ fn midi_gates_the_specified_pool_ignores_cv_and_restores_cv_when_off() {
 
 #[test]
 fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
-    for voices in 1..=VOICE_COUNT {
-        let mut instance = Instance::with_active_voices(8, voices as i32);
+    for voices in 1..=MAX_VOICES {
+        let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         instance.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
@@ -930,8 +957,8 @@ fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
 #[test]
 fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
     const FRAMES: usize = 24;
-    for voices in 1..=VOICE_COUNT {
-        let mut mixed = Instance::with_active_voices(8, voices as i32);
+    for voices in 1..=MAX_VOICES {
+        let mut mixed = Instance::with_voices(8, voices as i32);
         mixed.change(LEFT_OUTPUT, 1); // Overwrites Voice 1's pitch input after snapshot.
         mixed.change(OUTPUT_MODE, 1);
         for voice in 0..voices {
@@ -995,8 +1022,8 @@ fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
 #[test]
 fn configured_unison_voices_settle_near_mono_level_and_replace_preserves_other_buses() {
     let mut reference: Option<Vec<f32>> = None;
-    for voices in 1..=VOICE_COUNT {
-        let mut instance = Instance::with_active_voices(8, voices as i32);
+    for voices in 1..=MAX_VOICES {
+        let mut instance = Instance::with_voices(8, voices as i32);
         instance.change(OUTPUT_MODE, 1);
         let mut samples = [0.0; LAST_BUS * 64];
         for _ in 0..1500 {
@@ -1735,7 +1762,7 @@ unsafe extern "C" fn NT_drawShapeF(kind: u8, x0: f32, y0: f32, x1: f32, y1: f32,
 #[test]
 fn shared_midi_output_normalizes_independent_notes_with_the_existing_gate_fades() {
     for voices in [1, 4, 8] {
-        let mut mixed = Instance::with_active_voices(8, voices);
+        let mut mixed = Instance::with_voices(8, voices);
         mixed.change(OUTPUT_MODE, 1);
         mixed.change(MIDI_CHANNEL, 1);
         for voice in 0..voices {
@@ -1853,7 +1880,10 @@ fn persistence_metadata(instance: &Instance) -> Vec<String> {
             }
         }
         let pages = &*(*instance.base).parameter_pages;
-        assert_eq!(pages.num_pages as usize, VOICE_COUNT + 4);
+        assert_eq!(
+            pages.num_pages as usize,
+            (instance.values.len() - VOICE_START) / VOICE_PARAMETERS + 4
+        );
         for i in 0..pages.num_pages as usize {
             let page = &*pages.pages.add(i);
             let name = CStr::from_ptr(page.name).to_str().unwrap();
@@ -1873,7 +1903,7 @@ fn persistence_metadata(instance: &Instance) -> Vec<String> {
 #[test]
 fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activity() {
     for (segments, voices) in [(8, 1), (16, 10), (32, 10)] {
-        let mut instance = Instance::with_active_voices(segments, voices);
+        let mut instance = Instance::with_voices(segments, voices);
         let initial = persistence_metadata(&instance);
         for index in 0..instance.values.len() {
             let (min, max) = unsafe {
@@ -1911,7 +1941,7 @@ fn preset_parameter_metadata_is_complete_and_stable_during_voice_and_shape_activ
 #[test]
 fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
     for voices in [1, 10] {
-        let mut instance = Instance::with_active_voices(8, voices);
+        let mut instance = Instance::with_voices(8, voices);
         instance.change(PITCH, 69);
         instance.change(voice_transpose_parameter(0), 7);
         instance.change(voice_fine_parameter(0), -25);
@@ -1919,12 +1949,12 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
         let mut samples = [0.0; LAST_BUS * 24];
         instance.render(&mut samples);
         let mut expected = std::vec![(PITCH, false)];
-        for voice in 0..VOICE_COUNT {
+        for voice in 0..voices as usize {
             expected.push((voice_pitch_parameter(voice), false));
-            expected.push((voice_group_parameter(voice), true));
+            expected.push((voice_midi_group_parameter(voice), true));
         }
         let mut initial_expected = expected.clone();
-        for voice in 0..VOICE_COUNT {
+        for voice in 0..voices as usize {
             initial_expected.push((voice_pan_parameter(voice), true));
         }
         GRAY_CALLS.with(|calls| assert_eq!(&*calls.borrow(), &initial_expected));
@@ -1951,16 +1981,19 @@ fn midi_grays_only_cv_controls_and_restores_them_without_resetting_values() {
 
 #[test]
 fn restored_midi_mode_grays_controls_on_first_audio_callback() {
-    let mut instance = Instance::with_active_voices(32, 10);
+    let mut instance = Instance::with_voices(32, 10);
     // Model a host restoring values before invoking any parameter notifications.
     instance.values[MIDI_CHANNEL] = 1;
     instance.render(&mut [0.0; LAST_BUS * 24]);
     GRAY_CALLS.with(|calls| {
         let calls = calls.borrow();
-        assert_eq!(calls.len(), 1 + VOICE_COUNT * 3);
-        assert!(calls
-            .iter()
-            .all(|&(p, gray)| gray == !(0..VOICE_COUNT).any(|v| p == voice_group_parameter(v))));
+        assert_eq!(calls.len(), 1 + 10 * 3);
+        assert!(
+            calls
+                .iter()
+                .all(|&(p, gray)| gray
+                    == !(0..MAX_VOICES).any(|v| p == voice_midi_group_parameter(v)))
+        );
         assert!(!calls.iter().any(|&(p, _)| p == FINE || p == LEVEL));
     });
 }
@@ -2007,7 +2040,7 @@ fn assert_cached_octave(instance: &Instance, voice: usize, expected: f32) {
 
 #[test]
 fn per_voice_tuning_applies_transpose_in_both_modes_but_midi_ignores_root_and_cv() {
-    let mut instance = Instance::with_active_voices(8, 2);
+    let mut instance = Instance::with_voices(8, 2);
     instance.change(PITCH, 69);
     instance.change(FINE, 25);
     instance.change(voice_fine_parameter(0), -25);
@@ -2040,7 +2073,7 @@ fn per_voice_tuning_applies_transpose_in_both_modes_but_midi_ignores_root_and_cv
 
 #[test]
 fn voice_prefixes_cover_only_voice_parameters_and_respect_small_buffers() {
-    let instance = Instance::with_active_voices(8, 10);
+    let instance = Instance::with_voices(8, 10);
     for parameter in [
         LEFT_OUTPUT as i32,
         OUTPUT_MODE as i32,
@@ -2080,7 +2113,7 @@ fn pot_push_resets_current_control_once_per_press_and_preserves_pickup() {
         for selected in [0, segments - 1] {
             for mode in 0..3 {
                 for pot in 0..3 {
-                    let mut instance = Instance::with_active_voices(segments, voices);
+                    let mut instance = Instance::with_voices(segments, voices);
                     instance.event([0.8; 3], [selected as i8, 0]);
                     for _ in 0..mode {
                         instance.click_right([0.8; 3]);
@@ -2154,12 +2187,12 @@ fn pot_resets_keep_midi_pitch_locked_and_fine_and_level_active() {
     instance.event_buttons([0.8; 3], [0, 0], 0, buttons);
     instance.change(MIDI_CHANNEL, 0);
     instance.event_buttons([0.8; 3], [0, 0], POT_BUTTON_L, 0);
-    assert_eq!(instance.values[PITCH], 57);
+    assert_eq!(instance.values[PITCH], 48);
 }
 
 #[test]
 fn midi_bend_reaches_audio_per_channel_combines_with_fine_and_reuses_pitch_cache() {
-    let mut instance = Instance::with_active_voices(8, 3);
+    let mut instance = Instance::with_voices(8, 3);
     instance.change(OUTPUT_MODE, 1);
     instance.change(MIDI_CHANNEL, 1);
     instance.change(FINE, 25);
@@ -2198,8 +2231,8 @@ fn midi_bend_reaches_audio_per_channel_combines_with_fine_and_reuses_pitch_cache
 
 #[test]
 fn normalized_add_mode_preserves_existing_bus_audio_exactly() {
-    let mut add = Instance::with_active_voices(8, 10);
-    let mut replace = Instance::with_active_voices(8, 10);
+    let mut add = Instance::with_voices(8, 10);
+    let mut replace = Instance::with_voices(8, 10);
     replace.change(OUTPUT_MODE, 1);
     for _ in 0..500 {
         let mut a = [0.0; LAST_BUS * 24];
@@ -2217,7 +2250,7 @@ fn normalized_add_mode_preserves_existing_bus_audio_exactly() {
 #[test]
 fn midi_to_cv_crossfades_without_a_step_or_full_pool_gain_burst() {
     for mode in [0, 1] {
-        let mut instance = Instance::with_active_voices(8, 10);
+        let mut instance = Instance::with_voices(8, 10);
         instance.change(OUTPUT_MODE, mode);
         for boundary in 0..8 {
             instance.change(boundary_parameter(boundary), 100);
@@ -2307,56 +2340,17 @@ fn decibel_level_metadata_display_reset_and_rendered_amplitude_match() {
 }
 
 #[test]
-fn inactive_cv_voices_fade_silent_and_skip_pitch_and_audio_work_until_reenabled() {
-    let mut instance = Instance::with_active_voices(8, 10);
-    instance.change(OUTPUT_MODE, 1);
-    for voice in 0..10 {
-        instance.change(voice_active_parameter(voice), 0);
-    }
-    let mut samples = [0.0; LAST_BUS * 24];
-    let initial_work = dsp::playback_work_counts();
-    for _ in 0..160 {
-        instance.render(&mut samples);
-        assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
-    }
-    assert_eq!(dsp::playback_work_counts(), initial_work);
-    let before = dsp::playback_work_counts();
-    for _ in 0..20 {
-        instance.render(&mut samples);
-    }
-    assert_eq!(dsp::playback_work_counts(), before);
-    assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
-    for voice in [1, 3, 5, 7, 9] {
-        instance.change(voice_active_parameter(voice), 1);
-    }
-    for _ in 0..160 {
-        instance.render(&mut samples);
-    }
-    let before = dsp::playback_work_counts();
-    instance.render(&mut samples);
-    assert_eq!(dsp::playback_work_counts().0 - before.0, 5 * 24);
-    assert!(samples[12 * 24..13 * 24].iter().any(|v| v.abs() > 0.01));
-    for voice in [1, 3, 5, 7, 9] {
-        instance.change(voice_active_parameter(voice), 0);
-    }
-    for _ in 0..20 {
-        instance.render(&mut samples);
-    }
-    let before = dsp::playback_work_counts();
-    instance.render(&mut samples);
-    assert_eq!(dsp::playback_work_counts(), before);
-    assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
-}
-
-#[test]
-fn active_parameter_masks_midi_allocation_before_audio_and_does_not_resume_old_keys() {
-    let mut instance = Instance::with_active_voices(8, 8);
+fn none_assignment_masks_midi_allocation_before_audio_and_does_not_resume_old_keys() {
+    let mut instance = Instance::with_voices(8, 10);
     instance.change(OUTPUT_MODE, 1);
     instance.change(MIDI_CHANNEL, 1);
-    for voice in 0..8 {
-        instance.change(voice_active_parameter(voice), (voice % 2) as i16);
+    for voice in 0..10 {
+        instance.change(
+            voice_midi_group_parameter(voice),
+            if voice % 2 == 1 { voice as i16 + 1 } else { 0 },
+        );
     }
-    for note in 60..64 {
+    for note in 60..65 {
         instance.midi(0x90, note, 100);
     }
     {
@@ -2365,8 +2359,8 @@ fn active_parameter_masks_midi_allocation_before_audio_and_does_not_resume_old_k
             assert_eq!(note.sounding(), voice % 2 == 1);
         }
     }
-    instance.midi(0x90, 72, 100); // Fifth note steals group 2, never an inactive voice.
-    instance.change(voice_active_parameter(1), 0);
+    instance.midi(0x90, 72, 100); // Sixth note steals group 2, never an inactive voice.
+    instance.change(voice_midi_group_parameter(1), 0);
     instance.midi(0x90, 74, 100); // Disable must apply even before the next step.
     {
         let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
@@ -2378,7 +2372,7 @@ fn active_parameter_masks_midi_allocation_before_audio_and_does_not_resume_old_k
     }
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
     assert!(!context.state().midi.groups[1].sounding());
-    instance.change(voice_active_parameter(1), 1);
+    instance.change(voice_midi_group_parameter(1), 2);
     instance.render(&mut samples);
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
     assert!(!context.state().midi.groups[1].sounding());
@@ -2386,8 +2380,8 @@ fn active_parameter_masks_midi_allocation_before_audio_and_does_not_resume_old_k
     instance.render(&mut samples);
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
     assert_eq!(context.state().midi.groups[1].pitch(), 76);
-    for voice in 0..8 {
-        instance.change(voice_active_parameter(voice), 0);
+    for voice in 0..10 {
+        instance.change(voice_midi_group_parameter(voice), 0);
     }
     for _ in 0..30 {
         instance.render(&mut samples);
@@ -2396,39 +2390,17 @@ fn active_parameter_masks_midi_allocation_before_audio_and_does_not_resume_old_k
 }
 
 #[test]
-fn inactive_voices_stay_silent_across_midi_cv_mode_changes() {
-    let mut instance = Instance::with_active_voices(8, 10);
-    instance.change(OUTPUT_MODE, 1);
-    for boundary in 0..8 {
-        instance.change(boundary_parameter(boundary), 100);
-    }
-    for voice in 0..10 {
-        instance.change(voice_active_parameter(voice), 0);
-    }
-    let mut samples = [0.0; LAST_BUS * 24];
-    for mode in [1, 0, 3, 0, 1, 0] {
-        instance.change(MIDI_CHANNEL, mode);
-        for _ in 0..160 {
-            instance.render(&mut samples);
-            assert!(samples[12 * 24..13 * 24].iter().all(|&v| v == 0.0));
-        }
-    }
-}
-
-#[test]
-fn segment_respecification_preserves_every_surviving_parameter_identity_and_value() {
-    assert_eq!(unsafe { factory() }.num_specifications, 1);
-    assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Segments");
-    for old_segments in 2..=32 {
-        let mut old = Instance::new(old_segments);
+fn voice_respecification_preserves_all_shared_waveform_and_surviving_voice_values() {
+    assert_eq!(Wavesmith::SPECIFICATIONS[0].name, c"Voices");
+    for old_voices in 1..=MAX_VOICES as i32 {
+        let mut old = Instance::with_specified_voices(old_voices);
         for (index, value) in old.values.iter_mut().enumerate() {
             let d = unsafe { &*(*old.base).parameters.add(index) };
             *value = d.min + (index % (d.max as i32 - d.min as i32 + 1) as usize) as i16;
         }
-        for new_segments in 2..=32 {
-            let mut new = Instance::new(new_segments);
+        for new_voices in 1..=MAX_VOICES as i32 {
+            let mut new = Instance::with_specified_voices(new_voices);
             let retained = old.values.len().min(new.values.len());
-            // Model the host's ordinal save/restore during respecification.
             new.values[..retained].copy_from_slice(&old.values[..retained]);
             for parameter in 0..retained {
                 let old_name =
@@ -2437,7 +2409,7 @@ fn segment_respecification_preserves_every_surviving_parameter_identity_and_valu
                     unsafe { CStr::from_ptr((*(*new.base).parameters.add(parameter)).name) };
                 assert_eq!(
                     old_name, new_name,
-                    "{old_segments} -> {new_segments}, ordinal {parameter}"
+                    "{old_voices}->{new_voices}, ordinal {parameter}"
                 );
                 assert_eq!(
                     parameter_prefix(&old, parameter as i32),
@@ -2445,9 +2417,12 @@ fn segment_respecification_preserves_every_surviving_parameter_identity_and_valu
                 );
                 assert_eq!(old.values[parameter], new.values[parameter]);
             }
-            assert_eq!(new.values.len(), WAVEFORM_START + new_segments as usize * 2);
-            for voice in 0..VOICE_COUNT {
-                assert!(voice_active_parameter(voice) < WAVEFORM_START);
+            assert_eq!(
+                new.values.len(),
+                VOICE_START + new_voices as usize * VOICE_PARAMETERS
+            );
+            for parameter in WAVEFORM_START..VOICE_START {
+                assert_eq!(old.values[parameter], new.values[parameter]);
             }
         }
     }
@@ -2456,8 +2431,8 @@ fn segment_respecification_preserves_every_surviving_parameter_identity_and_valu
 #[test]
 fn stereo_center_and_endpoints_match_mono_and_generate_each_voice_only_once() {
     for position in [0, 50, 100] {
-        let mut mono = Instance::with_active_voices(8, 5);
-        let mut stereo = Instance::with_active_voices(8, 5);
+        let mut mono = Instance::with_voices(8, 5);
+        let mut stereo = Instance::with_voices(8, 5);
         mono.change(OUTPUT_MODE, 1);
         stereo.change(OUTPUT_MODE, 1);
         stereo.change(RIGHT_OUTPUT, 14);
@@ -2503,8 +2478,8 @@ fn stereo_center_and_endpoints_match_mono_and_generate_each_voice_only_once() {
 fn right_only_and_duplicate_bus_routing_are_full_level_mono_and_ignore_stored_pan() {
     for (left, right) in [(0, 14), (14, 14)] {
         for mode in [0, 1] {
-            let mut reference = Instance::with_active_voices(8, 3);
-            let mut actual = Instance::with_active_voices(8, 3);
+            let mut reference = Instance::with_voices(8, 3);
+            let mut actual = Instance::with_voices(8, 3);
             reference.change(LEFT_OUTPUT, 14);
             reference.change(OUTPUT_MODE, mode);
             actual.change(LEFT_OUTPUT, left);
@@ -2547,7 +2522,7 @@ fn pan_graying_follows_distinct_output_buses_and_preserves_values() {
         assert_eq!(instance.values[voice_pan_parameter(0)], 17);
         GRAY_CALLS.with(|calls| {
             for &(p, _) in calls.borrow().iter() {
-                assert!((0..VOICE_COUNT).any(|v| p == voice_pan_parameter(v)));
+                assert!((0..MAX_VOICES).any(|v| p == voice_pan_parameter(v)));
             }
         });
     }
@@ -2555,8 +2530,8 @@ fn pan_graying_follows_distinct_output_buses_and_preserves_values() {
 
 #[test]
 fn stereo_snapshots_both_cv_inputs_before_writing_and_preserves_additive_audio() {
-    let mut add = Instance::with_active_voices(8, 2);
-    let mut replace = Instance::with_active_voices(8, 2);
+    let mut add = Instance::with_voices(8, 2);
+    let mut replace = Instance::with_voices(8, 2);
     for instance in [&mut add, &mut replace] {
         instance.change(PITCH, 69);
         instance.change(LEFT_OUTPUT, 1);
@@ -2589,7 +2564,7 @@ fn stereo_snapshots_both_cv_inputs_before_writing_and_preserves_additive_audio()
 
 #[test]
 fn right_only_midi_stays_playing_when_left_is_disabled_and_both_none_stop_work() {
-    let mut instance = Instance::with_active_voices(8, 2);
+    let mut instance = Instance::with_voices(8, 2);
     instance.change(OUTPUT_MODE, 1);
     instance.change(MIDI_CHANNEL, 1);
     instance.midi(0x90, 69, 100);
@@ -2618,6 +2593,7 @@ fn right_only_midi_stays_playing_when_left_is_disabled_and_both_none_stop_work()
 #[test]
 fn mono_right_to_stereo_preserves_output_continuity_and_centers_the_voice() {
     let mut instance = Instance::new(8);
+    instance.change(PITCH, 57); // Keep the continuity fixture independent of pitch defaults.
     instance.change(LEFT_OUTPUT, 0);
     instance.change(RIGHT_OUTPUT, 14);
     instance.change(OUTPUT_MODE, 1);
@@ -2659,8 +2635,8 @@ fn mono_right_to_stereo_preserves_output_continuity_and_centers_the_voice() {
 #[test]
 fn moving_only_right_stereo_bus_leaves_left_sample_exact_and_keeps_level_history() {
     for voices in [1, 5] {
-        let mut reference = Instance::with_active_voices(8, voices);
-        let mut moved = Instance::with_active_voices(8, voices);
+        let mut reference = Instance::with_voices(8, voices);
+        let mut moved = Instance::with_voices(8, voices);
         for instance in [&mut reference, &mut moved] {
             instance.change(OUTPUT_MODE, 1);
             instance.change(RIGHT_OUTPUT, 14);
@@ -2750,7 +2726,7 @@ fn render_cycle_meter_averages_complete_windows_without_overflow() {
 #[test]
 fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
     for (voices, frames) in [(1, 24), (10, 24), (10, 64)] {
-        let mut instance = Instance::with_active_voices(8, voices);
+        let mut instance = Instance::with_voices(8, voices);
         CYCLE_COUNTER.with(|counter| counter.set(u32::MAX - 50));
         let mut samples = std::vec![0.0; LAST_BUS * frames];
         for _ in 0..256 {
@@ -2826,7 +2802,7 @@ fn profiling_stream_is_opt_in_usb_only_and_preserves_instance_identity() {
 
 #[test]
 fn shared_cv_conversion_handles_detuning_distinct_inputs_rerouting_and_exact_jitter() {
-    let mut instance = Instance::with_active_voices(8, 10);
+    let mut instance = Instance::with_voices(8, 10);
     instance.change(PITCH, 69);
     for voice in 0..10 {
         instance.change(voice_pitch_parameter(voice), 1);
@@ -2857,7 +2833,6 @@ fn shared_cv_conversion_handles_detuning_distinct_inputs_rerouting_and_exact_jit
             + voice as f32 * 0.1;
         assert_cached_octave(&instance, voice, octave);
     }
-    instance.change(voice_active_parameter(0), 0);
     instance.change(voice_pitch_parameter(1), 10);
     instance.render(&mut samples);
     assert_cached_octave(&instance, 1, -4.0 / 12.0 - 40.0 / 1200.0 + 0.9);
@@ -2866,7 +2841,7 @@ fn shared_cv_conversion_handles_detuning_distinct_inputs_rerouting_and_exact_jit
 #[cfg(not(feature = "profiling"))]
 #[test]
 fn normal_build_preserves_help_without_cycle_reads_or_profiling_sysex() {
-    let mut instance = Instance::with_active_voices(8, 10);
+    let mut instance = Instance::with_voices(8, 10);
     assert!(unsafe { factory().midi_sysex.is_none() });
     CYCLE_COUNTER.with(|counter| counter.set(12345));
     SENT_SYSEX.with(|messages| messages.borrow_mut().clear());
@@ -2889,45 +2864,43 @@ fn normal_build_preserves_help_without_cycle_reads_or_profiling_sysex() {
 }
 
 #[test]
-fn grouped_layout_has_twenty_four_pages_and_eight_consecutive_three_voice_groups() {
-    assert_eq!(VOICE_COUNT, 24);
-    assert_eq!(midi::GROUP_COUNT, 8);
+fn grouped_layout_has_none_and_ten_individual_defaults_then_none() {
+    assert_eq!(MAX_VOICES, 24);
+    assert_eq!(midi::GROUP_COUNT, 10);
     for segments in [2, 8, 32] {
-        let instance = Instance::new(segments);
-        let config = Wavesmith::configuration(&[segments]).unwrap();
+        let instance = Instance::configured(segments, MAX_VOICES as i32);
+        let config = Wavesmith::configuration(&[MAX_VOICES as i32, segments]).unwrap();
         assert_eq!(config.pages, 28);
-        assert_eq!(config.parameters, 163 + segments as usize * 2);
+        assert_eq!(config.parameters, 203);
         assert!(config.parameters <= 256 && config.pages <= 31);
-        for voice in 0..VOICE_COUNT {
-            let group = voice_group_parameter(voice);
+        for voice in 0..MAX_VOICES {
+            let group = voice_midi_group_parameter(voice);
             let d = unsafe { &*(*instance.base).parameters.add(group) };
-            assert_eq!(unsafe { CStr::from_ptr(d.name) }, c"Voice Group");
+            assert_eq!(unsafe { CStr::from_ptr(d.name) }, c"MIDI Voice Group");
             assert_eq!(
                 (d.min, d.max, d.default, d.unit),
-                (1, 8, (voice / 3 + 1) as i16, UNIT_NONE)
-            );
-            assert_eq!(
-                instance.values[voice_active_parameter(voice)],
-                i16::from(voice == 0)
+                (0, 10, default_group_value(voice), UNIT_ENUM)
             );
             assert_eq!(
                 parameter_prefix(&instance, group as i32),
                 std::format!("V{}:", voice + 1)
             );
-            assert_eq!(instance.values[group], (voice / 3 + 1) as i16);
-            assert!(group < voice_active_parameter(voice));
+            assert_eq!(instance.values[group], default_group_value(voice));
         }
     }
 }
 
 #[test]
 fn unequal_groups_skip_empty_slots_and_share_notes_bend_and_release() {
-    let mut instance = Instance::with_active_voices(8, 7);
+    let mut instance = Instance::with_voices(8, 7);
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     instance.change(RIGHT_OUTPUT, 14);
     for voice in 0..7 {
-        instance.change(voice_group_parameter(voice), if voice < 5 { 1 } else { 4 });
+        instance.change(
+            voice_midi_group_parameter(voice),
+            if voice < 5 { 1 } else { 4 },
+        );
         instance.change(voice_transpose_parameter(voice), voice as i16 - 3);
         instance.change(voice_fine_parameter(voice), voice as i16 * 5 - 15);
         instance.change(voice_pan_parameter(voice), voice as i16 * 16);
@@ -2982,11 +2955,14 @@ fn unequal_groups_skip_empty_slots_and_share_notes_bend_and_release() {
 
 #[test]
 fn shared_group_gates_advance_once_even_with_five_and_two_members() {
-    let mut instance = Instance::with_active_voices(8, 7);
+    let mut instance = Instance::with_voices(8, 7);
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     for voice in 0..7 {
-        instance.change(voice_group_parameter(voice), if voice < 5 { 1 } else { 4 });
+        instance.change(
+            voice_midi_group_parameter(voice),
+            if voice < 5 { 1 } else { 4 },
+        );
     }
     let mut enabled = [false; midi::GROUP_COUNT];
     enabled[0] = true;
@@ -3040,11 +3016,11 @@ fn shared_group_gates_advance_once_even_with_five_and_two_members() {
 }
 
 #[test]
-fn live_group_reassignment_and_active_changes_leave_other_members_playing() {
-    let mut instance = Instance::with_active_voices(8, 3);
+fn live_group_reassignment_and_none_changes_leave_other_members_playing() {
+    let mut instance = Instance::with_voices(8, 3);
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
-    instance.change(voice_group_parameter(2), 1);
+    instance.change(voice_midi_group_parameter(2), 1);
     instance.midi(0x90, 60, 100);
     instance.midi(0x90, 67, 100);
     let mut samples = [0.0; LAST_BUS * 24];
@@ -3052,7 +3028,7 @@ fn live_group_reassignment_and_active_changes_leave_other_members_playing() {
         instance.render(&mut samples);
     }
     assert_cached_octave(&instance, 2, (60.0 - 69.0) / 12.0);
-    instance.change(voice_group_parameter(2), 2);
+    instance.change(voice_midi_group_parameter(2), 2);
     instance.render(&mut samples);
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
     assert_eq!(
@@ -3068,7 +3044,7 @@ fn live_group_reassignment_and_active_changes_leave_other_members_playing() {
     assert_eq!(context.state().midi.groups[0].pitch(), 60);
     assert_eq!(context.state().midi.groups[1].pitch(), 67);
     assert_cached_octave(&instance, 2, (67.0 - 69.0) / 12.0);
-    instance.change(voice_active_parameter(2), 0);
+    instance.change(voice_midi_group_parameter(2), 0);
     for _ in 0..50 {
         instance.render(&mut samples);
     }
@@ -3077,15 +3053,15 @@ fn live_group_reassignment_and_active_changes_leave_other_members_playing() {
     assert_eq!(dsp::oscillator_tick_count() - before, 2 * 24);
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
     assert!(context.state().midi.groups[1].sounding());
-    instance.change(voice_active_parameter(2), 1);
+    instance.change(voice_midi_group_parameter(2), 2);
     for _ in 0..50 {
         instance.render(&mut samples);
     }
     let before = dsp::oscillator_tick_count();
     instance.render(&mut samples);
     assert_eq!(dsp::oscillator_tick_count() - before, 3 * 24);
-    instance.change(voice_active_parameter(1), 0);
-    instance.change(voice_active_parameter(2), 0);
+    instance.change(voice_midi_group_parameter(1), 0);
+    instance.change(voice_midi_group_parameter(2), 0);
     instance.midi(0x90, 72, 100);
     for _ in 0..50 {
         instance.render(&mut samples);
@@ -3096,15 +3072,15 @@ fn live_group_reassignment_and_active_changes_leave_other_members_playing() {
 }
 
 #[test]
-fn twenty_four_voices_use_eight_midi_notes_and_steal_an_entire_oldest_group() {
-    let mut instance = Instance::with_active_voices(32, 24);
+fn twenty_four_voices_use_ten_midi_notes_and_steal_an_entire_oldest_group() {
+    let mut instance = Instance::with_voices(32, 24);
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     instance.change(RIGHT_OUTPUT, 14);
     for voice in 0..24 {
         instance.change(
-            voice_group_parameter(voice),
-            default_group(voice) as i16 + 1,
+            voice_midi_group_parameter(voice),
+            (voice % midi::GROUP_COUNT) as i16 + 1,
         );
         instance.change(voice_fine_parameter(voice), voice as i16 * 4 - 46);
         instance.change(
@@ -3112,7 +3088,7 @@ fn twenty_four_voices_use_eight_midi_notes_and_steal_an_entire_oldest_group() {
             if voice % 2 == 0 { 0 } else { 100 },
         );
     }
-    for note in 60..68 {
+    for note in 60..70 {
         instance.midi(0x90, note, 100);
     }
     let mut samples = [0.0; LAST_BUS * 24];
@@ -3128,7 +3104,7 @@ fn twenty_four_voices_use_eight_midi_notes_and_steal_an_entire_oldest_group() {
         instance.render(&mut samples);
     }
     for voice in 0..24 {
-        let group = voice / 3;
+        let group = voice % midi::GROUP_COUNT;
         let note = if group == 0 { 72 } else { 60 + group };
         assert_cached_octave(
             &instance,
@@ -3146,12 +3122,12 @@ fn twenty_four_voices_use_eight_midi_notes_and_steal_an_entire_oldest_group() {
 
 #[test]
 fn group_parameter_does_not_change_cv_audio_and_only_active_groups_allocate() {
-    let mut a = Instance::with_active_voices(8, 24);
-    let mut b = Instance::with_active_voices(8, 24);
+    let mut a = Instance::with_voices(8, 24);
+    let mut b = Instance::with_voices(8, 24);
     a.change(OUTPUT_MODE, 1);
     b.change(OUTPUT_MODE, 1);
     for voice in 0..24 {
-        b.change(voice_group_parameter(voice), 8 - (voice % 8) as i16);
+        b.change(voice_midi_group_parameter(voice), 10 - (voice % 10) as i16);
     }
     let mut x = [0.0; LAST_BUS * 24];
     let mut y = x;
@@ -3160,7 +3136,10 @@ fn group_parameter_does_not_change_cv_audio_and_only_active_groups_allocate() {
         b.render(&mut y);
         assert_eq!(x, y);
     }
-    let mut instance = Instance::with_active_voices(8, 0);
+    let mut instance = Instance::configured(8, 24);
+    for voice in 0..24 {
+        instance.change(voice_midi_group_parameter(voice), 0);
+    }
     instance.change(MIDI_CHANNEL, 1);
     instance.change(OUTPUT_MODE, 1);
     instance.midi(0x90, 60, 100);
@@ -3168,8 +3147,7 @@ fn group_parameter_does_not_change_cv_audio_and_only_active_groups_allocate() {
     instance.render(&mut samples);
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
     assert!(context.state().midi.groups.iter().all(|g| !g.sounding()));
-    instance.change(voice_group_parameter(23), 8);
-    instance.change(voice_active_parameter(23), 1);
+    instance.change(voice_midi_group_parameter(23), 10);
     instance.midi(0x90, 67, 100);
     for _ in 0..300 {
         instance.render(&mut samples);
@@ -3181,9 +3159,355 @@ fn group_parameter_does_not_change_cv_audio_and_only_active_groups_allocate() {
         .groups
         .iter()
         .enumerate()
-        .all(|(g, n)| n.sounding() == (g == 7)));
+        .all(|(g, n)| n.sounding() == (g == 9)));
     assert_cached_octave(&instance, 23, (67.0 - 69.0) / 12.0);
     let before = dsp::oscillator_tick_count();
     instance.render(&mut samples);
     assert_eq!(dsp::oscillator_tick_count() - before, 24);
+}
+
+#[test]
+fn voices_specification_creates_only_requested_parameters_pages_and_processing_slots() {
+    let spec = &Wavesmith::SPECIFICATIONS[0];
+    assert_eq!(
+        (spec.name, spec.min, spec.max, spec.default),
+        (c"Voices" as &CStr, 1, 24, 1)
+    );
+    for voices in 1..=MAX_VOICES {
+        let mut instance = Instance::with_specified_voices(voices as i32);
+        let config = Wavesmith::configuration(&[voices as i32, 8]).unwrap();
+        assert_eq!(
+            (config.parameters, config.pages),
+            (83 + voices * 5, 4 + voices)
+        );
+        assert_eq!(instance.values.len(), config.parameters);
+        assert_eq!(Wavesmith::SPECIFICATIONS[1].name, c"Segments");
+        assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 8);
+        let mut samples = [0.0; LAST_BUS * 24];
+        GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
+        for _ in 0..200 {
+            instance.render(&mut samples);
+        }
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert_eq!(context.state().voices, voices);
+        assert!(context.state().grayed_for_midi.is_some());
+        assert!(context.state().grayed_for_stereo.is_some());
+        assert!(context.state().waveform_grayed);
+        GRAY_CALLS
+            .with(|calls| assert!(calls.borrow().iter().all(|&(p, _)| p < config.parameters)));
+        GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices * 24);
+        GRAY_CALLS.with(|calls| assert!(calls.borrow().is_empty()));
+        assert!(samples[12 * 24..13 * 24].iter().any(|x| x.abs() > 0.01));
+        assert_eq!(
+            parameter_prefix(&instance, voice_pitch_parameter(voices) as i32),
+            ""
+        );
+        instance.change(MIDI_CHANNEL, 1);
+        for voice in 0..voices {
+            instance.change(
+                voice_midi_group_parameter(voice),
+                (voice % midi::GROUP_COUNT + 1) as i16,
+            );
+        }
+        for group in 0..voices.min(midi::GROUP_COUNT) {
+            instance.midi(0x90, 60 + group as u8, 100);
+        }
+        for _ in 0..200 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices * 24);
+        for voice in 0..voices {
+            assert_cached_octave(
+                &instance,
+                voice,
+                (60.0 + (voice % midi::GROUP_COUNT) as f32 - 69.0) / 12.0,
+            );
+        }
+        instance.midi(0xb0, 120, 0);
+        instance.render(&mut samples);
+        // Add mode preserves previous bus samples, so verify no oscillator work.
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+    }
+    for invalid in [-1, 0, 25, 32] {
+        assert!(Wavesmith::configuration(&[invalid, 8]).is_none());
+    }
+}
+
+#[test]
+fn segment_specification_hides_unused_rows_but_keeps_them_allocated_and_grayed() {
+    for segments in 2..=32 {
+        for voices in [1, 3, 24] {
+            let mut instance = Instance::configured(segments, voices);
+            let config = Wavesmith::configuration(&[voices, segments]).unwrap();
+            assert_eq!(config.parameters, 83 + voices as usize * 5);
+            assert_eq!(
+                config.page_indices,
+                GLOBALS + voices as usize * 5 + segments as usize * 2 + 1
+            );
+            let pages = unsafe { &*(*instance.base).parameter_pages };
+            let waveform = unsafe { &*(*pages).pages.add(voices as usize + 3) };
+            let rows = unsafe {
+                core::slice::from_raw_parts(waveform.params, waveform.num_params as usize)
+            };
+            assert_eq!(rows.len(), 2 * segments as usize + 1);
+            assert_eq!(rows.last().copied(), Some(WAVEFORM_START as u8));
+            for i in 0..32 {
+                assert_eq!(
+                    rows.contains(&(curve_parameter(i) as u8)),
+                    i < segments as usize
+                );
+                assert_eq!(
+                    rows.contains(&(boundary_parameter(i) as u8)),
+                    i < segments as usize
+                );
+                let curve = unsafe { &*(*instance.base).parameters.add(curve_parameter(i)) };
+                assert!(
+                    !curve.name.is_null(),
+                    "hidden slots still need valid metadata"
+                );
+            }
+            unsafe { Callback::<Audio>::from_raw(instance.base) }
+                .state_mut()
+                .waveform_grayed = false;
+            GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
+            instance.render(&mut [0.0; LAST_BUS * 24]);
+            GRAY_CALLS.with(|calls| {
+                let calls = calls.borrow();
+                for i in 0..32 {
+                    assert!(calls.contains(&(curve_parameter(i), i >= segments as usize)));
+                    assert!(calls.contains(&(boundary_parameter(i), i >= segments as usize)));
+                }
+            });
+            GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
+            instance.render(&mut [0.0; LAST_BUS * 24]);
+            GRAY_CALLS.with(|calls| assert!(calls.borrow().is_empty()));
+        }
+    }
+}
+
+#[test]
+fn both_specifications_preserve_all_surviving_ordinals_values_and_waveform_tail() {
+    for old_segments in 2..=32 {
+        let mut old = Instance::configured(old_segments, 3);
+        for (i, value) in old.values.iter_mut().enumerate() {
+            let d = unsafe { &*(*old.base).parameters.add(i) };
+            *value = d.min + (i % (d.max as i32 - d.min as i32 + 1) as usize) as i16;
+        }
+        for new_segments in 2..=32 {
+            for voices in [1, 3, 24] {
+                let mut new = Instance::configured(new_segments, voices);
+                let retained = old.values.len().min(new.values.len());
+                new.values[..retained].copy_from_slice(&old.values[..retained]);
+                for i in 0..retained {
+                    let a = unsafe { CStr::from_ptr((*(*old.base).parameters.add(i)).name) };
+                    let b = unsafe { CStr::from_ptr((*(*new.base).parameters.add(i)).name) };
+                    assert_eq!(
+                        a, b,
+                        "segments {old_segments}->{new_segments}, voices {voices}, parameter {i}"
+                    );
+                    assert_eq!(
+                        parameter_prefix(&old, i as i32),
+                        parameter_prefix(&new, i as i32)
+                    );
+                    assert_eq!(old.values[i], new.values[i]);
+                }
+                assert_eq!(
+                    &old.values[WAVEFORM_START..VOICE_START],
+                    &new.values[WAVEFORM_START..VOICE_START]
+                );
+                let wave = read_wave(new_segments as usize, |p| new.values.get(p).copied());
+                assert_eq!(
+                    wave.segment_sample(new_segments as usize - 1, 1.0),
+                    wave.segment_sample(0, 0.0)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_wave_parameters_do_not_change_audio_and_return_after_respecification() {
+    let mut a = Instance::configured(2, 1);
+    let mut b = Instance::configured(2, 1);
+    a.change(OUTPUT_MODE, 1);
+    b.change(OUTPUT_MODE, 1);
+    let mut x = [0.0; LAST_BUS * 24];
+    let mut y = x;
+    for _ in 0..300 {
+        a.render(&mut x);
+        b.render(&mut y);
+        assert_eq!(x, y);
+    }
+    a.change(boundary_parameter(31), -90);
+    a.change(curve_parameter(31), 85);
+    for _ in 0..200 {
+        a.render(&mut x);
+        b.render(&mut y);
+        assert_eq!(x, y);
+    }
+    let mut expanded = Instance::configured(32, 1);
+    expanded.values.copy_from_slice(&a.values);
+    let wave = read_wave(32, |p| expanded.values.get(p).copied());
+    assert_eq!(wave.boundaries[31], -90);
+    assert_eq!(wave.curves[31], 85);
+    for _ in 0..300 {
+        expanded.render(&mut x);
+    }
+    assert!(x.iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn both_specification_ranges_are_validated_and_no_segments_parameter_remains() {
+    assert_eq!(Wavesmith::SPECIFICATIONS.len(), 2);
+    let a = &Wavesmith::SPECIFICATIONS[0];
+    let b = &Wavesmith::SPECIFICATIONS[1];
+    assert_eq!(
+        (a.name, a.min, a.max, a.default),
+        (c"Voices" as &CStr, 1, 24, 1)
+    );
+    assert_eq!(
+        (b.name, b.min, b.max, b.default),
+        (c"Segments" as &CStr, 2, 32, 8)
+    );
+    for invalid in [
+        std::vec![],
+        std::vec![1],
+        std::vec![0, 8],
+        std::vec![25, 8],
+        std::vec![1, 1],
+        std::vec![1, 33],
+    ] {
+        assert!(Wavesmith::configuration(&invalid).is_none());
+    }
+    let instance = Instance::with_specified_voices(1);
+    for i in 0..instance.values.len() {
+        assert_ne!(
+            unsafe { CStr::from_ptr((*(*instance.base).parameters.add(i)).name) },
+            c"Segments"
+        );
+    }
+}
+
+#[test]
+fn none_groups_do_not_mute_any_specified_cv_voices_but_disable_midi_allocation() {
+    for voices in [1, 10, 24] {
+        let mut instance = Instance::configured(8, voices);
+        for voice in 0..voices as usize {
+            instance.change(voice_midi_group_parameter(voice), 0);
+        }
+        let mut samples = [0.0; LAST_BUS * 24];
+        for _ in 0..200 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices as usize * 24);
+        instance.change(MIDI_CHANNEL, 1);
+        for note in 60..72 {
+            instance.midi(0x90, note, 100);
+        }
+        for _ in 0..200 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count(), before);
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert!(context
+            .state()
+            .midi
+            .groups
+            .iter()
+            .all(|group| !group.sounding()));
+        instance.change(MIDI_CHANNEL, 0);
+        for _ in 0..200 {
+            instance.render(&mut samples);
+        }
+        let before = dsp::oscillator_tick_count();
+        instance.render(&mut samples);
+        assert_eq!(dsp::oscillator_tick_count() - before, voices as usize * 24);
+        instance.assert_guard();
+    }
+}
+
+#[test]
+fn factory_defaults_allocate_ten_notes_and_later_voices_join_only_when_assigned() {
+    let mut instance = Instance::configured(8, 24);
+    for voice in 0..24 {
+        assert_eq!(
+            instance.values[voice_midi_group_parameter(voice)],
+            if voice < 10 { voice as i16 + 1 } else { 0 }
+        );
+    }
+    instance.change(MIDI_CHANNEL, 1);
+    for note in 60..70 {
+        instance.midi(0x90, note, 100);
+    }
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 10 * 24);
+    instance.change(voice_midi_group_parameter(10), 10);
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 11 * 24);
+    assert_cached_octave(&instance, 10, 0.0); // Group 10 holds A4 (69).
+    instance.change(voice_midi_group_parameter(10), 0);
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    let before = dsp::oscillator_tick_count();
+    instance.render(&mut samples);
+    assert_eq!(dsp::oscillator_tick_count() - before, 10 * 24);
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    assert_eq!(context.state().voice_gains[10], 0.0);
+    assert_eq!(context.state().voice_groups[10], midi::NO_GROUP);
+    instance.assert_guard();
+}
+
+#[test]
+fn midi_tuning_setup_only_runs_for_sounding_voices_including_release_tails() {
+    let mut instance = Instance::configured(8, 24);
+    instance.change(MIDI_CHANNEL, 1);
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    MIDI_TUNING_READS.with(|reads| reads.set(0));
+    instance.render(&mut samples);
+    MIDI_TUNING_READS.with(|reads| assert_eq!(reads.get(), 0));
+    instance.midi(0x90, 60, 100);
+    instance.render(&mut samples);
+    MIDI_TUNING_READS.with(|reads| assert_eq!(reads.get(), 1));
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    instance.change(voice_transpose_parameter(0), 12);
+    instance.change(voice_fine_parameter(0), 25);
+    instance.render(&mut samples);
+    assert_cached_octave(&instance, 0, (60.0 - 69.0 + 12.0) / 12.0 + 25.0 / 1200.0);
+    instance.midi(0x80, 60, 0);
+    MIDI_TUNING_READS.with(|reads| reads.set(0));
+    instance.render(&mut samples);
+    MIDI_TUNING_READS.with(|reads| assert_eq!(reads.get(), 1));
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    MIDI_TUNING_READS.with(|reads| reads.set(0));
+    instance.render(&mut samples);
+    MIDI_TUNING_READS.with(|reads| assert_eq!(reads.get(), 0));
+    instance.assert_guard();
 }

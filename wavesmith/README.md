@@ -1,13 +1,15 @@
 # Wavesmith prototype
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
-The only setup specification is Segments (2–32, default 8). Every instance
-provides 24 independent oscillator voices; only Voice 1 defaults to Active On.
-In MIDI mode, Voice Group assigns each oscillator to one of eight note groups.
-Every instance uses six 256-sample anti-alias tables per bank. Configured voices
-share the same waveform and table banks. Shape edits work while audio plays.
-Use the NT's respecification workflow to change the segment count; use each
-voice's Active parameter to change polyphony at any time.
+Two setup specifications select Voices (1–24, default 1) and Segments (2–32,
+default 8), in that order. Only requested voice pages/parameters are created;
+All specified voices play in CV mode. All 32 boundaries and
+32 curves always exist at fixed ordinals, but the Waveform page lists only the
+selected segments. Unused waveform fields are marked gray in case another host
+view (such as a CV mapping selector) shows them. Their stored values survive
+respecification. Every instance uses six shared 256-sample anti-alias tables per
+bank. Shape edits rebuild/crossfade while audio continues playing. Respecify to
+change either count. MIDI Voice Group controls which voices participate in MIDI mode.
 
 ## Controls
 
@@ -28,7 +30,7 @@ voice's Active parameter to change polyphony at any time.
 - Warp mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
   (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
   and Pitch remain available on parameter pages.
-- Tuning mode: left pot edits Pitch (MIDI note 0–127), centre pot edits Fine tune
+- Tuning mode: left pot edits Pitch (MIDI note 0–127, default C3/48), centre pot edits Fine tune
   (−100 to +100 cents), right pot edits Level (−60 to 0 dB, default −6 dB).
   The bottom position is displayed as −inf and mutes the output. The top row displays
   these three values instead of the warp controls. Pitch is displayed as a note
@@ -167,30 +169,30 @@ held sample; centered stereo settles at -3 dB per side. Existing pan settings ar
 retained and restored when stereo becomes available again. Live routing edits do
 not restart RMS or peak protection; reconnecting after silence still acquires
 startup attenuation.
-Every instance has Voice 1 through Voice 24 pages, containing Pitch CV,
-Transpose, Fine tune, Pan, Voice Group, and Active in that order. Parameter names
+The Voices specification creates Voice 1 through the requested voice count, containing Pitch CV,
+Transpose, Fine tune, Pan, and MIDI Voice Group in that order. Parameter names
 are shared; the API's parameter UI prefix identifies V1: through V24:. All voice
 pages share a navigation group, so moving between pages retains the selected row.
+Every voice defaults to Input 1 for Pitch CV.
 Transpose ranges from -48 to +48 semitones and Fine tune from -100 to +100 cents;
 both default to zero and apply in CV and MIDI modes. Each Pan is independent,
 with centered defaults and the shared stereo/mono behavior described above.
-Active is an Off/On enum, always last, with only Voice 1 initially On.
+MIDI Voice Group offers None and Groups 1–10. Voices 1–10 default to Groups
+1–10 respectively; Voices 11–24 default to None. In CV mode this parameter is
+grayed out and has no effect: every specified oscillator uses its own Pitch CV
+and tuning. In MIDI mode only assigned groups are allocated notes, and all their
+members follow the group's note, bend and gate while retaining independent
+transpose, fine tune and pan. For example, five members in Group 1 and two in
+Group 2 give two-note polyphony with different stack sizes. Empty groups are
+skipped. Voices assigned None do not play in MIDI mode.
 
-Voice Group ranges from 1 to 8. Defaults assign consecutive sets of three:
-Voices 1–3 to Group 1, Voices 4–6 to Group 2, through Voices 22–24 to Group 8. In CV mode it is grayed out and has no effect: every active oscillator
-uses its own Pitch CV and tuning. In MIDI mode groups containing active voices
-are allocated notes, and all active members follow their group's note, bend and
-gate while retaining independent transpose, fine tune and pan. For example,
-five members in Group 1 and two in Group 2 give two-note polyphony with different
-stack sizes. Empty/inactive groups are skipped. No fixed sub-oscillators remain.
-
-Turning off one oscillator fades it out without releasing other members of its
-MIDI group. Disabling the final member releases that group's held note and
-excludes it from allocation. Enabling a member of a sounding group fades it into
+Assigning None fades that oscillator out without releasing other members of its
+MIDI group. Removing the final member releases that group's held note and
+excludes it from allocation. Assigning a voice to a sounding group fades it into
 the existing note. Moving between held groups first fades out the old binding,
 then adopts the latest destination and fades in; other members continue playing.
-The short fades take approximately 5 ms each. Once silent, inactive oscillators
-skip CV reads, pitch conversion and rendering. Output routing remains shared.
+The short fades take approximately 5 ms each. Once silent, unassigned MIDI
+oscillators skip pitch conversion and rendering. Output routing remains shared.
 Waveform tables, rebuilding and FFT work are shared across all 24 oscillators.
 
 When Left Output and Right Output are both None, Wavesmith disables all voice
@@ -249,21 +251,22 @@ the destination bus. Each voice has its own phase, pitch/gain slew and anti-alia
 selection. Persistent frequency caches and steady playback remain active.
 The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
 more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
-reserve 24 oscillator states and eight MIDI note-group slots; only active oscillators
+reserve 24 oscillator states and ten MIDI note-group slots; only sounding oscillators
 and short fading tails are processed.
-All 24 voice pages and their parameters are always present.
+Only configured voice pages and parameters exist; increasing Voices appends new
+voice controls, and decreasing it removes the trailing voice controls.
 
 MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
-or a channel number to control every enabled voice with MIDI instead. In MIDI
+or a channel number to control assigned voices with MIDI instead. In MIDI
 mode, Pitch CV inputs and manual Pitch are ignored. Per-voice Transpose, shared
 Fine tune, per-voice Fine tune, and Level still apply. The ignored parameters are
 grayed out through the NT API while MIDI is enabled and restored when MIDI is
 Off, without changing their stored values. In the custom Tuning view, Pitch is
 dim and its pot is inactive in MIDI mode; Fine and Level remain editable.
-Voice Group is enabled only in MIDI mode. There are eight note slots; available
-polyphony is the number of distinct groups with active members (at most eight),
-not the number of active oscillators. Unassigned groups and their oscillators
-remain silent, and all release tails finish when no keys remain held.
+MIDI Voice Group is enabled only in MIDI mode. There are ten note slots; available
+polyphony is the number of distinct assigned groups (at most ten), rather than
+the number of oscillators. Unassigned groups and their oscillators remain silent,
+and all release tails finish when no keys remain held.
 
 Note On uses an idle group first, then a releasing group, then steals the oldest
 held group's note. Repeated Note On for an already-held key retriggers that group.
@@ -279,18 +282,31 @@ Velocity does not change loudness. Sustain and aftertouch are not handled. All N
 immediately. Changing MIDI Channel clears held notes, as does setting both outputs to None. MIDI allocation adds only small voice states, without extra waveform
 tables or FFT work.
 
-With N segments there are N level parameters named Boundary 00, Boundary 01,
-etc., and N independently named Curve parameters. One Waveform page lists them
-in waveform order: Boundary 00, Curve 01, Boundary 01, Curve 02, Boundary 02,
-and so on, ending with Curve N and Boundary 00. Each interior boundary appears
-once and is still shared by its neighboring segments in the custom editor.
-One editable parameter supplies both endpoint rows. There are four shared
-pages (Oscillator, Output, Shape, Waveform) plus 24 voice pages and the NT's
-own Common page. The plugin always has 28 pages, (29 including Common), independently of segment count. This avoids the firmware's page-count issue at
-high segment counts.
-All numeric shape parameters are host-visible;
-dedicated segment modulation routing is deferred. Ordinary parameter values are
-stored by the NT host with the preset; editor selection is temporary.
+With N specified segments, the Waveform page lists Boundary 00, Curve 01,
+Boundary 01, Curve 02, through Curve N and Boundary 00. The shared seam is shown
+twice; each active interior boundary appears once. The last segment returns to
+Boundary 00 in both the parameter page and custom editor.
+
+All 32 boundary and 32 curve parameter definitions remain allocated. Boundaries
+00..N-1 and Curves 01..N are enabled; later slots are grayed out and omitted from
+the Waveform page. Hiding rows does not remove those slots from the algorithm's
+parameter list, so other host views may still show their names. Unused values
+are saved by ordinal just like active ones. Shrinking and expanding Segments via
+respecification preserves those edits, as well as surviving voice controls.
+Randomize/preset/zero-curve actions operate on active segments only. Fresh
+instances default to a triangle-like shape for their chosen segment count, with
+unused boundaries and all curves initially zero.
+
+Segment count stays fixed for each instance. Editor selection and cached
+boundary-analysis weights start from that specification; there is no live
+Segments parameter or modulation target. Gray flags are set once per instance,
+including for omitted waveform parameters. Normal waveform edits retain staged
+rebuilding and the shared audio crossfade.
+
+Four shared pages (Oscillator, Output, Shape, Waveform) plus N configured voice
+pages give 5..28 plugin pages, or 6..29 including firmware Common. Page order
+remains Oscillator, Output, Shape, voices, Waveform. Underlying parameter order
+is fixed shared controls, fixed waveform controls, then the variable voice tail.
 
 ## Rendering
 
@@ -456,23 +472,26 @@ contribution ceiling. Asymmetric waves can have DC offset.
 
 ## Build and test
 
-**Grouped-voice prototype:** add a fresh Wavesmith instance after upgrading
-from the three-oscillator stack checkpoint. Parameter ordinals have changed;
-existing instances, presets and mappings are not migrated automatically. The
-new layout stays stable when respecifying Segments, and Active remains last.
+**Two-specification prototype:** add a fresh instance after upgrading from
+the live-Segments variant. Voices is the first specification (1..24/default 1);
+Segments is second (2..32/default 8). The former live parameter is removed, so
+parameter ordinals changed once. Earlier instances, presets and mappings are
+not migrated automatically. Removing Active also changes the per-voice stride
+from six parameters to five; add a fresh instance when testing this build.
 
-The audio bank is fixed at six tables, with 24 oscillators and eight MIDI groups.
-Only Voice 1 is active by default. Segments is the only specification.
-The page order is Oscillator, Output, Shape, Voice 1 through Voice 24, Waveform.
-Underlying parameter ordinals now follow that same order: 19 shared controls,
-six parameters for each of 24 voices, then interleaved boundary/curve values.
-Boundary 00 is one shared seam parameter shown again at the end of Waveform.
+There are 19 shared controls, then 64 fixed waveform controls, followed by five
+parameters per configured voice. Waveform ordinals start at 19; voices start at
+83. Totals are 83 + 5 * Voices (88..203 parameters), independent of Segments.
+Changing either specification preserves all shared/waveform ordinals and all
+surviving voice ordinals. Removed voice settings are discarded by the host;
+appended voices receive their defaults. Inactive waveform settings remain
+allocated and stored even while omitted from the parameter page.
 
-This revision changes parameter ordinals. Recreate earlier instances/presets and
-review CV-to-parameter mappings; old ordinal-based values/mappings are not
-migrated automatically. Changing segment count now preserves the indices of
-shared controls, voices, and remaining waveform controls. The fixed voice pool
-means segment respecification cannot shift the waveform block's starting ordinal.
+Six-table banks and waveform work buffers remain shared. Small oscillator, pan
+and input-cache arrays retain their preallocated 24-slot capacity. Voices limits
+parameter/page allocation and processing loops; the fixed DSP reserve remains.
+Page-index allocation follows only visible rows. Initialization uses the safe
+in-place array initializer, with no whole-state constructor temporary.
 
 From the repository's devcontainer:
 
@@ -494,20 +513,9 @@ procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
 and CPU load still need validation on a Disting NT. Preset libraries,
 independent segment-width editing, and per-boundary smoothing are deferred.
 
-There is no Voices specification. The 163 fixed shared/voice parameters precede
-all waveform boundaries and curves, which are appended as interleaved pairs.
-The total is 163 + 2 * Segments (167–227 parameters). Changing Segments preserves
-the identities and ordinals of all surviving controls. Removed segment values
-are discarded by the host; newly added segments receive their defaults.
-This is a one-time specification/layout change from older builds: review existing
-presets and CV mappings, especially instances from the fixed-stack layout.
-
-Stereo adds Right Output and one Pan control per voice. This shifts later
-parameter ordinals once; review presets and CV mappings created with earlier
-builds. Once using this layout, changing Segments still preserves all surviving
-parameter identities and ordinals. The waveform tables and FFT work are shared
-between channels; stereo adds small preallocated pan caches, a right mix buffer,
-and a second transition state rather than another oscillator bank.
+Both outputs continue to share the same oscillator bank and linked level
+controller. Stereo uses independent configured-voice pans; the waveform/FFT
+storage is shared rather than duplicated per channel or per voice.
 
 ### Optional profiling build
 

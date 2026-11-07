@@ -14,7 +14,7 @@ fn allocation_steals_oldest_and_old_note_off_cannot_release_its_replacement() {
     let mut midi = MidiState::new(48000);
     midi.set_channel(1);
     let enabled = [true; GROUP_COUNT];
-    for note in [60, 64, 67, 71, 72, 73, 75, 77] {
+    for note in [60, 64, 67, 71, 72, 73, 75, 77, 80, 83] {
         midi.message(0x90, note, 100, &enabled);
     }
     run_gate(&mut midi, 250);

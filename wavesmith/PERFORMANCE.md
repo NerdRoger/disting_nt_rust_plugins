@@ -884,3 +884,110 @@ spread test pools used for independent-note regressions, and cover full eight-
 note allocation/stealing with all 24 oscillators. After device testing, the user
 preferred this eight-group variant and approved checkpointing it on the
 experiment branch; the original fixed-stack checkpoint remains available.
+
+
+## Live Segments parameter and variable Voices specification
+
+Segments is now an Oscillator-page parameter, 2..32/default 8; Voices is the only
+specification, 1..24/default 1. All 32 boundaries and curves are always present,
+with inactive fields grayed and preserved. The fixed parameter prefix is now
+20 shared controls plus 64 waveform controls; six parameters per configured
+voice append from ordinal 84. Counts are 90..228 parameters and 5..28 plugin
+pages, independent of Segments. Voice respecification preserves every shared,
+waveform and surviving-voice identity. Existing presets need fresh instances
+because both specification semantics and ordinals changed.
+
+Segment changes synchronize editor selection/pickup and update only changed
+gray states after initial setup. Requests use the existing staged rebuild and
+crossfade, while inactive values do not affect the requested waveform. Cached
+boundary-analysis weights are refreshed for a rebuild's current segment count.
+Triggers operate on active segments only. Initial eight-segment defaults remain
+the triangle-like shape; dormant boundary defaults and all curves are zero.
+
+The specification limits parameter/page allocation, CV reads, pitch preparation,
+rendering, pan updates and graying loops to configured voices. Instance DSP
+arrays retain their fixed 24-slot reserve rather than reallocating on edits.
+The six-table bank and FFT buffers are unchanged. Normal ARM State is 4,380
+bytes (+12 versus the preceding 4,368); ITC is 24,794 versus 24,140 (+654), cold
+code 3,572 versus 3,644 (-72), and rodata 1,807 versus 1,799 (+8). Local stack
+reservations remain 928 bytes for construction and 1,008 for the callback,
+excluding saved registers/callees. No hardware CPU gain is claimed.
+
+131 normal/debug-and-optimized and 134 profiling tests pass, along with the full
+repository suite and both ARM relocation checks. New coverage exercises every
+voice specification in CV and MIDI modes, all voice-respecification pairs,
+fixed metadata and parameter limits, incremental graying, stored inactive edits,
+editor/pickup changes, restoration without parameter callbacks, and repeated
+live segment modulation during CV/MIDI playback. Reused smoothed/warped builds
+match freshly constructed engines exactly in all audio and preview tables after
+changing counts through 32, 2, 31, 3 and 8. Changes remain uncommitted for testing.
+
+
+## Two specifications with a fixed waveform parameter block
+
+This follow-up supersedes the uncommitted live-Segments variant above. Voices
+is specification 1 (1..24/default 1); Segments is specification 2 (2..32/default
+8). All 32 boundary and curve slots remain allocated at fixed ordinals, but only
+active rows appear on Waveform, including the shared seam at the end. Hidden
+slots are still marked gray once per instance in case another host view shows
+them, and remain stored for respecification. The live Segments parameter, UI
+synchronization and incremental count-update path have been removed.
+
+The fixed prefix is 19 shared controls plus 64 waveform controls; voices append
+from ordinal 83, for 89..227 total parameters. Page count is still 4+Voices;
+page-index storage now follows visible rows only: 19 + 6*Voices + 2*Segments + 1.
+Fresh defaults describe a triangle-like wave for the chosen segment count, with
+inactive slots initialized to zero. Old stored values override those defaults
+on respecification. Earlier parameter layouts need fresh instances.
+
+130 normal/debug-and-optimized and 133 profiling tests pass, plus the complete
+repository suite and both ARM relocation checks. Added coverage checks visible
+rows and hidden definitions/graying for every segment count, retained values
+and identities across both specifications, and unchanged audio after hidden-slot
+edits. The abandoned live-count-only UI/DSP regression was removed; the main
+DSP numerical regression suite remains intact.
+
+Relative to the live variant, normal ITC is 24,678 vs 24,794 bytes (-116), cold
+code 3,772 vs 3,572 (+200), rodata 1,806 vs 1,807 (-1), and State 4,376 vs 4,380
+(-4). Local stack reservations are 936 bytes for construction and 1,008 for the
+callback, excluding saved registers/callees. Waveform buffers and the fixed
+24-slot DSP reserve are unchanged. No hardware CPU improvement is claimed.
+All changes remain uncommitted for device review.
+
+
+## MIDI groups with None and continuous configured CV voices
+
+Removed the per-voice Active parameter. Every specified voice now plays in CV
+mode, regardless of its MIDI group. The final voice-page control is MIDI Voice
+Group, an enum offering None and Groups 1–10, grayed out in CV mode. Voices 1–10
+default to matching numbered groups; later voices default to None. MIDI allocates
+only nonempty groups, with oldest-group stealing and shared note gates retained.
+Changing a member to None preserves the short click-suppression fade, then skips
+its pitch preparation and rendering. Moving into a held group fades in normally.
+
+Five parameters per voice give 83 + 5*Voices parameters (88..203). Specifications,
+fixed waveform ordinals and the shared six-table bank are unchanged. Removing
+Active changes the per-voice stride; this build needs a fresh instance rather
+than restoring an older voice layout.
+
+130 normal native tests pass in debug and release, and 133 profiling tests pass.
+The complete repository suite and both ARM plugin relocation checks pass. New
+coverage checks factory defaults, all-None MIDI allocation, continuous CV output
+with None assignments, mode switching, Group 10 membership and live reassignment
+without leaving an unassigned oscillator rendering. No hardware CPU improvement
+is claimed. Changes remain uncommitted for device testing.
+
+
+### Skip silent MIDI tuning setup
+
+MIDI transpose/fine-tune reads and arithmetic now happen after binding resolution
+and the sounding check, rather than in the initial CV snapshot loop. Idle assigned
+voices skip that work; held notes, release tails and membership fades retain live
+tuning. CV input snapshots and processing are unchanged. A callback-level regression
+counts MIDI tuning setup in test builds only, checking zero work at idle, one voice
+for a held/releasing note, and zero again after its release. Existing group-change,
+mode-switching, tuning, voice-stealing and CV regressions continue to pass.
+
+131 native tests pass in debug and release, 134 pass with profiling enabled, and
+the repository suite and normal ARM plugin checks pass. No device CPU measurement
+has been taken for this change; savings must be confirmed on the module.

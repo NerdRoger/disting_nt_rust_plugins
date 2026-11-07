@@ -648,7 +648,7 @@ struct CvFactor {
 /// At most one distinct input per voice; retain exact inputs between callbacks.
 #[derive(Clone, Copy)]
 pub struct CvPitchCache {
-    entries: [CvFactor; super::VOICE_COUNT],
+    entries: [CvFactor; super::MAX_VOICES],
     used: usize,
 }
 
@@ -659,7 +659,7 @@ impl CvPitchCache {
                 bus: -1,
                 voltage: f32::INFINITY,
                 factor: 1.0,
-            }; super::VOICE_COUNT],
+            }; super::MAX_VOICES],
             used: 0,
         }
     }

@@ -1,6 +1,7 @@
 //! Fixed-size MIDI allocator and short click-suppression gates. No audio buffers.
 #![forbid(unsafe_code)]
-pub const GROUP_COUNT: usize = 8;
+pub const GROUP_COUNT: usize = 10;
+pub const NO_GROUP: u8 = GROUP_COUNT as u8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateState {
