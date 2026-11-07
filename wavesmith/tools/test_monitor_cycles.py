@@ -58,6 +58,23 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result["mean_draw_cycles"], 500)
         self.assertEqual(result["draw_calls_per_second"], 2)
 
+    def test_ui_stats_separate_idle_edits_and_setup(self):
+        def ui_packet(sequence, counters):
+            data = packet(sequence=sequence)
+            data[4] = 4
+            data.extend([0] * 50)
+            data.extend([0] * 10)
+            for value in counters:
+                data.extend((value >> (7*i)) & 127 for i in range(5))
+            return decode(data)
+        rows = [ui_packet(0, [0]*9), ui_packet(1, [1000, 10, 200, 600, 2, 400, 0, 0, 0])]
+        summary = summarize(rows, "ui")
+        self.assertEqual(summary["ui_idle_mean_cycles"], 100)
+        self.assertEqual(summary["ui_edit_mean_cycles"], 300)
+        self.assertEqual(summary["ui_edit_max_cycles_since_instantiation"], 400)
+        self.assertIsNone(summary["ui_setup_mean_cycles"])
+        self.assertEqual(summary["ui_setup_calls"], 0)
+
     def test_sequence_wrap_and_large_counts(self):
         first = decode(packet(sequence=0xffffffff,total_cycles=0xffffffffffffffff))
         second = decode(packet(sequence=0))

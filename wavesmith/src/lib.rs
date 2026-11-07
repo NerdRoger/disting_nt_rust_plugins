@@ -1506,8 +1506,28 @@ impl Plugin for Wavesmith {
         // The waveform editor owns the controls while this view is active.
         true
     }
+    // The normal build uses the identical framework default (centered pots).
+    #[cfg(feature = "profiling")]
+    fn setup_ui(context: &mut Callback<'_, Ui>) -> NtFloat3 {
+        let start = distingnt_api::api::cpu_cycle_count();
+        let values = [0.5; 3];
+        let cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(start);
+        context.state_mut().profiling.telemetry.record_ui(2, cycles);
+        values
+    }
     fn custom_ui(context: &mut Callback<'_, Ui>, data: &NtUiData) {
-        ui::handle(context, data);
+        #[cfg(feature = "profiling")]
+        let start = distingnt_api::api::cpu_cycle_count();
+        let _edited = ui::handle(context, data);
+        #[cfg(feature = "profiling")]
+        {
+            let cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(start);
+            context
+                .state_mut()
+                .profiling
+                .telemetry
+                .record_ui(usize::from(_edited), cycles);
+        }
     }
 }
 

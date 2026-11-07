@@ -44,6 +44,15 @@ impl UiState {
         }
     }
 
+    #[inline]
+    fn needs_handling(&self, data: &NtUiData) -> bool {
+        const ACTIVITY: u32 =
+            POT_L | POT_C | POT_R | POT_BUTTON_L | POT_BUTTON_C | POT_BUTTON_R | ENCODER_BUTTON_R;
+        !self.primed
+            || (data.controls | data.last_buttons) as u32 & ACTIVITY != 0
+            || data.encoders != [0, 0]
+    }
+
     pub fn advance(&mut self, frames: usize) {
         for remaining in &mut self.reset_hold {
             *remaining = remaining.saturating_sub(frames);
@@ -82,10 +91,22 @@ fn pickup(previous: f32, current: f32, value: f32) -> Option<f32> {
     Some((value + remaining_value / remaining_travel * delta).clamp(-100.0, 100.0))
 }
 
-pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
+// Leave the common no-activity path in ITC. Track even unflagged pot samples so
+// pickup measures travel since the previous callback rather than accumulating noise.
+pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
+    if !context.state().ui.needs_handling(data) {
+        context.state_mut().ui.previous = data.pots;
+        return false;
+    }
+    handle_active(context, data)
+}
+
+distingnt_api::nt_dram_section! {
+fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
     let changed_mode = data.controls as u32 & ENCODER_BUTTON_R != 0
         && data.last_buttons as u32 & ENCODER_BUTTON_R == 0;
     let changed_selection = data.encoders[0] != 0;
+    let mut edited = changed_mode || changed_selection;
     {
         let state = context.state_mut();
         let count = state.count.clamp(2, dsp::MAX_SEGMENTS) as i32;
@@ -168,6 +189,7 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
                 }
                 if value != reset_value {
                     let _ = context.parameters().set(parameter, reset_value);
+                    edited = true;
                 }
                 continue;
             }
@@ -211,15 +233,61 @@ pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) {
         if let (Some(updated), Some(parameter)) = (updated, parameter) {
             if updated != value {
                 let _ = context.parameters().set(parameter, updated);
+                edited = true;
             }
         }
     }
     context.state_mut().ui.primed = true;
+    edited
+}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pickup;
+    use super::*;
+
+    #[test]
+    fn idle_gate_handles_initialization_changes_held_buttons_and_releases() {
+        let mut ui = UiState::new();
+        let mut data = NtUiData {
+            pots: [0.5; 3],
+            controls: 0,
+            last_buttons: 0,
+            encoders: [0; 2],
+            unused: [0; 2],
+        };
+        assert!(ui.needs_handling(&data));
+        ui.primed = true;
+        assert!(!ui.needs_handling(&data));
+        // Raw noise alone must not wake the editor: use the host movement flags.
+        data.pots = [0.50001, 0.49999, 0.5];
+        assert!(!ui.needs_handling(&data));
+        for flag in [
+            POT_L,
+            POT_C,
+            POT_R,
+            POT_BUTTON_L,
+            POT_BUTTON_C,
+            POT_BUTTON_R,
+            ENCODER_BUTTON_R,
+        ] {
+            data.controls = flag as u16;
+            assert!(ui.needs_handling(&data));
+            data.last_buttons = flag as u16;
+            assert!(ui.needs_handling(&data));
+            data.controls = 0;
+            assert!(ui.needs_handling(&data));
+            data.last_buttons = 0;
+        }
+        for index in 0..2 {
+            for delta in [-1, 1] {
+                data.encoders[index] = delta;
+                assert!(ui.needs_handling(&data));
+                data.encoders[index] = 0;
+            }
+        }
+        assert!(!ui.needs_handling(&data));
+    }
 
     #[test]
     fn pickup_maps_remaining_travel_and_does_not_stick_at_stops() {

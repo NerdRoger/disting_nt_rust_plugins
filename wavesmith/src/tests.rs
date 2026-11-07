@@ -3782,3 +3782,30 @@ fn midi_attacks_and_long_releases_use_batched_playback_for_all_group_members() {
         assert!(samples[12 * 24..14 * 24].iter().all(|&v| v == 0.0));
     }
 }
+
+#[test]
+fn idle_ui_gate_tracks_unflagged_pots_before_pickup_resumes() {
+    let mut instance = Instance::new(8);
+    let boundary = editor_parameter(8, 0, 0).unwrap();
+    instance.change(boundary, 0);
+    instance.event([0.5; 3], [0, 0]);
+    for step in 1..=100 {
+        let data = NtUiData {
+            pots: [0.5 + step as f32 * 0.0002, 0.5, 0.5],
+            controls: 0,
+            last_buttons: 0,
+            encoders: [0; 2],
+            unused: [0; 2],
+        };
+        unsafe {
+            factory().custom_ui.unwrap()(instance.base, &data);
+        }
+        assert_eq!(instance.values[boundary], 0);
+    }
+    instance.event([0.525, 0.5, 0.5], [0, 0]);
+    assert!(
+        instance.values[boundary] > 0,
+        "pickup must use the most recent idle sample"
+    );
+    instance.assert_guard();
+}
