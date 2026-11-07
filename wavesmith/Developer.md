@@ -1,0 +1,632 @@
+# Wavesmith developer notes
+
+For setup, controls, and musical examples, see the [user guide](README.md).
+This document preserves the implementation details, development history, build
+instructions, and profiling workflow. Measurement results are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).
+
+A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
+Two setup specifications select Voices (1–24, default 1) and Segments (2–32,
+default 32), in that order. Only requested voice pages/parameters are created;
+All specified voices play in CV mode. All 32 boundaries and
+32 curves always exist at fixed ordinals, but the Waveform page lists only the
+selected segments. Unused waveform fields are marked gray in case another host
+view (such as a CV mapping selector) shows them. Their stored values survive
+respecification. Every instance uses six shared 256-sample anti-alias tables per
+bank. Shape edits rebuild/crossfade while audio continues playing. Respecify to
+change either count. MIDI Voice Group controls which voices participate in MIDI mode.
+
+## Controls
+
+- Left encoder: select segment. In Segment mode, selection wraps from the last
+  segment to the first and from the first to the last, including larger turns.
+- Press a potentiometer to reset its current control. In Segment mode, boundary
+  presses zero the selected endpoint and the curve press restores its default
+  zero curve. Warp and Tuning controls use their declared parameter defaults.
+  The starting waveform's nonzero boundary defaults are unchanged. Reset occurs
+  once per press. Pot motion is ignored while held and for 100 ms after release;
+  pickup then resumes from the current physical position without accumulating
+  the ignored movement. Other pots and external parameter modulation remain available.
+  MIDI-disabled Pitch stays inactive.
+- Right encoder press: cycle Segment → Warp → Tuning → Segment.
+- Segment mode (initial): left pot edits the selected segment's starting boundary
+  level, centre pot edits its curve, right pot edits its ending boundary level.
+  Levels and curves range from −100% to +100%; curve 0 is linear. Positive Curve
+  bows upward and negative Curve bows downward. Stronger bows reflect at the
+  whole waveform's −100%/+100% limits, never at the segment's endpoint levels.
+- Warp mode: left pot edits Warp Position (0–255), centre pot edits Warp Amount
+  (−100% to +100%), right pot edits Smoothing (0–100%). Shape triggers, output Level,
+  and Pitch remain available on parameter pages.
+- Tuning mode: left pot edits Pitch (MIDI note 0–127, default C3/48), centre pot edits Fine tune
+  (−100 to +100 cents), right pot edits Level (−60 to 0 dB, default −6 dB).
+  The bottom position is displayed as −inf and mutes the output. The top row displays
+  these three values instead of the warp controls. Pitch is displayed as a note
+  name and octave matching the NT (36 = C2, 37 = C#2), while its stored value
+  remains a MIDI note number.
+- Right encoder rotation is unused. Left encoder selects the segment in all modes.
+
+The top row follows the current pot assignments: Left / Curve / Right in Segment
+mode, Warp Pos / Warp Amt / Smooth in Warp mode, and Pitch / Fine / Level in
+Tuning mode. Segment values read the selected segment's shared boundary parameters
+and curve parameter, including the shared seam. All labels use regular-sized text. The
+graph occupies y=14–42 with its zero axis at y=28, leaving the help footer fixed.
+All three modes draw their header at full brightness (15) over a dim background
+bar (2). Warp and Tuning modes hide the segment selection and boundary handles.
+The waveform stays at full brightness in all modes to preserve its antialiasing
+range. Segment mode restores the selected
+segment's shading and handles. The help
+footer contains one row of encoder hints: Push: Mode on the right in every mode,
+and Turn: Select on the left only in Segment mode. Pot assignments are shown
+only in the header. Switching modes preserves the selected segment and parameter values;
+smart pickup resumes from the current knob positions without a value jump.
+
+Pots use the C++ plugins' smart soft takeover: the remaining virtual range is
+mapped onto the remaining knob travel, so either physical stop always reaches
+the corresponding minimum or maximum, even after selecting another segment.
+Fractional movement is retained for slow turns, and unexpected position jumps
+are ignored to resynchronize after visiting another screen. Adjacent segments
+share a single boundary level and always meet. For example, the right pot on
+Segment 3 and the left pot on Segment 4 both edit Boundary 03. The beginning and
+end of the complete waveform share Boundary 00, editable from either endpoint.
+It defaults to zero but can be set anywhere from −100% to +100%; both ends always
+meet at that value when the waveform repeats.
+Warp Position ranges from 0 to 255 (default 128); Warp Amount defaults to zero. Positive Warp Amount repels boundary
+positions from the warp position; negative Warp Amount attracts them. Both waveform ends
+remain fixed and boundaries retain their order, level, and curve identity. A
+monotone rational map limits the effective attraction/repulsion to 95% internally
+at full control travel, preventing zero-width segments. Warp Position can sit at either
+edge. A four-pixel black strip with a centered two-pixel full-brightness core
+marks it only in Warp mode, drawn over the waveform and clamped on screen
+at either edge. Grid dividers,
+selection shading and endpoint handles follow the redistributed boundaries.
+Zero Warp Amount retains the original equal-width geometry.
+Equal start/end levels produce a flat segment only at Curve 0; nonzero Curve can
+create humps and folded lobes between equal endpoints. The curve is quadratic
+Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curve
+±100 at the default Fold Limit of 2. Both endpoints remain exact. Folding is
+continuous reflection, not clipping.
+
+Fold Limit is a global 0–2 parameter (default 2) on the Morph page.
+At zero, Curve still bends the segment using a quadratic Bezier control point
+bounded by the global amplitude rails; it introduces no folds or hard clipping.
+At limits 1–2, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
+so each sampled curve value needs no more than the allowed number of reflections
+to return inside the rails. The value is a maximum, not a forced fold count;
+Curve zero remains linear at every setting. Default 2 preserves the previous
+curve arithmetic exactly. The maximum is two to keep folding useful at the
+256-sample table resolution. Overall smoothing and final
+anti-alias filtering still follow the curve/folding stage. Changing Fold Limit
+rebuilds the waveform through the existing chunked, crossfaded path, without
+adding FFTs or waveform buffers. Shape triggers leave Fold Limit unchanged.
+
+The footer is always visible at y=50–63, matching Window Comparator's reserved
+area. The custom display contains global values, the graph and help footer. The draw
+callback returns true to suppress the NT's standard parameter line, since the
+waveform editor uses the pots and encoders in this view.
+The bright, antialiased trace shows the defined shape with optional creative
+smoothing and brief edit crossfades. Only this bright editor trace is drawn;
+it is independent of the individual voices' pitch-dependent audio filtering.
+The display uses the NT's
+native antialiased float-coordinate drawing API; this does not filter the audio.
+All three modes show the vertical segment dividers as one-pixel dots spaced three
+pixels apart, at brightness 1 (the lowest nonzero level). The horizontal zero
+axis stays solid at brightness 1, and the thicker warp position marker stays solid.
+This keeps Warp Position/Warp Amount changes visible with less prominent dividers.
+Full-brightness boundary handles in Segment mode mark both
+ends of the selected segment above the curves. The bright trace is independent
+of pitch and the audio path's automatic
+anti-alias filtering. At Smooth = 0 it evaluates the exact drawn curves; above
+zero it reads a separate creative-smoothing table, preserving the boundary levels.
+
+## Parameters and routing
+
+Oscillator page: MIDI Channel (Off, All, or 1–16), Pitch (MIDI note number,
+default C3), Fine tune in cents, and Level (default −6 dB, up to nominal
+±5 V at 100%).
+
+Morph follows Output, with Warp Position, Warp Amount, Smoothing, and Fold Limit
+in that order. Reshape follows Morph, with Sine, Triangle,
+Square, Sawtooth, Zero Curves, Randomize Curves,
+Randomize Boundaries, and Randomize All in that order.
+
+- Randomize All replaces every boundary level and segment curve with
+  pseudorandom values from −100% to +100%.
+- Randomize Boundaries changes only boundary levels, including the shared seam.
+- Randomize Curves changes only segment curves.
+- Zero Curves sets every segment curve to zero.
+- Sine sets the boundaries to a sampled sinusoid, starting at its
+  negative peak so even two-segment instances remain bipolar.
+- Triangle sets sampled triangle levels, starting at the negative peak.
+- Square sets the first half's boundary levels negative and the second
+  half positive. The joins ramp across the available segments.
+- Sawtooth sets a rising ramp from the negative seam to the positive
+  last boundary, then returns to the seam across the final segment.
+
+The four waveform presets set boundary levels, including the shared seam, and
+zero all curves in the configured segments. They preserve smoothing and warp
+settings, with linear interpolation between the preset boundaries. With very few segments, the four shapes can coincide
+or approximate their target coarsely. These presets add no FFTs or audio buffers.
+
+Each Reshape action uses the NT confirmation parameter unit: 0 displays Ready
+and 1 displays Apply. When editing through the NT parameter interface, confirm
+Apply to perform the action. Previewing the proposed value leaves the waveform
+unchanged. After applying the action, its parameter automatically returns to 0,
+ready for another use. A direct CV/MIDI parameter change to 1 can still invoke
+an action without an interactive prompt; the confirmation belongs to host UI
+editing. All actions preserve pitch, routing, level, smoothing, Fold Limit,
+and warp settings. Generated values remain ordinary editable host parameters
+and are saved with the preset.
+The Output page follows Oscillator and contains Left Output, Right Output, and
+shared Output mode (add/replace), in that order. Left Output defaults to bus 13
+(physical output 1); Right Output defaults to None. Two distinct assigned buses
+enable stereo automatically. One assigned bus, or both outputs selecting the same
+bus, produces full-level mono through that bus. Both None disables voice audio.
+There is no Stereo parameter or additional specification.
+
+Each voice has Pan from 0% (left) through 50% (center) to 100% (right), default 50%.
+Pan is grayed out and ignored in mono; its stored value is retained. Stereo uses
+square-root equal-power gains, with about -3 dB per side at center. Pan gains are
+cached and changes are smoothed; activating stereo starts from the stored positions.
+Each oscillator is generated once and then distributed to the two mix buffers.
+The mono path retains its previous gain behavior. Shared RMS measurement uses
+the combined left/right energy and actual panned per-voice energy; one gain and
+one linked peak detector control both sides, preserving the stereo image.
+Add/replace applies to both assigned buses. Pitch CV is snapshotted before either
+bus is written. Duplicate output buses are written once as mono. New output destinations fade in over 20 ms; disconnected buses are no longer
+written. Changing only the other stereo output leaves an unchanged output's
+samples and level-controller history intact. Entering or leaving stereo ramps
+each voice's effective gains on the live waveform, rather than blending from a
+held sample; centered stereo settles at -3 dB per side. Existing pan settings are
+retained and restored when stereo becomes available again. Live routing edits do
+not restart RMS or peak protection; reconnecting after silence still acquires
+startup attenuation.
+The Voices specification creates Voice 1 through the requested voice count, containing Pitch CV,
+Transpose, Fine tune, Pan, and MIDI Voice Group in that order. Parameter names
+are shared; the API's parameter UI prefix identifies V1: through V24:. All voice
+pages share a navigation group, so moving between pages retains the selected row.
+Every voice defaults to Input 1 for Pitch CV.
+Transpose ranges from -48 to +48 semitones and Fine tune from -100 to +100 cents;
+both default to zero and apply in CV and MIDI modes. Each Pan is independent,
+with centered defaults and the shared stereo/mono behavior described above.
+MIDI Voice Group offers None and Groups 1–10. Voices 1–10 default to Groups
+1–10 respectively; Voices 11–24 default to None. In CV mode this parameter is
+grayed out and has no effect: every specified oscillator uses its own Pitch CV
+and tuning. In MIDI mode only assigned groups are allocated notes, and all their
+members follow the group's note, bend and gate while retaining independent
+transpose, fine tune and pan. For example, five members in Group 1 and two in
+Group 2 give two-note polyphony with different stack sizes. Empty groups are
+skipped. Voices assigned None do not play in MIDI mode.
+
+Assigning None fades that oscillator out without releasing other members of its
+MIDI group. Removing the final member releases that group's held note and
+excludes it from allocation. Assigning a voice to a sounding group fades it into
+the existing note. Moving between held groups first fades out the old binding,
+then adopts the latest destination and fades in; other members continue playing.
+The short fades take approximately 5 ms each. Once silent, unassigned MIDI
+oscillators skip pitch conversion and rendering. Output routing remains shared.
+Waveform tables, rebuilding and FFT work are shared across all 24 oscillators.
+
+When Left Output and Right Output are both None, Wavesmith disables all voice
+CV reading, frequency conversion, phase advancement and sample generation;
+shared waveform rebuilding and edit fades can still finish while silent.
+An enabled output mixes all active voices through automatic RMS level control.
+The controller compares the mix's measured energy with the average measured energy
+of its voices, aiming for a chord near a single voice's RMS level. MIDI voices
+are weighted by their squared attack/release gates, so a barely audible new note
+does not suddenly halve the reference. A minimum weight of one preserves the
+natural envelope of a single note. CV voices each have full weight. This
+accounts for correlated unison voices as well as independently pitched notes;
+there is no fixed division by the voice count. Level remains applied
+to the voices, so the loudness reference follows Level and the current waveform.
+Level uses the NT's dB/minus-infinity unit: integer steps from −60 through 0 dB,
+with −60 displayed as −inf and mapped to true zero gain. Other values use
+10^(dB/20), with the conversion cached across blocks until Level changes.
+Pot press restores −6 dB. The custom Tuning header displays Level with a dB suffix,
+or −inf for mute. Parameter ordering is unchanged, but saved percentage values
+are not converted automatically: review Level after loading an older preset
+(0 now means full level, not mute). New instances default to −6 dB.
+
+The RMS detector and gain reduction use a 50 ms response; gain recovery takes
+about one second. Gain never exceeds unity, and silence holds the controller
+until the voice pool becomes idle, avoiding boosted quiet signals or release tails.
+These are energy measurements, not frequency-weighted perceptual loudness (LUFS).
+
+A final peak protector analyzes preallocated 16-sample mix chunks and limits
+Wavesmith's contribution to a fixed +/-5 V, independently of Level. At Level −6 dB,
+a single voice's nominal +/-2.51 V swing therefore leaves 6 dB of peak headroom;
+Level is the loudness control, not the limiter threshold. Level 0 dB leaves less
+headroom and can still need limiting. Peak attenuation holds for 20 ms and
+recovers over about 200 ms rather than following individual waveform troughs. Short peak-protection gain reductions can still be
+audible, and peak-heavy chords can settle below the desired RMS level. The
+controller is tuned to reduce pumping; device listening tests remain necessary.
+It adds no FFTs, table buffers, audio delay or parameter/specification changes.
+Two 16-sample arrays and a small controller are initialized directly in the
+host-allocated state; the steady oscillator and pitch caches remain in use.
+
+Replace writes only the controlled mix on each assigned output. Add preserves
+the existing bus signal and adds the controlled Wavesmith contribution; unrelated
+upstream audio can still make the final bus exceed the ceiling. Disabling both
+outputs and changing MIDI Channel restart the controller. MIDI Channel changes also apply a 20 ms output
+transition from the last emitted sample to the new normalized mix, avoiding a
+step when changing between MIDI and continuous CV playback. The first audible
+chunk acquires the new attenuation immediately instead of starting the full CV
+pool at unity gain. The transition affects only Wavesmith's contribution in Add
+mode and adds no audio buffers or steady-state latency.
+
+In CV mode every active voice plays continuously. Its pitch is shared Pitch
+plus Pitch CV, shared Fine tune, voice Transpose, and voice Fine tune. A Pitch CV
+of None contributes zero volts, so voices can form manual chords with Transpose
+or detuned stacks with their Fine tune offsets. CV values are snapshotted
+before the shared output is cleared or written, including when an input is also
+the destination bus. Each voice has its own phase, pitch/gain slew and anti-alias
+selection. Persistent frequency caches and steady playback remain active.
+The waveform builder, 24 KiB table buffers and crossfade clock are shared, so
+more voices do not add FFT work or duplicate tables. Small playback/MIDI arrays
+reserve 24 oscillator states and ten MIDI note-group slots; only sounding oscillators
+and short fading tails are processed.
+Only configured voice pages and parameters exist; increasing Voices appends new
+voice controls, and decreasing it removes the trailing voice controls.
+
+MIDI Channel defaults to Off, preserving continuous CV/manual playback. Set All
+or a channel number to control assigned voices with MIDI instead. In MIDI
+mode, Pitch CV inputs and manual Pitch are ignored. Per-voice Transpose, shared
+Fine tune, per-voice Fine tune, and Level still apply. The ignored parameters are
+grayed out through the NT API while MIDI is enabled and restored when MIDI is
+Off, without changing their stored values. In the custom Tuning view, Pitch is
+dim and its pot is inactive in MIDI mode; Fine and Level remain editable.
+MIDI Voice Group is enabled only in MIDI mode. There are ten note slots; available
+polyphony is the number of distinct assigned groups (at most ten), rather than
+the number of oscillators. Unassigned groups and their oscillators remain silent,
+and all release tails finish when no keys remain held.
+
+Note On uses an idle group first, then a releasing group, then steals the oldest
+held group's note. Repeated Note On for an already-held key retriggers that group.
+Note Off and velocity-zero Note On release the matching channel/note; a stale
+release cannot stop a replacement note. All members share the same approximately
+5 ms gate ramp, advanced once per audio frame regardless of group size. A stolen
+group fades out before every member retunes to the replacement note.
+Pitch bend uses the full 14-bit MIDI value with a fixed +/-2-semitone range.
+Bend is tracked independently per MIDI channel, affects held/releasing and new
+notes, and is reset when MIDI Channel changes. It combines with both fine-tune
+offsets; CV mode is unaffected. Bend-range RPN messages are not handled.
+Velocity does not change loudness. Sustain and aftertouch are not handled. All Notes Off releases notes on its channel; All Sound Off silences them
+immediately. Changing MIDI Channel clears held notes, as does setting both outputs to None. MIDI allocation adds only small voice states, without extra waveform
+tables or FFT work.
+
+With N specified segments, the Waveform page lists Boundary 00, Curve 01,
+Boundary 01, Curve 02, through Curve N and Boundary 00. The shared seam is shown
+twice; each active interior boundary appears once. The last segment returns to
+Boundary 00 in both the parameter page and custom editor.
+
+All 32 boundary and 32 curve parameter definitions remain allocated. Boundaries
+00..N-1 and Curves 01..N are enabled; later slots are grayed out and omitted from
+the Waveform page. Hiding rows does not remove those slots from the algorithm's
+parameter list, so other host views may still show their names. Unused values
+are saved by ordinal just like active ones. Shrinking and expanding Segments via
+respecification preserves those edits, as well as surviving voice controls.
+Randomize/preset/zero-curve actions operate on active segments only. Fresh
+instances default to a triangle-like shape for their chosen segment count, with
+unused boundaries and all curves initially zero.
+
+Segment count stays fixed for each instance. Editor selection and cached
+boundary-analysis weights start from that specification; there is no live
+Segments parameter or modulation target. Gray flags are set once per instance,
+including for omitted waveform parameters. Normal waveform edits retain staged
+rebuilding and the shared audio crossfade.
+
+Five shared pages (Oscillator, Output, Morph, Reshape, Waveform) plus N configured
+voice pages give 6..29 plugin pages, or 7..30 including firmware Common. Page order
+is Oscillator, Output, Morph, Reshape, voices, Waveform. Underlying parameter order
+is fixed shared controls, fixed waveform controls, then the variable voice tail.
+
+## Rendering
+
+Segment evaluation first bows and folds the source shape. Creative Smoothing
+and its boundary anchoring follow folding; audio anti-alias filtering follows
+Smoothing. The bright trace shows the folded source with Smoothing. The existing Curve parameter names,
+indices and ranges are unchanged, but nonzero values now describe this bow/fold
+model rather than the earlier rational easing; old shapes are not converted.
+
+Every waveform edit builds six 256-sample audio tables, with harmonic limits
+127, 32, 8, 4, 2, and 1. The most detailed table retains up to 127 harmonics;
+the simplest retains the fundamental and DC. Two banks permit live edits,
+so memory holds twelve audio tables plus two creative-smoothing display tables.
+Audio tables are generated in pairs: one complex inverse FFT produces two real
+waveforms, extracted from its real and imaginary components. Three inverse FFTs
+generate all six tables, reusing the existing scratch buffer. Source sampling,
+creative Smoothing, boundary anchoring, update cadence and edit crossfades are
+unchanged. Playback selects adjacent tables using a binary search and blends between
+them only when the richer table's highest harmonic is between 47% and 49% of the
+audio sample rate (22.56–23.52 kHz at 48 kHz). The richest table is fully removed
+before any of its harmonics exceeds that limit. This narrow, late crossfade
+retains more detail than the original broad octave crossfade, though larger
+bands of still-safe harmonics can disappear as tables change compared with the
+eight-table bank, particularly at low and middle pitches. With six
+tables, around F7 the eighth harmonic
+is retained fully. Pitch changes reuse the bank without rebuilding it.
+Steady playback uses at most two table lookups per waveform sample, with four
+during a brief waveform-edit crossfade. There is no per-sample harmonic synthesis.
+Each voice caches its anti-alias table selection and blend until its actual,
+slewed pitch changes by 1 mV equivalent at 1 V/oct (1.2 cents) from the last
+accepted selection. This applies equally to CV and MIDI playback. Actual phase
+and pitch smoothing still follow every pitch change; the deadband affects only
+anti-alias filtering. Small changes accumulate against the cached pitch, so
+slow glides still update the filter. Stable notes reuse the selection without
+repeating its table search and blend calculation on every sample. The accepted
+selection is stored as integer lower/upper phase-step thresholds; it adds no
+waveform buffers or FFT work.
+Voice caches persist across audio blocks. MIDI frequency conversion runs only
+when the exact note/bend/fine exponent changes. In CV mode each voice caches its
+root/transpose/fine tuning factor. A per-instance cache converts each distinct
+input bus voltage to an exponential factor once and shares it across voices,
+including voices with different detuning. Exact unchanged inputs reuse that
+factor across callbacks; every representable voltage change invalidates it.
+The voice tuning factor is cached directly in phase-step units for the current
+sample rate. Multiplying it by the shared input factor produces the target
+without intermediate Hertz conversion and per-update sample-rate division.
+Existing minimum/maximum pitch limits are applied in phase-step units. This reassociates floating-point arithmetic, so
+small rounding differences are expected; tests bound tuning error and verify
+shared buses, independent buses, rerouting and tiny input changes. The cache
+adds 120 bytes to ARM instance state after padding, with no new waveform tables.
+Phase-step targets update only
+when frequency or sample rate changes; slew coefficients update only when the
+sample rate changes. Level smoothing restarts only when Level changes.
+Pitch smoothing uses signed integer arithmetic on the existing 32-bit phase
+steps. A precomputed Q30 coefficient calculates the exponential endpoint every
+two samples, retaining the approximately 1 ms time constant; a linear midpoint
+supplies the intervening sample. New targets and silent retunes cancel pending
+endpoints. Rounding continues in one-phase-step increments near the target so
+tracking settles exactly instead of sticking short. This two-sample trajectory
+slightly approximates the original per-sample exponential; CV glides and MIDI
+pitch bends passed a human listening check. At 48 kHz one step is about
+0.000011 Hz. Level retains its original floating-point recurrence. Pitch is no
+longer bit-identical to the old floating-point recurrence: tests bound transient
+error against a double-precision reference and check steady tuning, monotonic
+tracking, tiny CV ramps and sample-rate changes. No CV-input deadband is used.
+With a fully open gate, constant level and no waveform crossfade, a block
+renderer resolves the active waveform bank outside the sample loop. Settled
+pitch uses the cached integer phase step, gain, table selection and blend.
+Changing pitch first checks whether both current and target phase steps are
+strictly inside the cached selection range. The monotonic integer slew cannot
+leave that interval, so the chunk can reuse fixed table bindings and skip
+selection checks while retaining the exact per-sample pitch recurrence.
+Possible crossings retain the original general moving-pitch path. It resolves
+table storage once, refreshing bindings only when the selected table level
+changes, and computes
+sample indices and fractions once even when blending two tables. A single
+moving-pitch loop handles the storage lane and table blend directly to conserve
+ITC code space. The per-sample pitch helper is explicitly inlined to avoid a
+function call and register-save overhead in each oscillator sample. Gate updates,
+level smoothing and edit-crossfade checks stay outside this moving-pitch loop.
+Level changes, note attack/release/steal and waveform crossfades retain the
+original general renderer. Table references are local to each render call, so
+newly published banks are picked up immediately. The integer pitch tracker uses
+the existing 32-bit phase-step resolution, adds four state bytes per voice and
+adds no waveform buffers or FFT work.
+Stationary stereo pan uses a two-sample-unrolled mixing loop, with a scalar
+tail for arbitrary chunk sizes. It preserves the original per-sample output
+and stereo-energy accumulation order. Moving pan retains the original smoothing
+loop, including its exact settlement timing. No additional buffers are needed.
+Low notes retain more detail; high notes become smoother and may become quieter
+if most of the drawn shape's energy was in the removed harmonics. This reduces
+aliasing substantially, but finite source sampling and linear table interpolation
+still leave some residual error; it is not a guarantee of completely alias-free audio.
+
+When Smooth is above zero, a 256-sample FFT applies the requested smoothing.
+The control proportionally blends the original shape toward the fully smoothed
+shape, spreading the change across its full travel instead of sweeping a filter
+cutoff that becomes ineffective early. Maximum smoothing is unchanged.
+Boundary constraints still limit how
+smooth a shape with strongly alternating boundary levels can become.
+Creative smoothing still anchors the source's shared boundaries, including the
+seam, before the anti-alias filter. The final filtered tables deliberately do not
+restore those anchors, which would reintroduce out-of-band harmonics. Both ends
+of playback remain periodic and meet at the same value. The bright editor trace
+uses the shape before the final anti-alias filter, so raising pitch changes the
+audio without changing the drawing. Audio and display share the brief edit
+crossfade. Boundary parameters, randomization, modulation targets and presets
+retain the drawn source shape.
+
+A five-millisecond crossfade prevents abrupt edit clicks without resetting phase.
+That short transition also applies when enabling or disabling smoothing. A table
+set without smoothing takes seven source callbacks (prepare geometry, four
+64-sample chunks, FFT half 1, FFT half 2) plus four callbacks per pair of tables:
+nineteen callbacks with the fixed six tables.
+Every forward and inverse FFT runs in
+two dedicated callbacks, each performing four of its eight radix-2 stages.
+Reordering belongs to the first half; inverse normalization to the second.
+Sampling, filtering, preview storage, spectrum copying, and table storage run
+separately from the FFT halves. Each of the two boundary-correction passes takes one
+callback to measure errors and apply DC, followed by callbacks that each apply
+up to four harmonics. With six tables and zero Warp Amount, a smoothed build takes
+30 callbacks at eight segments, or 36 at 32 segments. At 24 frames and 48 kHz,
+those are 15 ms and 18 ms, versus 9.5 ms without smoothing, followed by the fade.
+Nonzero Warp Amount with smoothing adds four 64-sample resampling callbacks. Smoothing and
+boundary correction run in equal-width segment coordinates, retaining the
+existing cached correction weights. The finished shape is then stretched into
+the new segment positions before the final anti-alias FFT. The bright preview
+evaluates that stretch directly from the retained smoothing table, keeping
+anchors visible even when a compressed segment spans less than one audio-table
+sample. Strong compression can lose detail in the fixed 256-sample audio tables.
+Shifted boundary positions and reciprocal widths are computed once per rebuild,
+then samples walk the cached segments in order rather than repeatedly searching
+and recalculating positions. The geometry cache fits in the unused end of the
+existing FFT lookup buffer, separate from its twiddles and smoothing gains.
+Sampling and resampling each generate at most 64 samples per callback. At 24
+frames and 48 kHz, 32 segments and six tables take 20 ms to rebuild at nonzero
+Warp Amount with smoothing (40 callbacks), plus the 5 ms crossfade.
+This reduces work per callback without adding buffers or changing the correction.
+Continuous edits are coalesced without restarting an
+unfinished build. The old complete table set plays until the new set is ready.
+Startup is silent during the first build, then fades in. This is interactive
+control-rate editing; it is not an audio-rate waveform modulation engine.
+
+Audio/preview tables and build buffers occupy separately constructed SRAM blocks
+with a fixed buffer footprint of 24 KiB, excluding the small instance state
+and parameter metadata.
+Two additional blocks cache the boundary-correction analysis weights once at
+startup for the selected segment count. Harmonic correction reuses the FFT's
+half-cycle lookup instead of regenerating sine/cosine recurrences on every edit.
+The fixed smoothing filter response fits in the unused half of the FFT lookup
+buffer. Smoothing still applies both boundary-correction passes with the same
+correction order; these caches do not depend on the current shape or Smooth value.
+Two real-valued tables are packed into each block. Each table pair takes four
+callbacks: prepare the paired spectrum, inverse FFT half 1, inverse FFT half 2,
+and store the pair. Each build callback performs at most half an FFT, retaining
+paired table generation without adding buffers.
+This keeps
+large temporaries off the firmware stack. No memory allocation or locks occur
+during audio rendering. There is no automatic whole-wave shift or normalization.
+Smoothed shapes can ring beyond their requested levels; ±5 V at full Level is
+nominal for the source tables; the final mix protector enforces the +/-5 V
+contribution ceiling. Asymmetric waves can have DC offset.
+
+## Build and test
+
+**Two-specification prototype:** add a fresh instance after upgrading from
+the live-Segments variant. Voices is the first specification (1..24/default 1);
+Segments is second (2..32/default 32). The former live parameter is removed, so
+parameter ordinals changed once. Earlier instances, presets and mappings are
+not migrated automatically. Removing Active also changes the per-voice stride
+from six parameters to five; add a fresh instance when testing this build.
+
+There are 19 shared controls, then 64 fixed waveform controls, followed by five
+parameters per configured voice. Waveform ordinals start at 19; voices start at
+83. Totals are 83 + 5 * Voices (88..203 parameters), independent of Segments.
+Changing either specification preserves all shared/waveform ordinals and all
+surviving voice ordinals. Removed voice settings are discarded by the host;
+appended voices receive their defaults. Inactive waveform settings remain
+allocated and stored even while omitted from the parameter page.
+
+Six-table banks and waveform work buffers remain shared. Small oscillator, pan
+and input-cache arrays retain their preallocated 24-slot capacity. Voices limits
+parameter/page allocation and processing loops; the fixed DSP reserve remains.
+Page-index allocation follows only visible rows. Initialization uses the safe
+in-place array initializer, with no whole-state constructor temporary.
+
+From the repository's devcontainer:
+
+Instance state is initialized field by field in its final allocation through the
+API's safe `RegionInitializer` and `initialize_region!` macro. This avoids large
+whole-state temporaries on the firmware stack. Both the direct-initialization
+diagnostic and the integrated safe version saved successfully on hardware after
+the ordinary constructor crashed. All Rust plugins now use required direct state
+and preallocated-region initialization hooks. Wavesmith continues to forbid unsafe
+code. This changes no parameters or preset data.
+
+```sh
+make plugins/wavesmith.o
+cargo test -p wavesmith --lib
+```
+
+Copy `plugins/wavesmith.o` to the NT's plugin folder using your normal deployment
+procedure. Requires API-v14-capable firmware. Hardware listening, control feel,
+and CPU load still need validation on a Disting NT. Preset libraries,
+independent segment-width editing, and per-boundary smoothing are deferred.
+
+Both outputs continue to share the same oscillator bank and linked level
+controller. Stereo uses independent configured-voice pans; the waveform/FFT
+storage is shared rather than duplicated per channel or per voice.
+
+### Optional profiling build
+
+Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer
+and the factory SysEx monitoring callback. They display the regular help footer.
+This is a compile-time choice, separate from the MIDI channel setting.
+
+Build the special instrumented variant inside the devcontainer with:
+
+```sh
+make wavesmith-profile
+cargo test -p wavesmith --lib --features profiling
+```
+
+This produces `plugins/wavesmith-profile.o` with Cargo feature `profiling` enabled.
+It uses the same optimized `plugin` profile as production, so measurement does
+not include unoptimized debug-build overhead. Normal builds and CI releases
+continue to use `make plugins/wavesmith.o` without that feature. `make test`
+tests both configurations.
+
+To profile on the device, use the instrumented artifact in place of the normal
+Wavesmith file, preserving its filename and preset identity:
+
+```sh
+cp plugins/wavesmith-profile.o plugins/wavesmith.o
+```
+
+Then deploy `wavesmith.o` using the supplied push script and the `scratch`
+preset. Restore the production artifact afterwards with
+`make -B plugins/wavesmith.o` and deploy that file again. The Python monitor is
+unchanged; it requires the instrumented build.
+
+In a profiling build, a temporary overlay draws over the existing help footer. `Render cyc:`
+shows the average CPU cycles spent rendering and mixing all voices per audio
+callback, over non-overlapping windows of 256 callbacks (128 ms at 24 frames and
+48 kHz). Intervals from all internal chunks are summed. Pitch-to-frequency
+setup, waveform rebuilding/FFTs, the shared level controller and output writes
+are outside the timed intervals. Interrupts and a small counter-read overhead
+can affect readings; compare the same voice, pitch, routing and block settings.
+The underlying help rendering remains in place. No extra waveform buffers or
+parameter changes are introduced.
+
+In that build the profiling stream is also opt-in at runtime and USB-only. The monitor enables it with
+`F0 7D 57 53 01 10 F7` and disables it with command `11` in a `finally` block.
+This keeps unsolicited reports out of the firmware upload protocol. No notes
+or musical parameter changes are sent. Run from the repository root:
+
+```powershell
+python wavesmith/tools/monitor_cycles.py --seconds 100 --warmup 5 --label baseline --expect-voices 24 --expect-mode cv --expect-stereo
+```
+
+CSV and JSON summaries are written under ignored `target/wavesmith-profiling/`.
+Use `--output path.csv` for named results, `--compare baseline.json` for a
+percentage comparison, `--instance 0` when several Wavesmith instances exist,
+and `--stop` to disable a stream after an interrupted monitor. Always stop and
+close the monitor before deploying with the existing push script. The monitor
+fails rather than comparing runs with different voice counts, modes, routing,
+sample rates or block sizes. It also reports missing telemetry sequence numbers.
+
+Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
+version `1`; base report type `1` has the fields below. All integer fields are little-endian base-128:
+instance index (5 bytes), sequence (5), displayed average cycles (5), measured
+cycle sum (10), callback count (5), frame count (5), sample rate (5), last block
+size (5), followed by oscillator count, MIDI mode and stereo flags (one byte each).
+The count describes oscillators prepared for rendering, including release tails,
+rather than the number of MIDI note groups.
+The monitor calculates a weighted cycle average from sums and counts over the
+whole run rather than averaging occasional screen readings. One report covers
+approximately one second of audio, with no extra work inside the timed loops.
+
+Measured playback optimization results and decisions are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).
+
+Extended profiling reports (report type 2, same control protocol) append five
+10-byte base-128 totals: callback body, setup/pitch conversion, table rebuilding,
+level control and output/transition work. The callback measurement begins at
+entry and ends before telemetry encoding/transmission, so it includes timing
+instrumentation and normal processing but excludes the ABI wrapper and USB send.
+The original render measurement and displayed footer average are unchanged.
+Use `mean_callback_cycles` and `callback_change_percent` for whole-body
+comparisons; moving work between stages must not count as a CPU improvement.
+The monitor also decodes the original report type 1.
+
+Oscillator pitch/level targets are prepared once per audio callback, before
+internal chunk rendering. Pitch smoothing uses the integer recurrence described
+above; level smoothing and gate behavior retain their existing arithmetic.
+
+The level controller combines stereo power/peak detection into one traversal
+and calculates each stereo gain-ramp value once. Left/right power sums and
+per-sample gain arithmetic retain the original accumulation and rounding order.
+
+MIDI pitch conversion uses each voice's persistent exact cache. CV conversion
+separates cached per-voice tuning from a shared per-bus voltage factor. This
+shares work even when voices are detuned, unlike the earlier exact-combined-
+pitch sharing experiment. Independent detuning and tiny CV changes remain intact.
+The firmware exp2 function is retained; a factory-initialized lookup-table
+experiment was discarded because it added no reliable benefit on top of sharing.
+
+While Level is settled, block rendering calculates the volts-per-sample gain
+(`level * 5`) once per chunk instead of applying two multiplications per sample.
+Level transitions retain the general renderer. Regrouping can change final
+floating-point rounding; numerical tests bound the difference and keep pitch,
+phase and oscillator-state comparisons exact. No persistent state is added.
