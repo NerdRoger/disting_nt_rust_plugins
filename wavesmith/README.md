@@ -2,7 +2,7 @@
 
 A CV or MIDI oscillator built from 2–32 curved segments, initially equal-width.
 Two setup specifications select Voices (1–24, default 1) and Segments (2–32,
-default 8), in that order. Only requested voice pages/parameters are created;
+default 32), in that order. Only requested voice pages/parameters are created;
 All specified voices play in CV mode. All 32 boundaries and
 32 curves always exist at fixed ordinals, but the Waveform page lists only the
 selected segments. Unused waveform fields are marked gray in case another host
@@ -81,7 +81,7 @@ Bezier-shaped before folding, with an added midpoint bow of up to ±400% at Curv
 ±100 at the default Fold Limit of 2. Both endpoints remain exact. Folding is
 continuous reflection, not clipping.
 
-Fold Limit is a global 0–2 parameter (default 2) on the Shape page.
+Fold Limit is a global 0–2 parameter (default 2) on the Morph page.
 At zero, Curve still bends the segment using a quadratic Bezier control point
 bounded by the global amplitude rails; it introduces no folds or hard clipping.
 At limits 1–2, the available midpoint bow becomes ±(2 × limit) at Curve ±100,
@@ -119,32 +119,36 @@ Oscillator page: MIDI Channel (Off, All, or 1–16), Pitch (MIDI note number,
 default A3/220 Hz), Fine tune in cents, and Level (default −6 dB, up to nominal
 ±5 V at 100%).
 
-Shape follows Output, in this order: Warp Position, Warp Amount, Smoothing,
-Fold Limit, Sine Boundaries, Triangle Boundaries, Square Boundaries, Sawtooth
-Boundaries, Zero Curves, Randomize Curves, Randomize Boundaries, Randomize All.
-The warp controls are ordinary modulatable host parameters. The underlying parameter list follows the same order as the pages.
+Morph follows Output, with Warp Position, Warp Amount, Smoothing, and Fold Limit
+in that order. Reshape follows Morph, with Sine, Triangle,
+Square, Sawtooth, Zero Curves, Randomize Curves,
+Randomize Boundaries, and Randomize All in that order.
 
 - Randomize All replaces every boundary level and segment curve with
   pseudorandom values from −100% to +100%.
 - Randomize Boundaries changes only boundary levels, including the shared seam.
 - Randomize Curves changes only segment curves.
 - Zero Curves sets every segment curve to zero.
-- Sine Boundaries sets the boundaries to a sampled sinusoid, starting at its
+- Sine sets the boundaries to a sampled sinusoid, starting at its
   negative peak so even two-segment instances remain bipolar.
-- Triangle Boundaries sets sampled triangle levels, starting at the negative peak.
-- Square Boundaries sets the first half's boundary levels negative and the second
+- Triangle sets sampled triangle levels, starting at the negative peak.
+- Square sets the first half's boundary levels negative and the second
   half positive. The joins ramp across the available segments.
-- Sawtooth Boundaries sets a rising ramp from the negative seam to the positive
+- Sawtooth sets a rising ramp from the negative seam to the positive
   last boundary, then returns to the seam across the final segment.
 
-The four waveform presets change boundary levels only, including the shared seam.
-They preserve curves, smoothing and warp settings; use Zero Curves for the cleanest
-linear-segment approximation. With very few segments, the four shapes can coincide
+The four waveform presets set boundary levels, including the shared seam, and
+zero all curves in the configured segments. They preserve smoothing and warp
+settings, with linear interpolation between the preset boundaries. With very few segments, the four shapes can coincide
 or approximate their target coarsely. These presets add no FFTs or audio buffers.
 
-Each trigger ranges from 0 to 1 and acts only on its own rising edge. Return it
-to 0, then 1 to act again; holding it at 1 does not repeat or affect the other
-triggers' edge detection. All actions preserve pitch, routing, level, smoothing,
+Each Reshape action uses the NT confirmation parameter unit: 0 displays Ready
+and 1 displays Apply. When editing through the NT parameter interface, confirm
+Apply to perform the action. Previewing the proposed value leaves the waveform
+unchanged. After applying the action, its parameter automatically returns to 0,
+ready for another use. A direct CV/MIDI parameter change to 1 can still invoke
+an action without an interactive prompt; the confirmation belongs to host UI
+editing. All actions preserve pitch, routing, level, smoothing, Fold Limit,
 and warp settings. Generated values remain ordinary editable host parameters
 and are saved with the preset.
 The Output page follows Oscillator and contains Left Output, Right Output, and
@@ -305,9 +309,9 @@ Segments parameter or modulation target. Gray flags are set once per instance,
 including for omitted waveform parameters. Normal waveform edits retain staged
 rebuilding and the shared audio crossfade.
 
-Four shared pages (Oscillator, Output, Shape, Waveform) plus N configured voice
-pages give 5..28 plugin pages, or 6..29 including firmware Common. Page order
-remains Oscillator, Output, Shape, voices, Waveform. Underlying parameter order
+Five shared pages (Oscillator, Output, Morph, Reshape, Waveform) plus N configured
+voice pages give 6..29 plugin pages, or 7..30 including firmware Common. Page order
+is Oscillator, Output, Morph, Reshape, voices, Waveform. Underlying parameter order
 is fixed shared controls, fixed waveform controls, then the variable voice tail.
 
 ## Rendering
@@ -476,7 +480,7 @@ contribution ceiling. Asymmetric waves can have DC offset.
 
 **Two-specification prototype:** add a fresh instance after upgrading from
 the live-Segments variant. Voices is the first specification (1..24/default 1);
-Segments is second (2..32/default 8). The former live parameter is removed, so
+Segments is second (2..32/default 32). The former live parameter is removed, so
 parameter ordinals changed once. Earlier instances, presets and mappings are
 not migrated automatically. Removing Active also changes the per-voice stride
 from six parameters to five; add a fresh instance when testing this build.

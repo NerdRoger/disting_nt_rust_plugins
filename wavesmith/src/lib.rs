@@ -27,7 +27,7 @@ const MIDI_CHANNEL: usize = 0;
 const PITCH: usize = 1;
 const FINE: usize = 2;
 const LEVEL: usize = 3;
-const DEFAULT_SEGMENTS: usize = 8;
+const DEFAULT_SEGMENTS: usize = 32;
 const LEFT_OUTPUT: usize = 4;
 const RIGHT_OUTPUT: usize = 5;
 const OUTPUT_MODE: usize = 6;
@@ -613,7 +613,7 @@ impl Plugin for Wavesmith {
         let parameters = VOICE_START + voices * VOICE_PARAMETERS;
         Some(Configuration {
             parameters,
-            pages: 4 + voices,
+            pages: 5 + voices,
             page_indices: GLOBALS + voices * VOICE_PARAMETERS + segments * 2 + 1,
             regions: dsp::blocks(dsp::DEFAULT_TABLES),
         })
@@ -719,13 +719,19 @@ impl Plugin for Wavesmith {
             &[LEFT_OUTPUT as u8, RIGHT_OUTPUT as u8, OUTPUT_MODE as u8],
         )?;
         metadata.add_page(
-            c"Shape",
+            c"Morph",
             3,
             &[
                 WARP_POSITION as u8,
                 WARP_AMOUNT as u8,
                 SMOOTHING as u8,
                 FOLD_LIMIT as u8,
+            ],
+        )?;
+        metadata.add_page(
+            c"Reshape",
+            4,
+            &[
                 SINE_BOUNDARIES as u8,
                 TRIANGLE_BOUNDARIES as u8,
                 SQUARE_BOUNDARIES as u8,
@@ -766,7 +772,7 @@ impl Plugin for Wavesmith {
             // Shared group retains the selected parameter row between voices.
             metadata.add_page(
                 page_name,
-                4,
+                5,
                 &[
                     cv as u8,
                     transpose as u8,
@@ -812,12 +818,12 @@ impl Plugin for Wavesmith {
             c"Randomize Boundaries",
             c"Randomize Curves",
             c"Zero Curves",
-            c"Sine Boundaries",
-            c"Triangle Boundaries",
-            c"Square Boundaries",
-            c"Sawtooth Boundaries",
+            c"Sine",
+            c"Triangle",
+            c"Square",
+            c"Sawtooth",
         ]) {
-            metadata.set_parameter(parameter, definition(name, 0, 1, 0, UNIT_NONE)?)?;
+            metadata.set_parameter(parameter, definition(name, 0, 1, 0, UNIT_CONFIRM)?)?;
         }
         metadata.set_parameter(
             WARP_POSITION,
@@ -864,7 +870,7 @@ impl Plugin for Wavesmith {
             *indices.get_mut(segment * 2 + 2)? =
                 editor_parameter(n, segment, 1).unwrap_or(WAVEFORM_START) as u8;
         }
-        metadata.add_page(c"Waveform", 5, indices.get(..n * 2 + 1)?)?;
+        metadata.add_page(c"Waveform", 6, indices.get(..n * 2 + 1)?)?;
         Some(())
     }
 
@@ -925,6 +931,11 @@ impl Plugin for Wavesmith {
                     dsp::preset_boundary(shape, boundary, n),
                 );
             }
+            for segment in 0..n {
+                let _ = context.parameters().set(curve_parameter(segment), 0);
+            }
+            let _ = context.parameters().set(triggers[trigger], 0);
+            context.state_mut().trigger_high[trigger] = false;
             return;
         }
         // Publish real host parameters so the editor, modulation and presets
@@ -951,6 +962,28 @@ impl Plugin for Wavesmith {
             }
         }
         context.state_mut().random_seed = seed;
+        let _ = context.parameters().set(triggers[trigger], 0);
+        context.state_mut().trigger_high[trigger] = false;
+    }
+
+    fn parameter_string(
+        _: &mut Callback<'_, ReadOnly>,
+        parameter: i32,
+        value: i32,
+        buffer: &mut [c_char],
+    ) -> i32 {
+        if !SHAPE_TRIGGERS.iter().any(|&p| p as i32 == parameter) {
+            return 0;
+        }
+        let label = if value == 0 { c"Ready" } else { c"Apply" };
+        let bytes = label.to_bytes_with_nul();
+        let Some(output) = buffer.get_mut(..bytes.len()) else {
+            return 0;
+        };
+        for (out, &byte) in output.iter_mut().zip(bytes) {
+            *out = byte as c_char;
+        }
+        (bytes.len() - 1) as i32
     }
 
     fn prefix(_context: &mut Callback<'_, ReadOnly>, parameter: i32, buffer: &mut [c_char]) -> i32 {

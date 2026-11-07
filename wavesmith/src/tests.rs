@@ -219,7 +219,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
         unsafe {
             assert_eq!(
                 (*(*instance.base).parameter_pages).num_pages as usize,
-                4 + MAX_VOICES
+                5 + MAX_VOICES
             );
             assert_eq!(editor_parameter(n as usize, 0, 0), Some(WAVEFORM_START));
             assert_eq!(
@@ -236,33 +236,46 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 core::slice::from_raw_parts(oscillator.params, oscillator.num_params as usize),
                 &[MIDI_CHANNEL as u8, PITCH as u8, FINE as u8, LEVEL as u8]
             );
-            let shape = &*pages.pages.add(2);
-            assert_eq!(CStr::from_ptr(shape.name), c"Shape");
-            let expected_names = [
-                c"Warp Position",
-                c"Warp Amount",
-                c"Smoothing",
-                c"Fold Limit",
-                c"Sine Boundaries",
-                c"Triangle Boundaries",
-                c"Square Boundaries",
-                c"Sawtooth Boundaries",
-                c"Zero Curves",
-                c"Randomize Curves",
-                c"Randomize Boundaries",
-                c"Randomize All",
-            ];
-            let rows = core::slice::from_raw_parts(shape.params, shape.num_params as usize);
-            assert_eq!(rows.len(), expected_names.len());
-            for (&index, name) in rows.iter().zip(expected_names) {
-                assert_eq!(
-                    CStr::from_ptr((*(*instance.base).parameters.add(index as usize)).name),
-                    name
-                );
+            for (index, page_name, expected_names) in [
+                (
+                    2,
+                    c"Morph",
+                    &[
+                        c"Warp Position",
+                        c"Warp Amount",
+                        c"Smoothing",
+                        c"Fold Limit",
+                    ][..],
+                ),
+                (
+                    3,
+                    c"Reshape",
+                    &[
+                        c"Sine",
+                        c"Triangle",
+                        c"Square",
+                        c"Sawtooth",
+                        c"Zero Curves",
+                        c"Randomize Curves",
+                        c"Randomize Boundaries",
+                        c"Randomize All",
+                    ][..],
+                ),
+            ] {
+                let page = &*pages.pages.add(index);
+                assert_eq!(CStr::from_ptr(page.name), page_name);
+                let rows = core::slice::from_raw_parts(page.params, page.num_params as usize);
+                assert_eq!(rows.len(), expected_names.len());
+                for (&index, name) in rows.iter().zip(expected_names) {
+                    assert_eq!(
+                        CStr::from_ptr((*(*instance.base).parameters.add(index as usize)).name),
+                        *name
+                    );
+                }
             }
             let oscillator_group = (*pages.pages).group;
             let routing_group = (*pages.pages.add(1)).group;
-            let page = &*pages.pages.add(MAX_VOICES + 3);
+            let page = &*pages.pages.add(MAX_VOICES + 4);
             assert_eq!(CStr::from_ptr(page.name), c"Waveform");
             assert_ne!(page.group, 0);
             assert_ne!(page.group, oscillator_group);
@@ -343,15 +356,15 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 c"Randomize Boundaries",
                 c"Randomize Curves",
                 c"Zero Curves",
-                c"Sine Boundaries",
-                c"Triangle Boundaries",
-                c"Square Boundaries",
-                c"Sawtooth Boundaries",
+                c"Sine",
+                c"Triangle",
+                c"Square",
+                c"Sawtooth",
             ]) {
                 assert_eq!(references[index], 1);
                 let d = *(*instance.base).parameters.add(index);
                 assert_eq!(CStr::from_ptr(d.name), name);
-                assert_eq!((d.min, d.max, d.default, d.unit), (0, 1, 0, UNIT_NONE));
+                assert_eq!((d.min, d.max, d.default, d.unit), (0, 1, 0, UNIT_CONFIRM));
             }
             for (index, name, minimum, maximum, default) in [
                 (WARP_POSITION, c"Warp Position", 0, 255, 128),
@@ -436,9 +449,9 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
             if kind == 3 {
                 assert!(curves.iter().all(|&p| after[p] == 0));
             }
-            instance.change(trigger, 1);
-            assert_eq!(instance.values, after);
+            assert_eq!(instance.values[trigger], 0);
             instance.change(trigger, 0);
+            assert_eq!(instance.values, after);
             let rearmed = instance.values.clone();
             if kind == 3 {
                 instance.change(curves[0], 73);
@@ -457,7 +470,7 @@ fn shape_triggers_change_only_the_requested_values_for_every_segment_count() {
 }
 
 #[test]
-fn shape_trigger_edges_are_independent() {
+fn reshape_actions_reset_independently() {
     let mut instance = Instance::new(8);
     let [all, boundaries, curves, zero, ..] = SHAPE_TRIGGERS;
     for trigger in [all, boundaries, curves, zero] {
@@ -469,7 +482,8 @@ fn shape_trigger_edges_are_independent() {
     instance.change(curve_parameter(0), 73);
     let before = instance.values.clone();
     for trigger in [all, boundaries, curves, zero] {
-        instance.change(trigger, 1);
+        assert_eq!(instance.values[trigger], 0);
+        instance.change(trigger, 0);
     }
     assert_eq!(instance.values, before);
     instance.change(curves, 0);
@@ -487,7 +501,7 @@ fn shape_trigger_edges_are_independent() {
 }
 
 #[test]
-fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
+fn waveform_presets_zero_curves_preserve_globals_and_rearm() {
     for n in 2..=32 {
         let mut instance = Instance::new(n);
         let n = n as usize;
@@ -509,6 +523,9 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
         .into_iter()
         .enumerate()
         {
+            for segment in 0..n {
+                instance.change(curve_parameter(segment), 20 + segment as i16);
+            }
             let trigger = SHAPE_TRIGGERS[4 + kind];
             let before = instance.values.clone();
             instance.change(trigger, 1);
@@ -518,28 +535,30 @@ fn waveform_boundary_triggers_preserve_curves_globals_and_independent_edges() {
                     dsp::preset_boundary(shape, i, n)
                 );
             }
+            let curves: Vec<_> = (0..n).map(curve_parameter).collect();
+            assert!(curves
+                .iter()
+                .all(|&parameter| instance.values[parameter] == 0));
             for parameter in 0..before.len() {
-                if parameter != trigger && !boundaries.contains(&parameter) {
+                if parameter != trigger
+                    && !boundaries.contains(&parameter)
+                    && !curves.contains(&parameter)
+                {
                     assert_eq!(instance.values[parameter], before[parameter]);
                 }
             }
-            // Holding this trigger high must not reapply the shape, even with
-            // other waveform triggers already held high from earlier iterations.
+            assert_eq!(instance.values[trigger], 0);
             instance.change(WAVEFORM_START, 73);
-            let held = instance.values.clone();
-            for trigger in SHAPE_TRIGGERS.into_iter().skip(4).take(kind + 1) {
-                instance.change(trigger, 1);
-            }
-            assert_eq!(instance.values, held);
-            instance.change(trigger, 0);
+            // Automatic reset makes a second Apply work without manual rearming.
             instance.change(trigger, 1);
+            assert_eq!(instance.values[trigger], 0);
             assert_eq!(instance.values[WAVEFORM_START], -100);
         }
     }
 }
 
 #[test]
-fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
+fn randomize_actions_rearm_automatically_and_preserve_other_controls() {
     for n in 2..=32 {
         let mut instance = Instance::new(n);
         let n = n as usize;
@@ -566,11 +585,11 @@ fn randomize_triggers_on_rising_edges_and_preserves_other_controls() {
         assert!(first[shape_start..shape_end]
             .iter()
             .all(|v| (-100..=100).contains(v)));
-        instance.change(trigger, 1);
-        assert_eq!(instance.values, first);
+        assert_eq!(instance.values[trigger], 0);
         instance.change(trigger, 0);
-        assert_eq!(&instance.values[..trigger], &first[..trigger]);
+        assert_eq!(instance.values, first);
         instance.change(trigger, 1);
+        assert_eq!(instance.values[trigger], 0);
         assert_ne!(
             &instance.values[shape_start..shape_end],
             &first[shape_start..shape_end]
@@ -692,7 +711,7 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
         for voices in [MAX_VOICES] {
             let instance = Instance::configured(n, MAX_VOICES as i32);
             let config = Wavesmith::configuration(&[MAX_VOICES as i32, n]).unwrap();
-            assert_eq!(config.pages, voices + 4);
+            assert_eq!(config.pages, voices + 5);
             assert_eq!(
                 config.regions * core::mem::size_of::<dsp::Block>(),
                 24 * 1024
@@ -705,11 +724,11 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                     rows,
                     &[LEFT_OUTPUT as u8, RIGHT_OUTPUT as u8, OUTPUT_MODE as u8]
                 );
-                let group = (*pages.pages.add(3)).group;
+                let group = (*pages.pages.add(4)).group;
                 assert_ne!(group, 0);
                 assert_ne!(group, routing.group);
                 assert_ne!(group, (*pages.pages).group);
-                assert_ne!(group, (*pages.pages.add(voices + 3)).group);
+                assert_ne!(group, (*pages.pages.add(voices + 4)).group);
                 let mut seen = std::vec![0; instance.values.len()];
                 let mut next_ordinal = 0;
                 for i in 0..pages.num_pages as usize {
@@ -740,7 +759,7 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
                     );
                 }
                 for voice in 0..voices {
-                    let page = &*pages.pages.add(voice + 3);
+                    let page = &*pages.pages.add(voice + 4);
                     assert_eq!(
                         CStr::from_ptr(page.name).to_str().unwrap(),
                         std::format!("Voice {}", voice + 1)
@@ -1882,7 +1901,7 @@ fn persistence_metadata(instance: &Instance) -> Vec<String> {
         let pages = &*(*instance.base).parameter_pages;
         assert_eq!(
             pages.num_pages as usize,
-            (instance.values.len() - VOICE_START) / VOICE_PARAMETERS + 4
+            (instance.values.len() - VOICE_START) / VOICE_PARAMETERS + 5
         );
         for i in 0..pages.num_pages as usize {
             let page = &*pages.pages.add(i);
@@ -2870,7 +2889,7 @@ fn grouped_layout_has_none_and_ten_individual_defaults_then_none() {
     for segments in [2, 8, 32] {
         let instance = Instance::configured(segments, MAX_VOICES as i32);
         let config = Wavesmith::configuration(&[MAX_VOICES as i32, segments]).unwrap();
-        assert_eq!(config.pages, 28);
+        assert_eq!(config.pages, 29);
         assert_eq!(config.parameters, 203);
         assert!(config.parameters <= 256 && config.pages <= 31);
         for voice in 0..MAX_VOICES {
@@ -3178,11 +3197,11 @@ fn voices_specification_creates_only_requested_parameters_pages_and_processing_s
         let config = Wavesmith::configuration(&[voices as i32, 8]).unwrap();
         assert_eq!(
             (config.parameters, config.pages),
-            (83 + voices * 5, 4 + voices)
+            (83 + voices * 5, 5 + voices)
         );
         assert_eq!(instance.values.len(), config.parameters);
         assert_eq!(Wavesmith::SPECIFICATIONS[1].name, c"Segments");
-        assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 8);
+        assert_eq!(Wavesmith::SPECIFICATIONS[1].default, 32);
         let mut samples = [0.0; LAST_BUS * 24];
         GRAY_CALLS.with(|calls| calls.borrow_mut().clear());
         for _ in 0..200 {
@@ -3252,7 +3271,7 @@ fn segment_specification_hides_unused_rows_but_keeps_them_allocated_and_grayed()
                 GLOBALS + voices as usize * 5 + segments as usize * 2 + 1
             );
             let pages = unsafe { &*(*instance.base).parameter_pages };
-            let waveform = unsafe { &*(*pages).pages.add(voices as usize + 3) };
+            let waveform = unsafe { &*(*pages).pages.add(voices as usize + 4) };
             let rows = unsafe {
                 core::slice::from_raw_parts(waveform.params, waveform.num_params as usize)
             };
@@ -3374,7 +3393,7 @@ fn both_specification_ranges_are_validated_and_no_segments_parameter_remains() {
     );
     assert_eq!(
         (b.name, b.min, b.max, b.default),
-        (c"Segments" as &CStr, 2, 32, 8)
+        (c"Segments" as &CStr, 2, 32, 32)
     );
     for invalid in [
         std::vec![],
@@ -3564,5 +3583,50 @@ fn pot_reset_ignores_release_motion_for_100ms_then_resumes_from_current_position
             }
             assert_ne!(instance.values[parameter], reset);
         }
+    }
+}
+
+#[test]
+fn reshape_confirmation_labels_are_non_mutating_and_actions_reset_after_completion() {
+    let mut instance = Instance::new(32);
+    for trigger in SHAPE_TRIGGERS {
+        let before = instance.values.clone();
+        let seed = unsafe { Callback::<ReadOnly>::from_raw(instance.base) }
+            .state()
+            .random_seed;
+        for (value, expected) in [(0, "Ready"), (1, "Apply")] {
+            let mut buffer = [0 as c_char; 32];
+            let length = unsafe {
+                factory().parameter_string.unwrap()(
+                    instance.base,
+                    trigger as i32,
+                    value,
+                    buffer.as_mut_ptr(),
+                )
+            };
+            assert_eq!(length as usize, expected.len());
+            assert_eq!(
+                unsafe { CStr::from_ptr(buffer.as_ptr()).to_str().unwrap() },
+                expected
+            );
+        }
+        // Previewing the proposed confirmed value must not perform the action.
+        assert_eq!(instance.values, before);
+        assert_eq!(
+            unsafe { Callback::<ReadOnly>::from_raw(instance.base) }
+                .state()
+                .random_seed,
+            seed
+        );
+        instance.change(trigger, 1);
+        assert_eq!(instance.values[trigger], 0);
+        assert!(
+            !unsafe { Callback::<ReadOnly>::from_raw(instance.base) }
+                .state()
+                .trigger_high[SHAPE_TRIGGERS.iter().position(|&p| p == trigger).unwrap()]
+        );
+        let after = instance.values.clone();
+        instance.change(trigger, 0);
+        assert_eq!(instance.values, after);
     }
 }
