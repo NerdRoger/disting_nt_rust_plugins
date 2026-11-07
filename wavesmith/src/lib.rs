@@ -129,6 +129,22 @@ const fn default_group_value(voice: usize) -> i16 {
         0
     }
 }
+#[inline(never)]
+fn group_parameters(
+    voices: usize,
+    p: &distingnt_api::api::parameters::Parameters<'_, ReadOnly>,
+) -> [u8; MAX_VOICES] {
+    read_groups(voices, |index| p.value(index))
+}
+#[inline(never)]
+fn enabled_parameters(
+    voices: usize,
+    midi: bool,
+    p: &distingnt_api::api::parameters::Parameters<'_, ReadOnly>,
+) -> [bool; MAX_VOICES] {
+    enabled_voices(voices, midi, |index| p.value(index))
+}
+
 fn read_groups(voices: usize, value: impl Fn(usize) -> Option<i16>) -> [u8; MAX_VOICES] {
     core::array::from_fn(|voice| {
         if voice >= voices {
@@ -911,9 +927,11 @@ impl Plugin for Wavesmith {
                 .value(MIDI_CHANNEL)
                 .unwrap_or(0)
                 .clamp(0, 17) as u8;
-            let enabled = enabled_voices(context.state().voices, setting != 0, |index| {
-                context.read_parameters().value(index)
-            });
+            let enabled = enabled_parameters(
+                context.state().voices,
+                setting != 0,
+                &context.read_parameters(),
+            );
             let state = context.state_mut();
             state.set_midi_channel(setting, &enabled);
             return;
@@ -1047,8 +1065,8 @@ impl Plugin for Wavesmith {
         sync_parameter_graying(context);
         let p = context.read_parameters();
         let setting = p.value(MIDI_CHANNEL).unwrap_or(0).clamp(0, 17) as u8;
-        let enabled = enabled_voices(context.state().voices, setting != 0, |index| p.value(index));
-        let groups = read_groups(context.state().voices, |index| p.value(index));
+        let enabled = enabled_parameters(context.state().voices, setting != 0, &p);
+        let groups = group_parameters(context.state().voices, &p);
         let available = enabled_groups(&enabled, &groups);
         let attack = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
         let release = p.value(MIDI_RELEASE).unwrap_or(midi::RELEASE_DEFAULT);
@@ -1084,9 +1102,7 @@ impl Plugin for Wavesmith {
             }
         }
         let replace = p.value(OUTPUT_MODE).unwrap_or(0) != 0;
-        let enabled = enabled_voices(context.state().voices, midi_setting != 0, |index| {
-            p.value(index)
-        });
+        let enabled = enabled_parameters(context.state().voices, midi_setting != 0, &p);
         let mut render_voice = [false; MAX_VOICES];
         for ((&on, render), &gain) in enabled
             .iter()
@@ -1097,7 +1113,7 @@ impl Plugin for Wavesmith {
             *render = output_enabled && (on || gain > 0.0);
         }
         let desired_groups = if midi_setting != 0 {
-            read_groups(context.state().voices, |index| p.value(index))
+            group_parameters(context.state().voices, &p)
         } else {
             [midi::NO_GROUP; MAX_VOICES]
         };
