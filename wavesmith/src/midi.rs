@@ -99,6 +99,30 @@ pub struct MidiState {
 }
 
 impl MidiState {
+    #[inline(always)]
+    pub fn initialize(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>,
+        sample_rate: u32,
+    ) {
+        distingnt_api::initialize_region!(
+            destination,
+            MidiState {
+                gate_step: 1.0 / (sample_rate / 200).max(1) as f32,
+                attack_step: 1.0 / (sample_rate / 200).max(1) as f32,
+                samples_per_ms: sample_rate as f32 * 0.001,
+                attack_ms: ATTACK_DEFAULT,
+                release_ms: RELEASE_DEFAULT,
+                release_frames: (sample_rate as u64 * RELEASE_DEFAULT as u64 / 1000).max(1) as u32,
+                channel_setting: 0,
+            },
+            arrays {
+                groups: |_| NoteGroup::new(),
+                pitch_bends: |_| 0.0,
+            }
+        );
+    }
+
+    #[cfg(test)]
     pub fn new(sample_rate: u32) -> Self {
         Self {
             groups: [NoteGroup::new(); GROUP_COUNT],

@@ -571,6 +571,24 @@ These are executable section sizes, not instance RAM requirements; compiler or
 source changes can alter them. Decisions and measurements are recorded in
 [PERFORMANCE.md](PERFORMANCE.md).
 
+### Nested constructor initialization
+
+Instance construction now uses the initializer macro's `regions` group for the
+Engine, MIDI state, and CV pitch cache. Each subobject is populated in its final
+allocated field. The outer State was already initialized in place; returning
+these nested aggregates by value had still materialized constructor temporaries.
+The framework validates nested destination alignment and requires each child to
+finish before marking its parent initialized. Ordinary scalar/array fields keep
+the existing packed-field support; unaligned nested regions are rejected safely.
+
+In the measured ARM normal build, the initialization closure's own frame fell
+from 1,008 to 248 bytes, and the separate 488-byte Engine constructor disappeared.
+These are function frames, not the full firmware/interrupt stack high-water mark.
+ITC stayed at 19,812 bytes; DRAM code increased from 9,296 to 9,400 bytes. Instance
+memory requirements and audio processing are unchanged. A small initial Wave
+value remains for seeding the engine's existing snapshots. Per-block requested
+waveform and CV/tuning scratch are separate follow-up candidates, not changed here.
+
 ### Optional profiling build
 
 Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer

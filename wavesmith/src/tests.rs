@@ -3837,3 +3837,19 @@ fn fresh_instances_use_sine_boundaries_and_zero_curves_for_every_segment_count()
         instance.assert_guard();
     }
 }
+
+#[test]
+fn directly_initialized_subobjects_match_value_constructor_references() {
+    for segments in 2..=32 {
+        for voices in [1, 15, 24] {
+            let instance = Instance::configured(segments, voices);
+            let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+            let state = context.state();
+            let rate = state.sample_rate as u32;
+            assert_eq!(state.engine, dsp::Engine::new(segments as usize, rate));
+            assert_eq!(state.midi, midi::MidiState::new(rate));
+            assert_eq!(state.cv_pitch, dsp::CvPitchCache::new());
+            instance.assert_guard();
+        }
+    }
+}

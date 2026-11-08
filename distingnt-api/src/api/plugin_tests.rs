@@ -803,3 +803,110 @@ fn array_field_panic_never_marks_partial_state_initialized() {
     assert!(result.is_err());
     assert!(!destination.initialized);
 }
+
+#[test]
+fn nested_regions_initialize_at_their_final_addresses_with_guards() {
+    #[derive(Clone, Copy)]
+    struct Child {
+        values: [u32; 32],
+    }
+    #[derive(Clone, Copy)]
+    struct Parent {
+        marker: u32,
+        child: Child,
+    }
+    #[repr(C)]
+    struct Guarded {
+        before: u32,
+        value: MaybeUninit<Parent>,
+        after: u32,
+    }
+    let mut memory = Guarded {
+        before: 0xa5a5a5a5,
+        value: MaybeUninit::uninit(),
+        after: 0x5a5a5a5a,
+    };
+    let expected = unsafe { core::ptr::addr_of_mut!((*memory.value.as_mut_ptr()).child) };
+    let mut destination = unsafe { RegionInitializer::new(memory.value.as_mut_ptr()) };
+    crate::initialize_region!(
+        &mut destination,
+        Parent { marker: 7 },
+        arrays {},
+        regions {
+            child: |child| {
+                assert_eq!(child.__destination(), expected);
+                crate::initialize_region!(
+                    child,
+                    Child {},
+                    arrays {
+                        values: |i| (i * 3) as u32
+                    }
+                );
+            }
+        }
+    );
+    assert!(destination.initialized);
+    let value = unsafe { memory.value.assume_init() };
+    assert_eq!(value.marker, 7);
+    for (i, n) in value.child.values.iter().enumerate() {
+        assert_eq!(*n, (i * 3) as u32);
+    }
+    assert_eq!((memory.before, memory.after), (0xa5a5a5a5, 0x5a5a5a5a));
+}
+
+#[test]
+fn unfinished_or_panicking_nested_regions_do_not_publish_the_parent() {
+    #[derive(Clone, Copy)]
+    struct Parent {
+        marker: u8,
+        child: u32,
+    }
+    let mut memory = MaybeUninit::<Parent>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(memory.as_mut_ptr()) };
+    crate::initialize_region!(
+        &mut destination,
+        Parent { marker: 7 },
+        arrays {},
+        regions { child: |_| {} }
+    );
+    assert!(!destination.initialized);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::initialize_region!(
+            &mut destination,
+            Parent { marker: 8 },
+            arrays {},
+            regions {
+                child: |_| panic!("nested initialization failed")
+            }
+        );
+    }));
+    assert!(result.is_err());
+    assert!(!destination.initialized);
+}
+
+#[test]
+fn unaligned_nested_regions_are_rejected_without_calling_the_initializer() {
+    #[derive(Clone, Copy)]
+    #[repr(C, packed)]
+    struct Parent {
+        marker: u8,
+        child: u32,
+    }
+    #[repr(C, align(16))]
+    struct Aligned {
+        value: MaybeUninit<Parent>,
+    }
+    let mut memory = Aligned {
+        value: MaybeUninit::uninit(),
+    };
+    let mut destination = unsafe { RegionInitializer::new(memory.value.as_mut_ptr()) };
+    crate::initialize_region!(
+        &mut destination,
+        Parent { marker: 7 },
+        arrays {},
+        regions {
+            child: |_| panic!("unaligned nested initializer must not be admitted")
+        }
+    );
+    assert!(!destination.initialized);
+}

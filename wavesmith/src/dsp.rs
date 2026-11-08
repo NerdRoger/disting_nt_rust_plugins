@@ -78,6 +78,7 @@ const TWIDDLES: usize = BANK_BLOCKS + 2;
 const BUILD_STEPS: usize = LEVELS.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS + SOURCE_STEPS;
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct TableLayout {
     count: usize,
     cutoffs: [u8; MAX_TABLES],
@@ -628,6 +629,7 @@ fn store_table(
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct CvFactor {
     bus: i16,
     voltage: f32,
@@ -636,12 +638,29 @@ struct CvFactor {
 
 /// At most one distinct input per voice; retain exact inputs between callbacks.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct CvPitchCache {
     entries: [CvFactor; super::MAX_VOICES],
     used: usize,
 }
 
 impl CvPitchCache {
+    #[inline(always)]
+    pub fn initialize(destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>) {
+        distingnt_api::initialize_region!(
+            destination,
+            CvPitchCache { used: 0 },
+            arrays {
+                entries: |_| CvFactor {
+                    bus: -1,
+                    voltage: f32::INFINITY,
+                    factor: 1.0
+                },
+            }
+        );
+    }
+
+    #[cfg(test)]
     pub const fn new() -> Self {
         Self {
             entries: [CvFactor {
@@ -1157,6 +1176,7 @@ pub fn playback_work_counts() -> (usize, usize) {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Engine {
     layout: TableLayout,
     requested: Wave,
@@ -1184,10 +1204,46 @@ pub struct Engine {
 }
 
 impl Engine {
+    #[inline(always)]
+    pub fn initialize(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>,
+        count: usize,
+        sample_rate: u32,
+    ) {
+        let wave = Wave::new(count);
+        // Keep test-only oscillator fields out of the production layout while
+        // sharing the actual field initialization across both configurations.
+        macro_rules! initialize {
+            ($($field:ident: $value:expr),* $(,)?) => {
+                distingnt_api::initialize_region!(destination, Engine {
+                    layout: TableLayout::new(DEFAULT_TABLES),
+                    requested: wave,
+                    building: wave,
+                    active: 0,
+                    stage: 0,
+                    dirty: true,
+                    initialized: false,
+                    basis_count: 0,
+                    sample_segment: 0,
+                    fade: 0,
+                    fade_length: (sample_rate as usize / 200).max(1),
+                    ready: [false; 2],
+                    $($field: $value,)*
+                }, arrays { waves: |_| wave });
+            };
+        }
+        #[cfg(not(test))]
+        initialize!();
+        #[cfg(test)]
+        initialize!(phase: 0, level: 0.0, increment: 0.0, playback_level: 0, playback_blend: 0.0);
+    }
+
+    #[cfg(test)]
     pub fn new(count: usize, sample_rate: u32) -> Self {
         Self::with_tables(count, sample_rate, DEFAULT_TABLES)
     }
 
+    #[cfg(test)]
     fn with_tables(count: usize, sample_rate: u32, tables: usize) -> Self {
         let wave = Wave::new(count);
         Self {

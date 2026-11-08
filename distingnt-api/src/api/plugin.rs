@@ -211,25 +211,84 @@ impl<T: Copy, const N: usize> RegionInitializer<'_, [T; N]> {
 ///         arrays { samples: |_| 0 });
 /// }
 /// ```
+/// Nested aligned fields can use their own initializer rather than return an
+/// aggregate by value. A nested initializer that does not finish leaves the
+/// parent incomplete, so construction cannot publish it. Unaligned nested
+/// fields in packed structs are rejected before their initializer is called.
+/// ```
+/// #![forbid(unsafe_code)]
+/// use distingnt_api::api::plugin::RegionInitializer;
+/// #[derive(Clone, Copy)]
+/// struct Child { values: [u32; 32] }
+/// #[derive(Clone, Copy)]
+/// struct Parent { child: Child, flag: bool }
+/// fn initialize(destination: &mut RegionInitializer<'_, Parent>) {
+///     distingnt_api::initialize_region!(destination, Parent { flag: true }, arrays {},
+///         regions { child: |child| {
+///             distingnt_api::initialize_region!(child, Child {},
+///                 arrays { values: |index| index as u32 });
+///         }});
+/// }
+/// ```
 #[macro_export]
 macro_rules! initialize_region {
     ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? }) => {
-        $crate::initialize_region!($destination, $state { $($field: $value),* }, arrays {})
+        $crate::initialize_region!($destination, $state { $($field: $value),* }, arrays {}, regions {})
     };
     ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? },
-        arrays { $($array:ident: $element:expr),* $(,)? }) => {{
-        // Check omissions/duplicates across scalar and array fields without building S.
-        let _ = |value: $state| { let $state { $($field: _,)* $($array: _,)* } = value; };
+        arrays { $($array:ident: $element:expr),* $(,)? }) => {
+        $crate::initialize_region!($destination, $state { $($field: $value),* },
+            arrays { $($array: $element),* }, regions {})
+    };
+    ($destination:expr, $state:ident { $($field:ident: $value:expr),* $(,)? },
+        arrays { $($array:ident: $element:expr),* $(,)? },
+        regions { $($region:ident: $initialize:expr),* $(,)? }) => {{
+        // Check omissions/duplicates across all groups without building S.
+        let _ = |value: $state| { let $state { $($field: _,)* $($array: _,)* $($region: _,)* } = value; };
         let initializer: &mut $crate::api::plugin::RegionInitializer<'_, $state> = &mut *$destination;
         let pointer: *mut $state = initializer.__destination();
         // SAFETY: typed exclusive destination, every field checked above, each
         // expression yields that field's type. Failure/panic never publishes it.
-        // Unaligned writes also support repr(packed) state structs safely.
         $(unsafe { ::core::ptr::addr_of_mut!((*pointer).$field).write_unaligned($value); })*
         $(unsafe { $crate::api::plugin::__initialize_array_field(
             ::core::ptr::addr_of_mut!((*pointer).$array), $element); })*
-        unsafe { initializer.__finish(); }
+        let complete = true $(& {
+            let destination = unsafe { ::core::ptr::addr_of_mut!((*pointer).$region) };
+            let initialize = $crate::api::plugin::__nested_initializer(destination, $initialize);
+            unsafe { $crate::api::plugin::__initialize_nested_region(destination, initialize) }
+        })*;
+        if complete {
+            unsafe { initializer.__finish(); }
+        }
     }};
+}
+
+// Give closures their higher-ranked callback type outside the unsafe block.
+#[doc(hidden)]
+#[inline(always)]
+pub fn __nested_initializer<T: Copy, F: FnOnce(&mut RegionInitializer<'_, T>)>(
+    _: *mut T,
+    initialize: F,
+) -> F {
+    initialize
+}
+
+/// # Safety
+/// The destination is exclusive writable storage for T. Alignment is checked
+/// before admitting the nested initializer; unaligned packed fields fail safely.
+#[doc(hidden)]
+#[inline(always)]
+pub unsafe fn __initialize_nested_region<T: Copy>(
+    destination: *mut T,
+    initialize: impl FnOnce(&mut RegionInitializer<'_, T>),
+) -> bool {
+    if !(destination as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return false;
+    }
+    // SAFETY: exclusive writable destination supplied by the macro, now aligned.
+    let mut nested = unsafe { RegionInitializer::new(destination) };
+    initialize(&mut nested);
+    nested.initialized
 }
 
 /// # Safety

@@ -712,10 +712,7 @@ impl Plugin for Wavesmith {
         distingnt_api::initialize_region!(
             destination,
             State {
-                engine: dsp::Engine::new(segments, rate),
-                midi: midi::MidiState::new(rate),
                 voice_gains: [0.0; MAX_VOICES],
-                cv_pitch: dsp::CvPitchCache::new(),
                 levels: levels::LevelControl::new(rate),
                 level: levels::Level::new(),
                 mode_transition: levels::ModeTransition::new(rate),
@@ -741,6 +738,11 @@ impl Plugin for Wavesmith {
                 pans: |_| stereo::Pan::new(),
                 voice_groups: default_group,
                 group_gates: |_| [0.0; levels::CHUNK],
+            },
+            regions {
+                engine: |field| dsp::Engine::initialize(field, segments, rate),
+                midi: |field| midi::MidiState::initialize(field, rate),
+                cv_pitch: dsp::CvPitchCache::initialize,
             }
         );
         Some(())
