@@ -1908,3 +1908,28 @@ fn in_place_requests_match_snapshot_requests_during_rebuilds_and_crossfades() {
         assert_eq!(actual.waves[actual.active], desired);
     }
 }
+
+#[test]
+fn unwarped_sampling_matches_zero_warp_copy_without_changing_source() {
+    for count in 2..=MAX_SEGMENTS {
+        let mut wave = Wave::new(count);
+        for i in 0..count {
+            wave.boundaries[i] = ((i * 37 % 201) as i16) - 100;
+            wave.curves[i] = ((i * 61 % 201) as i16) - 100;
+        }
+        for amount in [-100, -1, 0, 1, 100] {
+            wave.warp_amount = amount;
+            for fold in 0..=2 {
+                wave.fold_limit = fold;
+                let original = wave;
+                let mut reference = wave;
+                reference.warp_amount = 0;
+                for i in 0..=SIZE {
+                    let phase = i as f32 / SIZE as f32;
+                    assert_eq!(wave.sample_unwarped(phase), reference.sample(phase));
+                }
+                assert_eq!(wave, original);
+            }
+        }
+    }
+}

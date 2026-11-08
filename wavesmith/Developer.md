@@ -616,6 +616,22 @@ build, ITC code increases by 32 bytes and DRAM code by 40 bytes. Normal and
 profiling host tests pass, including scratch reuse/mode-transition checks and
 existing CV/output aliasing regressions.
 
+### Borrowed rebuild source evaluation
+
+Source generation borrows the building waveform and explicitly evaluates
+equal-width coordinates when smoothing is active. This replaces the former
+144-byte waveform copy whose warp amount was temporarily set to zero, without
+changing the stored build shape or adding persistent scratch. A regression
+compares the direct evaluation exactly with the former copy-and-zero-warp
+approach across segment counts, warp amounts, folding limits, and sample phases.
+
+For this change alone, the normal ARM callback's own frame drops from 680 to
+552 bytes, including saved registers; this is not the nested-call stack peak.
+Instance SRAM is unchanged (State remains 4,924 bytes). ITC code falls from
+19,868 to 19,636 bytes, while DRAM code grows from 9,448 to 9,800 bytes. Normal
+and profiling tests pass. Audio bookkeeping arrays remain callback-local;
+the separate preallocation experiment for those arrays was reverted.
+
 ### Stack-memory follow-ups
 
 - [ ] Size per-voice scratch and persistent voice storage from the Voices

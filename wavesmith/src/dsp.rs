@@ -173,6 +173,16 @@ impl Wave {
         self.segment_sample(index, t)
     }
 
+    // Evaluate equal-width coordinates without changing the stored build shape.
+    fn sample_unwarped(&self, phase: f32) -> f32 {
+        if phase <= 0.0 || phase >= 1.0 {
+            return self.boundary_level(0);
+        }
+        let position = phase * self.count as f32;
+        let index = (position as usize).min(self.count - 1);
+        self.segment_sample(index, position - index as f32)
+    }
+
     pub fn boundary_position(&self, boundary: usize) -> f32 {
         #[cfg(test)]
         tests::count_boundary_position();
@@ -1357,10 +1367,7 @@ impl Engine {
             if self.stage < SOURCE_FFT_STAGE {
                 // Smooth and anchor in equal-width segment coordinates, then
                 // stretch that completed shape before final anti-alias filtering.
-                let mut source = self.building;
-                if source.smoothing > 0 {
-                    source.warp_amount = 0;
-                }
+                let source = &self.building;
                 let first = (self.stage - 1) * SAMPLES_PER_STEP;
                 #[cfg(test)]
                 tests::count_generated_samples(SAMPLES_PER_STEP);
@@ -1372,11 +1379,11 @@ impl Engine {
                     .take(SAMPLES_PER_STEP)
                 {
                     let phase = i as f32 / SIZE as f32;
-                    let sample = if source.warp_amount == 0 {
-                        source.sample(phase)
+                    let sample = if source.smoothing > 0 || source.warp_amount == 0 {
+                        source.sample_unwarped(phase)
                     } else {
                         let (segment, t) = cached_segment_at(
-                            &source,
+                            source,
                             &twiddles.data,
                             phase,
                             &mut self.sample_segment,
