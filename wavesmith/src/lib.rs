@@ -295,7 +295,7 @@ distingnt_api::nt_dram_section! {
 }
 
 fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
-    let mut wave = dsp::Wave::new(n);
+    let mut wave = dsp::Wave::blank(n);
     wave.boundaries[0] = value(WAVEFORM_START).unwrap_or(0).clamp(-100, 100);
     wave.smoothing = value(SMOOTHING).unwrap_or(0).clamp(0, 100);
     wave.warp_position = value(WARP_POSITION)
@@ -651,7 +651,7 @@ impl Plugin for Wavesmith {
     type State = State;
     type Region = dsp::Block;
     type StateMemory = Sram;
-    const GUID: u32 = multichar(b'N', b'R', b'w', b's');
+    const GUID: u32 = multichar(b'A', b'T', b'w', b's');
     const NAME: &'static CStr = c"Wavesmith";
     const DESCRIPTION: &'static CStr = c"Sculpt a live oscillator from curved segments";
     const TAGS: u32 = TAG_INSTRUMENT;
@@ -905,7 +905,13 @@ impl Plugin for Wavesmith {
         // Both ends of the cycle reference the same editable seam boundary.
         metadata.set_parameter(
             WAVEFORM_START,
-            definition(c"Boundary 00", -100, 100, 0, UNIT_PERCENT)?,
+            definition(
+                c"Boundary 00",
+                -100,
+                100,
+                dsp::default_level(0, n),
+                UNIT_PERCENT,
+            )?,
         )?;
         for (parameter, name) in SHAPE_TRIGGERS.into_iter().zip([
             c"Randomize All",

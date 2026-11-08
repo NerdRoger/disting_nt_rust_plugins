@@ -227,8 +227,8 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 Some(WAVEFORM_START)
             );
             let wave = read_wave(n as usize, |p| instance.values.get(p).copied());
-            assert_eq!(wave.segment_sample(0, 0.0), 0.0);
-            assert_eq!(wave.segment_sample(n as usize - 1, 1.0), 0.0);
+            assert_eq!(wave.segment_sample(0, 0.0), -1.0);
+            assert_eq!(wave.segment_sample(n as usize - 1, 1.0), -1.0);
             let pages = &*(*instance.base).parameter_pages;
             let oscillator = &*pages.pages;
             assert_eq!(CStr::from_ptr(oscillator.name), c"Oscillator");
@@ -313,7 +313,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
                 );
             }
             let seam = *(*instance.base).parameters.add(WAVEFORM_START);
-            assert_eq!((seam.min, seam.max, seam.default), (-100, 100, 0));
+            assert_eq!((seam.min, seam.max, seam.default), (-100, 100, -100));
             assert_eq!(CStr::from_ptr(seam.name), c"Boundary 00");
             let mut references = std::vec![0; instance.values.len()];
             for i in 0..pages.num_pages as usize {
@@ -706,8 +706,8 @@ fn every_supported_layout_is_continuous_after_boundary_and_curve_edits() {
                 wave.segment_sample(boundary, 0.0)
             );
         }
-        assert_eq!(wave.segment_sample(0, 0.0), 0.0);
-        assert_eq!(wave.segment_sample(n as usize - 1, 1.0), 0.0);
+        assert_eq!(wave.segment_sample(0, 0.0), -1.0);
+        assert_eq!(wave.segment_sample(n as usize - 1, 1.0), -1.0);
     }
 }
 
@@ -3808,4 +3808,32 @@ fn idle_ui_gate_tracks_unflagged_pots_before_pickup_resumes() {
         "pickup must use the most recent idle sample"
     );
     instance.assert_guard();
+}
+
+#[test]
+fn fresh_instances_use_sine_boundaries_and_zero_curves_for_every_segment_count() {
+    for count in 2..=32 {
+        let mut instance = Instance::new(count);
+        let count = count as usize;
+        let wave = dsp::Wave::new(count);
+        for boundary in 0..count {
+            let expected = (-100.0 * (std::f64::consts::TAU * boundary as f64 / count as f64).cos())
+                .round() as i16;
+            let parameter = boundary_parameter(boundary);
+            let definition = unsafe { &*(*instance.base).parameters.add(parameter) };
+            assert_eq!(definition.default, expected);
+            assert_eq!(instance.values[parameter], expected);
+            assert_eq!(wave.boundaries[boundary], expected);
+            assert_eq!(instance.values[curve_parameter(boundary)], 0);
+            assert_eq!(wave.curves[boundary], 0);
+        }
+        let original = instance.values.clone();
+        instance.change(SHAPE_TRIGGERS[4], 1);
+        assert_eq!(
+            instance.values, original,
+            "Sine action should match startup defaults"
+        );
+        assert_eq!(wave.sample(0.0), wave.sample(1.0));
+        instance.assert_guard();
+    }
 }

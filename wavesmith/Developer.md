@@ -68,7 +68,7 @@ are ignored to resynchronize after visiting another screen. Adjacent segments
 share a single boundary level and always meet. For example, the right pot on
 Segment 3 and the left pot on Segment 4 both edit Boundary 03. The beginning and
 end of the complete waveform share Boundary 00, editable from either endpoint.
-It defaults to zero but can be set anywhere from −100% to +100%; both ends always
+It defaults to −100% (the sine starting point) but can be set anywhere from −100% to +100%; both ends always
 meet at that value when the waveform repeats.
 Warp Position ranges from 0 to 255 (default 128); Warp Amount defaults to zero. Positive Warp Amount repels boundary
 positions from the warp position; negative Warp Amount attracts them. Both waveform ends
@@ -311,8 +311,10 @@ parameter list, so other host views may still show their names. Unused values
 are saved by ordinal just like active ones. Shrinking and expanding Segments via
 respecification preserves those edits, as well as surviving voice controls.
 Randomize/preset/zero-curve actions operate on active segments only. Fresh
-instances default to a triangle-like shape for their chosen segment count, with
-unused boundaries and all curves initially zero.
+instances default to the same sampled sine boundaries as Reshape → Sine for
+their chosen segment count, with unused boundaries and all curves initially zero.
+The parameter-reading path starts from blank waveform storage, so it does not
+recalculate the default sine before loading the current host parameter values.
 
 Segment count stays fixed for each instance. Editor selection and cached
 boundary-analysis weights start from that specification; there is no live

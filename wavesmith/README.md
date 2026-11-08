@@ -23,7 +23,7 @@ When adding Wavesmith, choose these specifications:
 | `Voices` | Number of oscillator voices, from 1 to 24. Default: 1. Start with one voice, then add more when you want chords, detuning, or MIDI stacks. |
 | `Segments` | Number of waveform segments, from 2 to 32. Default: 32. Fewer segments make broad shapes easier to edit; more give you finer control. |
 
-A new instance starts with a triangle-like waveform, Pitch at C3, and Level at
+A new instance starts with a sine approximation, Pitch at C3, and Level at
 −6 dB. Left Output defaults to physical Output 1, and every voice's Pitch CV
 defaults to Input 1. MIDI Channel defaults to Off, so the oscillator plays
 continuously in CV mode.

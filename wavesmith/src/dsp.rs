@@ -143,19 +143,23 @@ pub struct Wave {
 }
 
 impl Wave {
-    pub fn new(count: usize) -> Self {
-        let count = count.clamp(2, MAX_SEGMENTS);
-        let mut wave = Self {
-            count,
+    /// Initialize storage without calculating a preset that callers will replace.
+    pub fn blank(count: usize) -> Self {
+        Self {
+            count: count.clamp(2, MAX_SEGMENTS),
             smoothing: 0,
             warp_position: WARP_POSITION_DEFAULT,
             warp_amount: 0,
             fold_limit: DEFAULT_FOLD_LIMIT,
             boundaries: [0; MAX_SEGMENTS + 1],
             curves: [0; MAX_SEGMENTS],
-        };
-        for i in 1..count {
-            wave.boundaries[i] = default_level(i, count);
+        }
+    }
+
+    pub fn new(count: usize) -> Self {
+        let mut wave = Self::blank(count);
+        for i in 0..wave.count {
+            wave.boundaries[i] = default_level(i, wave.count);
         }
         wave
     }
@@ -436,22 +440,7 @@ fn audio_table_stage(wave: &Wave) -> usize {
 }
 
 pub fn default_level(node: usize, count: usize) -> i16 {
-    // A bipolar triangle-like starting wave, including for two segments.
-    let phase = node as f32 / count as f32;
-    let value = if count == 2 {
-        if node == 1 {
-            1.0
-        } else {
-            0.0
-        }
-    } else if phase < 0.25 {
-        phase * 4.0
-    } else if phase < 0.75 {
-        2.0 - phase * 4.0
-    } else {
-        phase * 4.0 - 4.0
-    };
-    (value * 100.0) as i16
+    preset_boundary(BoundaryShape::Sine, node, count)
 }
 
 #[derive(Clone, Copy, Default)]
