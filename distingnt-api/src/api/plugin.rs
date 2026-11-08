@@ -139,6 +139,25 @@ scalar_initializers!(
 );
 
 impl<T: Copy, const N: usize> RegionInitializer<'_, [T; N]> {
+    /// Initialize aggregate elements in their final locations. Unlike fill_with,
+    /// the callback never returns an element by value. Any unfinished element
+    /// leaves the entire array unpublished.
+    pub fn initialize_each(
+        &mut self,
+        mut initialize: impl FnMut(&mut RegionInitializer<'_, T>, usize),
+    ) {
+        for index in 0..N {
+            // SAFETY: the owned array contains N exclusive, aligned T slots.
+            let mut element =
+                unsafe { RegionInitializer::new(self.destination.cast::<T>().add(index)) };
+            initialize(&mut element, index);
+            if !element.initialized {
+                return;
+            }
+        }
+        self.initialized = true;
+    }
+
     /// Initialize array elements directly, without creating a temporary array.
     pub fn fill(&mut self, value: T) {
         self.fill_with(|_| value);

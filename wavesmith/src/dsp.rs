@@ -610,14 +610,15 @@ impl Block {
     };
 }
 
-// The framework constructs these small SRAM blocks independently. Keeping
-// large buffers outside State avoids large temporary return values on the
-// firmware stack. Each table uses one real or imaginary lane in a packed block.
+// Fixed shared DSP buffers are initialized block-by-block in their final SRAM
+// locations through RegionInitializer::initialize_each, never returned as a
+// whole array. Each table uses one real or imaginary lane in a packed block.
 pub const fn blocks(tables: usize) -> usize {
     tables + 6
 }
+pub const BLOCK_COUNT: usize = blocks(DEFAULT_TABLES);
 #[cfg(test)]
-const BLOCKS: usize = blocks(DEFAULT_TABLES);
+const BLOCKS: usize = BLOCK_COUNT;
 pub type Memory = [Block];
 
 fn store_table(
@@ -640,74 +641,68 @@ fn store_table(
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
-struct CvFactor {
+pub struct CvFactor {
     bus: i16,
     voltage: f32,
     factor: f32,
 }
 
-/// At most one distinct input per voice; retain exact inputs between callbacks.
+/// Cursor over at most one distinct input per voice. Entries live in the
+/// specification-sized voice records and retain exact inputs between callbacks.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct CvPitchCache {
-    entries: [CvFactor; super::MAX_VOICES],
     used: usize,
+}
+
+impl CvFactor {
+    pub const fn new() -> Self {
+        Self {
+            bus: -1,
+            voltage: f32::INFINITY,
+            factor: 1.0,
+        }
+    }
 }
 
 impl CvPitchCache {
     #[inline(always)]
     pub fn initialize(destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>) {
-        distingnt_api::initialize_region!(
-            destination,
-            CvPitchCache { used: 0 },
-            arrays {
-                entries: |_| CvFactor {
-                    bus: -1,
-                    voltage: f32::INFINITY,
-                    factor: 1.0
-                },
-            }
-        );
+        distingnt_api::initialize_region!(destination, CvPitchCache { used: 0 });
     }
-
     #[cfg(test)]
     pub const fn new() -> Self {
-        Self {
-            entries: [CvFactor {
-                bus: -1,
-                voltage: f32::INFINITY,
-                factor: 1.0,
-            }; super::MAX_VOICES],
-            used: 0,
-        }
+        Self { used: 0 }
     }
     pub fn begin_block(&mut self) {
         self.used = 0;
     }
-    pub fn factor(&mut self, bus: i16, voltage: f32) -> f32 {
+    pub fn factor<'a>(
+        &mut self,
+        bus: i16,
+        voltage: f32,
+        entries: impl Iterator<Item = &'a mut CvFactor>,
+    ) -> f32 {
         if voltage == 0.0 {
             return 1.0;
         }
-        let position = self
-            .entries
-            .iter()
-            .take(self.used)
-            .position(|entry| entry.bus == bus);
-        let index = position.unwrap_or(self.used);
-        let Some(entry) = self.entries.get_mut(index) else {
-            return distingnt_api::api::math::exp2(voltage);
-        };
-        if position.is_none() {
-            self.used += 1;
+        for (index, entry) in entries.enumerate() {
+            if index < self.used && entry.bus != bus {
+                continue;
+            }
+            if index == self.used {
+                self.used += 1;
+            }
+            if entry.bus != bus || entry.voltage != voltage {
+                entry.bus = bus;
+                entry.voltage = voltage;
+                entry.factor = distingnt_api::api::math::exp2(voltage);
+                #[cfg(test)]
+                tests::count_frequency_conversion();
+            }
+            return entry.factor;
         }
-        if entry.bus != bus || entry.voltage != voltage {
-            entry.bus = bus;
-            entry.voltage = voltage;
-            entry.factor = distingnt_api::api::math::exp2(voltage);
-            #[cfg(test)]
-            tests::count_frequency_conversion();
-        }
-        entry.factor
+        distingnt_api::api::math::exp2(voltage)
     }
 }
 

@@ -632,17 +632,78 @@ Instance SRAM is unchanged (State remains 4,924 bytes). ITC code falls from
 and profiling tests pass. Audio bookkeeping arrays remain callback-local;
 the separate preallocation experiment for those arrays was reverted.
 
-### Stack-memory follow-ups
+### Specification-sized voice storage
 
-- [ ] Size per-voice scratch and persistent voice storage from the Voices
-  specification instead of always reserving 24 slots. This includes CV/tuning
-  scratch, oscillators, pan state, gains, bindings, and the CV cache. Update the
-  firmware requirement calculation, aligned layout, and in-place initialization
-  together. Shared waveform/FFT buffers and the fixed MIDI-group count are
-  separate from voice capacity. For example, CV/tuning scratch alone would use
-  60 bytes for five voices instead of the fixed-capacity 288 bytes, before any
-  layout alignment. This layout change is deliberately deferred until after
-  testing the fixed-capacity stack reductions.
+- [x] Size persistent voice state and CV/tuning scratch from the Voices
+  specification rather than always allocating 24 entries.
+
+The framework's variable-length region now contains exactly one `Voice` record
+per specified voice. It holds oscillator state, pan state, gain, current MIDI
+binding, tuning/CV snapshots, and a CV-cache entry. The cache's used-entry cursor
+remains shared, while cache entries are stored in the requested voice records.
+The lookup retains exact bus/voltage comparisons and reuses one conversion for
+voices on the same bus; it scans initialized entries in first-use order.
+
+The twelve fixed DSP blocks move from the framework's variable region into
+`State.tables`; this relocates the same 24,576 bytes, not a new allocation.
+`RegionInitializer::initialize_each` initializes every block directly at its
+final address and refuses to publish an incomplete array. Voice records use the
+existing per-region initializer. There are no heap allocations, runtime resizing,
+or large value-returning buffer constructors. All parameter ordinals and pages
+are unchanged. Audio bookkeeping arrays on the stack remain as before, following
+the decision to reject item five; the fixed ten MIDI-group arrays also remain.
+
+The ARM normal build uses 124 bytes per Voice instead of 3,000 fixed bytes of
+voice-related data. Flattening CV bus/voltage fields allows the MIDI binding to
+occupy padding previously unused by the CV snapshot tuples. The remaining shared
+state is 1,924 bytes. `State` itself is now 26,500 bytes because it contains the
+24,576 DSP bytes; compare the complete allocation rather than State alone.
+
+Per-instance ARM SRAM breakdown (five voices, 32 segments, normal build):
+
+| Area | Before bytes | After bytes |
+|---|---:|---:|
+| Audio table banks, six tables and two edit banks | 12,288 | 12,288 |
+| Editor/smoothed waveform tables, two banks | 2,048 | 2,048 |
+| Spectrum and paired-IFFT scratch | 4,096 | 4,096 |
+| Twiddles, smoothing gains, cached geometry | 2,048 | 2,048 |
+| Boundary correction basis | 4,096 | 4,096 |
+| Shared waveform engine | 628 | 628 |
+| MIDI groups, bends, envelopes and shared gate buffers | 928 | 928 |
+| Three mix buffers | 192 | 192 |
+| Other controls, UI, level state, cache cursor and padding | 176 | 176 |
+| Oscillators | 1,824 | 380 |
+| Pan state | 480 | 100 |
+| Voice gains | 96 | 20 |
+| Voice tuning scratch | 96 | 20 |
+| CV bus/voltage snapshots, MIDI bindings and record padding | 216 | 40 |
+| CV cache entries | 288 | 60 |
+| Framework header, parameter/page metadata, indices and alignment | 2,028 | 2,028 |
+| **Total requested SRAM** | **31,528** | **29,148** |
+
+At 32 segments, normal-build requested SRAM is:
+
+| Voices | Before bytes | After bytes | Saved bytes |
+| 1 | 31,140 | 28,264 | 2,876 |
+| 5 | 31,528 | 29,148 | 2,380 |
+| 10 | 32,012 | 30,252 | 1,760 |
+| 15 | 32,500 | 31,360 | 1,140 |
+| 24 | 33,372 | 33,348 | 24 |
+
+These are ARM32 layout figures, including metadata, derived from compiler type
+sizes and the framework allocation layout. Metadata already scaled with voices
+before this change and still does. DRAM and DTC **data requests** remain zero;
+SRAM holds the data above. Factory static-data requirements are unchanged. Code
+placement in DRAM is separate from these data requests. Fewer segments reduce
+page-index storage but not the fixed waveform parameter count or DSP buffers.
+
+Normal code sections: ITC 19,636 -> 19,022 bytes (-614), DRAM code 9,800 -> 9,736
+bytes (-64). The callback's own stack frame is 552 -> 528 bytes; the constructor's
+own frame is 248 -> 240 bytes, including saved registers but excluding nested
+calls. Direct block initialization therefore has not introduced a whole-State
+or waveform-bank stack temporary. Host tests cover every voice count at 2/8/32
+segments, exact region lengths and strides, initialization, allocation guards,
+parameter routing, MIDI regrouping/stealing/release, and the existing DSP checks.
 
 ### Optional profiling build
 

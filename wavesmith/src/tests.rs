@@ -92,7 +92,7 @@ impl Instance {
                     < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>()
                         + 14000) as u32
             );
-            assert!(core::mem::size_of::<State>() < 8192);
+            assert!(core::mem::size_of::<State>() < 32768);
             let alignment =
                 distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
                     .unwrap();
@@ -401,7 +401,7 @@ fn specification_selects_voices_while_live_segments_keep_six_tables() {
             Wavesmith::configuration(&[MAX_VOICES as i32, segments])
                 .unwrap()
                 .regions,
-            dsp::blocks(dsp::DEFAULT_TABLES)
+            MAX_VOICES
         );
         let mut samples = [0.0; LAST_BUS * 24];
         instance.change(PITCH, 105);
@@ -720,7 +720,7 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
             let config = Wavesmith::configuration(&[MAX_VOICES as i32, n]).unwrap();
             assert_eq!(config.pages, voices + 5);
             assert_eq!(
-                config.regions * core::mem::size_of::<dsp::Block>(),
+                dsp::BLOCK_COUNT * core::mem::size_of::<dsp::Block>(),
                 24 * 1024
             );
             unsafe {
@@ -982,23 +982,61 @@ fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
 }
 
 #[test]
-fn preallocated_cv_scratch_is_reused_and_cleared_across_modes() {
+fn voice_regions_match_every_specification_and_initialize_in_place() {
+    for count in 1..=MAX_VOICES {
+        for segments in [2, 8, 32] {
+            let mut instance = Instance::configured(segments, count as i32);
+            {
+                let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+                assert_eq!(context.regions().len(), count);
+                assert_eq!(
+                    Wavesmith::configuration(&[count as i32, segments])
+                        .unwrap()
+                        .regions,
+                    count
+                );
+                let base = context.regions().as_ptr() as usize;
+                for (index, voice) in context.regions().iter().enumerate() {
+                    assert_eq!(
+                        voice as *const Voice as usize,
+                        base + index * core::mem::size_of::<Voice>()
+                    );
+                    assert_eq!(voice.oscillator, dsp::Oscillator::new());
+                    assert_eq!(voice.pan.gains(), stereo::Pan::new().gains());
+                    assert_eq!(voice.group, default_group(index));
+                    assert_eq!(voice.gain, 0.0);
+                    assert_eq!(voice.tuning_octaves, 0.0);
+                    assert_eq!((voice.cv_bus, voice.cv_voltage), (0, 0.0));
+                    assert_eq!(voice.cv_cache, dsp::CvFactor::new());
+                }
+            }
+            let mut samples = [0.0; LAST_BUS * 24];
+            instance.render(&mut samples);
+            instance.change(MIDI_CHANNEL, 1);
+            instance.midi(0x90, 60, 100);
+            instance.render(&mut samples);
+            instance.assert_guard();
+        }
+    }
+}
+
+#[test]
+fn preallocated_cv_scratch_is_sized_reused_and_cleared_across_modes() {
     let mut instance = Instance::configured(8, 5);
     let pointers = {
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-        let state = context.state();
-        (state.tuning_octaves.as_ptr(), state.cv_inputs.as_ptr())
+        assert_eq!(context.regions().len(), 5);
+        context.regions().as_ptr()
     };
     let mut samples = [0.0; LAST_BUS * 24];
     samples[..24].fill(0.5);
     instance.render(&mut samples);
     {
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-        let state = context.state();
-        assert_eq!(&state.cv_inputs[..5], &[(1, 0.5); 5]);
-        assert!(state.tuning_octaves[..5].iter().all(|&v| v == -1.75));
-        assert!(state.cv_inputs[5..].iter().all(|&v| v == (0, 0.0)));
-        assert!(state.tuning_octaves[5..].iter().all(|&v| v == 0.0));
+        for data in context.regions() {
+            assert_eq!((data.cv_bus, data.cv_voltage), (1, 0.5));
+            assert_eq!(data.tuning_octaves, -1.75);
+        }
     }
     for midi in [1, 0] {
         instance.change(MIDI_CHANNEL, midi);
@@ -1006,13 +1044,11 @@ fn preallocated_cv_scratch_is_reused_and_cleared_across_modes() {
         instance.change(RIGHT_OUTPUT, 0);
         instance.render(&mut samples);
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-        let state = context.state();
-        assert_eq!(
-            pointers,
-            (state.tuning_octaves.as_ptr(), state.cv_inputs.as_ptr())
-        );
-        assert!(state.tuning_octaves.iter().all(|&v| v == 0.0));
-        assert!(state.cv_inputs.iter().all(|&v| v == (0, 0.0)));
+        assert_eq!(context.regions().as_ptr(), pointers);
+        assert!(context
+            .regions()
+            .iter()
+            .all(|data| data.tuning_octaves == 0.0 && data.cv_bus == 0 && data.cv_voltage == 0.0));
     }
 }
 
@@ -2089,7 +2125,9 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
 // rounding when cents and semitones are combined in different orders.
 fn assert_cached_octave(instance: &Instance, voice: usize, expected: f32) {
     let context = unsafe { Callback::<Audio>::from_raw(instance.base) };
-    let actual = context.state().oscillators[voice].target_frequency_for_test();
+    let actual = context.regions()[voice]
+        .oscillator
+        .target_frequency_for_test();
     let rate = context.state().sample_rate;
     let expected_hz = (440.0 * 2.0f32.powf(expected)).max(0.01).min(rate * 0.45);
     // Observe the real target phase step, including the existing integer LSB.
@@ -3098,7 +3136,7 @@ fn live_group_reassignment_and_none_changes_leave_other_members_playing() {
     instance.render(&mut samples);
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
     assert_eq!(
-        context.state().voice_groups[2],
+        context.regions()[2].group,
         0,
         "fade old group before adopting new pitch"
     );
@@ -3106,7 +3144,7 @@ fn live_group_reassignment_and_none_changes_leave_other_members_playing() {
         instance.render(&mut samples);
     }
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-    assert_eq!(context.state().voice_groups[2], 1);
+    assert_eq!(context.regions()[2].group, 1);
     assert_eq!(context.state().midi.groups[0].pitch(), 60);
     assert_eq!(context.state().midi.groups[1].pitch(), 67);
     assert_cached_octave(&instance, 2, (67.0 - 69.0) / 12.0);
@@ -3539,8 +3577,8 @@ fn factory_defaults_allocate_ten_notes_and_later_voices_join_only_when_assigned(
     instance.render(&mut samples);
     assert_eq!(dsp::oscillator_tick_count() - before, 10 * 24);
     let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-    assert_eq!(context.state().voice_gains[10], 0.0);
-    assert_eq!(context.state().voice_groups[10], midi::NO_GROUP);
+    assert_eq!(context.regions()[10].gain, 0.0);
+    assert_eq!(context.regions()[10].group, midi::NO_GROUP);
     instance.assert_guard();
 }
 
@@ -3904,5 +3942,41 @@ fn reused_waveform_storage_clears_inactive_fields_and_reads_host_defaults() {
         assert!(reused.curves[count..].iter().all(|&value| value == 0));
         assert_eq!(reused.sample(0.0), reused.sample(1.0));
         instance.assert_guard();
+    }
+}
+
+#[test]
+fn instance_requirement_contains_only_requested_voice_storage() {
+    use core::mem::{align_of, size_of};
+    let mut previous: Option<usize> = None;
+    for count in 1..=MAX_VOICES {
+        let specs = [count as i32, 32];
+        let config = Wavesmith::configuration(&specs).unwrap();
+        let mut req = NtAlgorithmRequirements {
+            num_parameters: 0,
+            sram: 0,
+            dram: 0,
+            dtc: 0,
+            itc: 0,
+        };
+        unsafe {
+            factory().calculate_requirements.unwrap()(&mut req, specs.as_ptr());
+        }
+        let instance = Instance::configured(32, count as i32);
+        assert_eq!(req.sram as usize, instance.guard_offset);
+        assert_eq!((req.dram, req.dtc, req.itc), (0, 0, 0));
+        if let Some(previous) = previous {
+            let increment = req.sram as usize - previous;
+            let payload = size_of::<Voice>()
+                + VOICE_PARAMETERS * size_of::<distingnt_sys::NtParameter>()
+                + size_of::<distingnt_sys::NtParameterPage>()
+                + VOICE_PARAMETERS;
+            assert!(increment.abs_diff(payload) < align_of::<Voice>());
+        }
+        assert_eq!(
+            config.regions * size_of::<Voice>(),
+            count * size_of::<Voice>()
+        );
+        previous = Some(req.sram as usize);
     }
 }

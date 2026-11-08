@@ -1592,6 +1592,7 @@ fn fixed_pitch_follows_sub_millivolt_ramps_and_reprepares_after_rate_changes() {
 #[test]
 fn shared_cv_factor_preserves_tuning_clamps_and_reuses_conversion_across_detuned_voices() {
     let mut cache = CvPitchCache::new();
+    let mut entries = [CvFactor::new(); 10];
     let mut voices = [Oscillator::new(); 10];
     let mut max_cents = 0.0f64;
     for bus in [1, 64, 0, 3] {
@@ -1600,7 +1601,7 @@ fn shared_cv_factor_preserves_tuning_clamps_and_reuses_conversion_across_detuned
             let before = playback_work_counts().1;
             for (i, voice) in voices.iter_mut().enumerate() {
                 let tuning = i as f32 * 2.1 - 9.1;
-                let factor = cache.factor(bus, voltage);
+                let factor = cache.factor(bus, voltage, entries.iter_mut());
                 let actual = voice.cv_frequency(tuning, factor);
                 let expected = 440.0 * 2.0f64.powf(((tuning + voltage).clamp(-16.0, 16.0)) as f64);
                 max_cents = max_cents.max(1200.0 * (actual as f64 / expected).log2().abs());
@@ -1611,7 +1612,10 @@ fn shared_cv_factor_preserves_tuning_clamps_and_reuses_conversion_across_detuned
             cache.begin_block();
             let before = playback_work_counts().1;
             for (i, voice) in voices.iter_mut().enumerate() {
-                voice.cv_frequency(i as f32 * 2.1 - 9.1, cache.factor(bus, voltage));
+                voice.cv_frequency(
+                    i as f32 * 2.1 - 9.1,
+                    cache.factor(bus, voltage, entries.iter_mut()),
+                );
             }
             assert_eq!(playback_work_counts().1, before);
         }

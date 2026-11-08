@@ -371,27 +371,54 @@ impl Default for Profiling {
     }
 }
 
+// Exactly one region is requested for each specified voice. Each record is
+// initialized in its final location; no heap or maximum-size backing array.
+#[derive(Clone, Copy)]
+struct Voice {
+    oscillator: dsp::Oscillator,
+    pan: stereo::Pan,
+    gain: f32,
+    group: u8,
+    tuning_octaves: f32,
+    cv_bus: i16,
+    cv_voltage: f32,
+    cv_cache: dsp::CvFactor,
+}
+
+impl Voice {
+    fn initialize(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>,
+        index: usize,
+    ) {
+        distingnt_api::initialize_region!(
+            destination,
+            Self {
+                oscillator: dsp::Oscillator::new(),
+                pan: stereo::Pan::new(),
+                gain: 0.0,
+                group: default_group(index),
+                tuning_octaves: 0.0,
+                cv_bus: 0,
+                cv_voltage: 0.0,
+                cv_cache: dsp::CvFactor::new(),
+            }
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct State {
     engine: dsp::Engine,
-    oscillators: [dsp::Oscillator; MAX_VOICES],
+    tables: [dsp::Block; dsp::BLOCK_COUNT],
     midi: midi::MidiState,
-    // Current MIDI bindings; live edits adopt their destination after fading out.
-    voice_groups: [u8; MAX_VOICES],
     // Only ramping groups write/read these shared gates; steady gates use unity.
     group_gates: [[f32; levels::CHUNK]; midi::GROUP_COUNT],
-    // CV startup/reconnect gates, or MIDI membership/None fades.
-    voice_gains: [f32; MAX_VOICES],
     cv_pitch: dsp::CvPitchCache,
-    // Fixed-capacity block scratch; size from Voices in a later layout change.
-    tuning_octaves: [f32; MAX_VOICES],
-    cv_inputs: [(i16, f32); MAX_VOICES],
     levels: levels::LevelControl,
     level: levels::Level,
     mode_transition: levels::ModeTransition,
     right_mode_transition: levels::ModeTransition,
     routing: Option<stereo::Routing>,
-    pans: [stereo::Pan; MAX_VOICES],
     pan_slew: f32,
     mix: [f32; levels::CHUNK],
     right_mix: [f32; levels::CHUNK],
@@ -409,18 +436,28 @@ struct State {
 }
 
 impl State {
-    fn set_midi_channel(&mut self, setting: u8, enabled: &[bool; MAX_VOICES]) {
+    fn set_midi_channel(
+        &mut self,
+        setting: u8,
+        enabled: &[bool; MAX_VOICES],
+        voices: &mut [Voice],
+    ) {
         if self.midi.set_channel(setting) {
-            self.oscillators.fill(dsp::Oscillator::new());
-            for (gain, &on) in self.voice_gains.iter_mut().zip(enabled) {
-                *gain = if on { 1.0 } else { 0.0 };
+            for (voice, &on) in voices.iter_mut().zip(enabled) {
+                voice.oscillator = dsp::Oscillator::new();
+                voice.gain = if on { 1.0 } else { 0.0 };
             }
             self.levels.restart_for_mode_change();
             self.mode_transition.start();
             self.right_mode_transition.start();
         }
     }
-    fn set_routing(&mut self, routing: stereo::Routing, pan_positions: &[i16; MAX_VOICES]) {
+    fn set_routing(
+        &mut self,
+        routing: stereo::Routing,
+        pan_positions: &[i16; MAX_VOICES],
+        voices: &mut [Voice],
+    ) {
         let old = self.routing;
         let changed = old != Some(routing);
         let first_bus = if routing.stereo() {
@@ -464,7 +501,8 @@ impl State {
                 self.levels.restart_for_mode_change();
             }
         }
-        for (pan, &position) in self.pans.iter_mut().zip(pan_positions).take(self.voices) {
+        for (voice, &position) in voices.iter_mut().zip(pan_positions) {
+            let pan = &mut voice.pan;
             let gains = pan.gains();
             let immediate = old.is_none() || old.is_some_and(|old| !old.enabled());
             if routing.stereo() {
@@ -503,7 +541,7 @@ impl State {
     }
 }
 
-type Callback<'a, Mode> = Context<'a, State, dsp::Block, Mode, Sram>;
+type Callback<'a, Mode> = Context<'a, State, Voice, Mode, Sram>;
 struct Wavesmith;
 
 fn sync_segment_graying(context: &mut Callback<'_, Audio>) {
@@ -659,7 +697,7 @@ const CURVE_NAMES: [&CStr; 32] = [
 
 impl Plugin for Wavesmith {
     type State = State;
-    type Region = dsp::Block;
+    type Region = Voice;
     type StateMemory = Sram;
     const GUID: u32 = multichar(b'A', b'T', b'w', b's');
     const NAME: &'static CStr = c"Wavesmith";
@@ -704,7 +742,7 @@ impl Plugin for Wavesmith {
             parameters,
             pages: 5 + voices,
             page_indices: GLOBALS + 2 + voices * VOICE_PARAMETERS + segments * 2 + 1,
-            regions: dsp::blocks(dsp::DEFAULT_TABLES),
+            regions: voices,
         })
     }
 
@@ -722,7 +760,6 @@ impl Plugin for Wavesmith {
         distingnt_api::initialize_region!(
             destination,
             State {
-                voice_gains: [0.0; MAX_VOICES],
                 levels: levels::LevelControl::new(rate),
                 level: levels::Level::new(),
                 mode_transition: levels::ModeTransition::new(rate),
@@ -744,28 +781,24 @@ impl Plugin for Wavesmith {
                 grayed_for_stereo: None,
             },
             arrays {
-                oscillators: |_| dsp::Oscillator::new(),
-                pans: |_| stereo::Pan::new(),
-                voice_groups: default_group,
                 group_gates: |_| [0.0; levels::CHUNK],
-                tuning_octaves: |_| 0.0,
-                cv_inputs: |_| (0, 0.0),
             },
             regions {
                 engine: |field| dsp::Engine::initialize(field, segments, rate),
                 midi: |field| midi::MidiState::initialize(field, rate),
                 cv_pitch: dsp::CvPitchCache::initialize,
+                tables: |field| field.initialize_each(|block, _| dsp::Block::initialize(block)),
             }
         );
         Some(())
     }
 
     fn initialize_region(
-        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, dsp::Block>,
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Voice>,
         _: &[i32],
-        _: usize,
+        index: usize,
     ) -> Option<()> {
-        dsp::Block::initialize(destination);
+        Voice::initialize(destination, index);
         Some(())
     }
 
@@ -1009,8 +1042,10 @@ impl Plugin for Wavesmith {
                 setting != 0,
                 &context.read_parameters(),
             );
-            let state = context.state_mut();
-            state.set_midi_channel(setting, &enabled);
+            let processing = context.processing();
+            processing
+                .state
+                .set_midi_channel(setting, &enabled, processing.regions);
             return;
         }
         if parameter == LEFT_OUTPUT as i32 || parameter == RIGHT_OUTPUT as i32 {
@@ -1103,9 +1138,10 @@ impl Plugin for Wavesmith {
         let available = enabled_groups(&enabled, &groups);
         let attack = p.value(MIDI_ATTACK).unwrap_or(midi::ATTACK_DEFAULT);
         let release = p.value(MIDI_RELEASE).unwrap_or(midi::RELEASE_DEFAULT);
-        let state = context.state_mut();
+        let processing = context.processing();
+        let state = processing.state;
         state.midi.set_envelope(attack, release);
-        state.set_midi_channel(setting, &enabled);
+        state.set_midi_channel(setting, &enabled, processing.regions);
         state.midi.message(status, data1, data2, &available);
     }
 
@@ -1139,7 +1175,7 @@ impl Plugin for Wavesmith {
         for ((&on, render), &gain) in enabled
             .iter()
             .zip(&mut render_voice)
-            .zip(&context.state().voice_gains)
+            .zip(context.regions().iter().map(|voice| &voice.gain))
             .take(voices)
         {
             *render = output_enabled && (on || gain > 0.0);
@@ -1158,18 +1194,16 @@ impl Plugin for Wavesmith {
         // including release tails. No pitch value doubles as an enabled flag.
         let processing = context.processing();
         let state = processing.state;
-        state.tuning_octaves.fill(0.0);
-        state.cv_inputs.fill((0, 0.0));
+        let voice_data = processing.regions;
+        for voice in voice_data.iter_mut() {
+            voice.tuning_octaves = 0.0;
+            voice.cv_bus = 0;
+            voice.cv_voltage = 0.0;
+        }
         // Snapshot CV before clearing or writing the shared destination. MIDI
         // tuning is read later, after binding resolution and the sounding check.
         if output_enabled && midi_setting == 0 {
-            for (voice, (pitch, &render)) in state
-                .tuning_octaves
-                .iter_mut()
-                .zip(&render_voice)
-                .take(voices)
-                .enumerate()
-            {
+            for (voice, (data, &render)) in voice_data.iter_mut().zip(&render_voice).enumerate() {
                 if !render {
                     continue;
                 }
@@ -1195,10 +1229,9 @@ impl Plugin for Wavesmith {
                 } else {
                     0.0
                 };
-                if let Some(input) = state.cv_inputs.get_mut(voice) {
-                    *input = (bus, cv);
-                }
-                *pitch = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
+                data.cv_bus = bus;
+                data.cv_voltage = cv;
+                data.tuning_octaves = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
         state.engine.update_request(|requested| {
@@ -1207,14 +1240,16 @@ impl Plugin for Wavesmith {
         state.ui.advance(frames);
         state.midi.set_envelope(attack_ms, release_ms);
         let level = state.level.amplitude(level_db);
-        let memory = processing.regions;
-        state.set_midi_channel(midi_setting, &enabled);
-        state.set_routing(routing, &pan_positions);
+        state.set_midi_channel(midi_setting, &enabled, voice_data);
+        state.set_routing(routing, &pan_positions, voice_data);
+        let memory = &mut state.tables[..];
         if output_enabled {
             state.midi.release_disabled(&available);
         } else {
             state.midi.sync_enabled(&available);
-            state.voice_gains = [0.0; MAX_VOICES];
+            for voice in voice_data.iter_mut() {
+                voice.gain = 0.0;
+            }
         }
         state.midi.begin_block();
         let retuned = core::array::from_fn::<_, { midi::GROUP_COUNT }, _>(|group| {
@@ -1225,22 +1260,25 @@ impl Plugin for Wavesmith {
                 .is_some_and(|group| group.take_retune())
         });
         state.cv_pitch.begin_block();
-        for (
-            voice,
-            (((((((oscillator, gain), binding), &desired), &on), &tuning), &(bus, cv)), render),
-        ) in state
-            .oscillators
-            .iter_mut()
-            .zip(&mut state.voice_gains)
-            .zip(&mut state.voice_groups)
-            .zip(&desired_groups)
-            .zip(&enabled)
-            .zip(&state.tuning_octaves)
-            .zip(&state.cv_inputs)
-            .zip(&mut render_voice)
-            .take(voices)
-            .enumerate()
-        {
+        for voice in 0..voice_data.len().min(MAX_VOICES) {
+            let factor = if midi_setting == 0 && render_voice[voice] {
+                let data = &voice_data[voice];
+                state.cv_pitch.factor(
+                    data.cv_bus,
+                    data.cv_voltage,
+                    voice_data.iter_mut().map(|data| &mut data.cv_cache),
+                )
+            } else {
+                1.0
+            };
+            let data = &mut voice_data[voice];
+            let oscillator = &mut data.oscillator;
+            let gain = &mut data.gain;
+            let binding = &mut data.group;
+            let desired = desired_groups[voice];
+            let on = enabled[voice];
+            let tuning = data.tuning_octaves;
+            let render = &mut render_voice[voice];
             if midi_setting != 0 {
                 let old_sounding = state
                     .midi
@@ -1297,7 +1335,6 @@ impl Plugin for Wavesmith {
                     oscillator.prepare(frequency, state.sample_rate, level);
                 }
             } else if *render {
-                let factor = state.cv_pitch.factor(bus, cv);
                 if frames > 0 {
                     oscillator.prepare_cv(tuning, factor, state.sample_rate, level);
                 }
@@ -1355,17 +1392,16 @@ impl Plugin for Wavesmith {
                         }
                     }
                 }
-                for ((((((oscillator, gain), &binding), &desired), &render), &on), pan) in state
-                    .oscillators
+                for (((data, &desired), &render), &on) in voice_data
                     .iter_mut()
-                    .zip(&mut state.voice_gains)
-                    .zip(&state.voice_groups)
                     .zip(&desired_groups)
                     .zip(&render_voice)
                     .zip(&enabled)
-                    .zip(&mut state.pans)
-                    .take(voices)
                 {
+                    let oscillator = &mut data.oscillator;
+                    let gain = &mut data.gain;
+                    let binding = data.group;
+                    let pan = &mut data.pan;
                     if !render {
                         continue;
                     }

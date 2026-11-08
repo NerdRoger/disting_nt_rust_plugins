@@ -910,3 +910,56 @@ fn unaligned_nested_regions_are_rejected_without_calling_the_initializer() {
     );
     assert!(!destination.initialized);
 }
+
+#[test]
+fn aggregate_array_elements_initialize_in_place_and_reject_unfinished_entries() {
+    #[derive(Clone, Copy)]
+    struct Entry {
+        index: u32,
+        samples: [u32; 128],
+    }
+    #[repr(C)]
+    struct Guarded {
+        before: u32,
+        entries: MaybeUninit<[Entry; 3]>,
+        after: u32,
+    }
+    let mut memory = Guarded {
+        before: 0xa5a5a5a5,
+        entries: MaybeUninit::uninit(),
+        after: 0x5a5a5a5a,
+    };
+    let base = memory.entries.as_mut_ptr().cast::<Entry>();
+    let mut destination = unsafe { RegionInitializer::new(memory.entries.as_mut_ptr()) };
+    destination.initialize_each(|entry, index| {
+        assert_eq!(entry.__destination(), unsafe { base.add(index) });
+        crate::initialize_region!(
+            entry,
+            Entry {
+                index: index as u32
+            },
+            arrays {
+                samples: |i| (index * 128 + i) as u32
+            }
+        );
+    });
+    assert!(destination.initialized);
+    let entries = unsafe { &*memory.entries.as_ptr() };
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.index, index as u32);
+        assert_eq!(entry.samples[127], (index * 128 + 127) as u32);
+    }
+    assert_eq!((memory.before, memory.after), (0xa5a5a5a5, 0x5a5a5a5a));
+    let mut unfinished = MaybeUninit::<[u32; 3]>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(unfinished.as_mut_ptr()) };
+    destination.initialize_each(|entry, index| {
+        if index != 1 {
+            entry.set(index as u32);
+        }
+    });
+    assert!(!destination.initialized);
+    let mut empty = MaybeUninit::<[u32; 0]>::uninit();
+    let mut destination = unsafe { RegionInitializer::new(empty.as_mut_ptr()) };
+    destination.initialize_each(|_, _| panic!("empty array has no elements"));
+    assert!(destination.initialized);
+}
