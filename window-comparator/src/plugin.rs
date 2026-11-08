@@ -15,6 +15,7 @@ impl Plugin for WindowComparator {
     type State = State;
     type Region = Channel;
     type StateMemory = distingnt_api::api::state_memory::Sram;
+    type ExtraRegions = ();
     const GUID: u32 = multichar(b'A', b'T', b'w', b'R');
     const NAME: &'static core::ffi::CStr = c"Rust Window Comparator";
     const DESCRIPTION: &'static core::ffi::CStr = c"A window comparator";

@@ -321,9 +321,18 @@ fn add_harmonic(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], k: usize
     }
 }
 
-// Cache the boundary analysis basis once per specification. Two independent
-// blocks hold up to 16 harmonics x 32 boundaries, without a large State/stack.
-fn prepare_boundary_basis(n: usize, basis: &mut [Block; 2]) {
+// Cache one complex weight per boundary and correction harmonic.
+pub const fn basis_entries(count: usize) -> usize {
+    let n = if count < 2 {
+        2
+    } else if count > MAX_SEGMENTS {
+        MAX_SEGMENTS
+    } else {
+        count
+    };
+    n * (n / 2)
+}
+fn prepare_boundary_basis(n: usize, basis: &mut [Complex]) {
     let n = n.clamp(2, MAX_SEGMENTS);
     for k in 1..=n / 2 {
         let angle = core::f32::consts::TAU * k as f32 / n as f32;
@@ -331,7 +340,10 @@ fn prepare_boundary_basis(n: usize, basis: &mut [Block; 2]) {
         let (mut cosine, mut sinusoid) = (1.0, 0.0);
         for i in 0..n {
             let index = (k - 1) * n + i;
-            basis[(index / SIZE) & 1].data[index & (SIZE - 1)] = Complex {
+            let Some(slot) = basis.get_mut(index) else {
+                return;
+            };
+            *slot = Complex {
                 re: cosine,
                 im: sinusoid,
             };
@@ -348,7 +360,7 @@ fn anchor_boundary_step(
     wave: &Wave,
     data: &mut [Complex; SIZE],
     twiddles: &[Complex; SIZE],
-    basis: &[Block; 2],
+    basis: &[Complex],
     errors: &mut [Complex; SIZE],
     step: usize,
 ) {
@@ -375,7 +387,9 @@ fn anchor_boundary_step(
             let (mut a, mut b) = (0.0, 0.0);
             for (i, error) in errors.iter().take(n).enumerate() {
                 let index = (k - 1) * n + i;
-                let weight = basis[(index / SIZE) & 1].data[index & (SIZE - 1)];
+                let Some(&weight) = basis.get(index) else {
+                    return;
+                };
                 a += error.re * weight.re;
                 b += error.re * weight.im;
             }
@@ -407,6 +421,7 @@ fn set_cached_geometry(twiddles: &mut [Complex; SIZE], index: usize, value: f32)
     }
 }
 
+#[inline(always)]
 fn prepare_geometry(wave: &Wave, twiddles: &mut [Complex; SIZE]) {
     for i in 0..=wave.count {
         set_cached_geometry(twiddles, i, wave.boundary_position(i));
@@ -455,12 +470,15 @@ pub fn default_level(node: usize, count: usize) -> i16 {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Complex {
+pub struct Complex {
     re: f32,
     im: f32,
 }
 
 impl Complex {
+    pub fn initialize(destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>) {
+        distingnt_api::initialize_region!(destination, Self { re: 0.0, im: 0.0 });
+    }
     fn mul(self, rhs: Self) -> Self {
         Self {
             re: self.re * rhs.re - self.im * rhs.im,
@@ -614,11 +632,17 @@ impl Block {
 // locations through RegionInitializer::initialize_each, never returned as a
 // whole array. Each table uses one real or imaginary lane in a packed block.
 pub const fn blocks(tables: usize) -> usize {
-    tables + 6
+    tables + 4
 }
 pub const BLOCK_COUNT: usize = blocks(DEFAULT_TABLES);
 #[cfg(test)]
-const BLOCKS: usize = BLOCK_COUNT;
+const BLOCKS: usize = reference_blocks(DEFAULT_TABLES);
+// Native-only fixtures retain the former packed cache blocks to check the
+// existing reference traces and cache contents without production padding.
+#[cfg(test)]
+const fn reference_blocks(tables: usize) -> usize {
+    blocks(tables) + 2
+}
 pub type Memory = [Block];
 
 fn store_table(
@@ -1303,7 +1327,24 @@ impl Engine {
         self.dirty = !self.ready[latest & 1] || self.requested != self.waves[latest & 1];
     }
 
+    #[cfg(test)]
     pub fn advance(&mut self, memory: &mut Memory) {
+        let count = blocks(self.layout.count);
+        if memory.len() != count + 2 {
+            return;
+        }
+        let (memory, packed) = memory.split_at_mut(count);
+        let mut basis = [Complex::default(); MAX_SEGMENTS * (MAX_SEGMENTS / 2)];
+        for (to, block) in basis.chunks_mut(SIZE).zip(packed.iter()) {
+            to.copy_from_slice(&block.data);
+        }
+        self.advance_with_basis(memory, &mut basis);
+        for (from, block) in basis.chunks(SIZE).zip(packed.iter_mut()) {
+            block.data.copy_from_slice(from);
+        }
+    }
+
+    pub fn advance_with_basis(&mut self, memory: &mut Memory, basis: &mut [Complex]) {
         if self.fade > 0 {
             return;
         }
@@ -1314,14 +1355,13 @@ impl Engine {
             self.building = self.requested;
         }
         let tables_per_bank = self.layout.count + 1;
-        if memory.len() != blocks(self.layout.count) {
+        if memory.len() != blocks(self.layout.count)
+            || basis.len() < basis_entries(self.building.count)
+        {
             return;
         }
         let (banks, workspace) = memory.split_at_mut(tables_per_bank);
-        let [spectrum, scratch, twiddles, basis @ ..] = workspace else {
-            return;
-        };
-        let Ok(basis) = <&mut [Block; 2]>::try_from(basis) else {
+        let [spectrum, scratch, twiddles] = workspace else {
             return;
         };
         if !self.initialized {

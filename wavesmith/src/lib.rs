@@ -541,7 +541,8 @@ impl State {
     }
 }
 
-type Callback<'a, Mode> = Context<'a, State, Voice, Mode, Sram>;
+type Callback<'a, Mode> =
+    Context<'a, State, Voice, Mode, Sram, distingnt_api::api::plugin::ExtraRegions<dsp::Complex>>;
 struct Wavesmith;
 
 fn sync_segment_graying(context: &mut Callback<'_, Audio>) {
@@ -699,6 +700,18 @@ impl Plugin for Wavesmith {
     type State = State;
     type Region = Voice;
     type StateMemory = Sram;
+    type ExtraRegions = distingnt_api::api::plugin::ExtraRegions<dsp::Complex>;
+    fn extra_region_count(specs: &[i32]) -> usize {
+        segment_count(specs).map(dsp::basis_entries).unwrap_or(0)
+    }
+    fn initialize_extra_region(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, dsp::Complex>,
+        _: &[i32],
+        _: usize,
+    ) -> Option<()> {
+        dsp::Complex::initialize(destination);
+        Some(())
+    }
     const GUID: u32 = multichar(b'A', b'T', b'w', b's');
     const NAME: &'static CStr = c"Wavesmith";
     const DESCRIPTION: &'static CStr = c"Sculpt a live oscillator from curved segments";
@@ -1342,7 +1355,9 @@ impl Plugin for Wavesmith {
         }
         #[cfg(feature = "profiling")]
         let setup_end = distingnt_api::api::cpu_cycle_count();
-        state.engine.advance(memory);
+        state
+            .engine
+            .advance_with_basis(memory, processing.extra_regions);
         #[cfg(feature = "profiling")]
         let build_end = distingnt_api::api::cpu_cycle_count();
         #[cfg(feature = "profiling")]

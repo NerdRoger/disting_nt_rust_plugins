@@ -705,6 +705,60 @@ or waveform-bank stack temporary. Host tests cover every voice count at 2/8/32
 segments, exact region lengths and strides, initialization, allocation guards,
 parameter routing, MIDI regrouping/stealing/release, and the existing DSP checks.
 
+### Segment-sized boundary correction cache prototype
+
+The boundary-correction cache is now a second typed region array in the
+firmware's instance SRAM allocation. It contains exactly
+`segments * floor(segments / 2)` complex weights (8 bytes each). The main voice
+array continues to use the Voices specification. Ten fixed DSP blocks remain in
+State (20,480 bytes); the old two basis blocks are removed. Boundary/curve
+parameters, four waveform snapshots, audio tables and FFT size are unchanged.
+
+The framework's optional `ExtraRegions<T>` policy adds an ARM32 offset/count
+descriptor of 8 bytes only for algorithms opting into this second array. Other
+Rust plugins declare `ExtraRegions = ()`, with a zero-sized descriptor and no
+additional RAM. Both arrays use checked layouts and direct element initialization;
+Context processing returns disjoint, callback-scoped typed slices. Initialization
+failure, count overflow and misalignment are covered by framework tests. Counts
+are evaluated once per construction to prevent a mutable count hook from
+invalidating its checked allocation.
+
+Boundary weights retain their previous order and arithmetic. Checked slice
+lookups avoid introducing precompiled panic routines with unsupported ARM
+relocations. Native-only packed-cache fixtures retain the previous two blocks
+and adapt them to the same builder; independent smoothing-reference tests remain.
+Tests compare exact-sized caches against those fixtures for every segment count,
+including odd counts, with smoothing/warp edits, bit-identical audio/table results,
+and guard checks around the cache. The native fixture's fixed maximum temporary
+is excluded from firmware builds.
+
+| Segments | Previous cache bytes | New cache + descriptor bytes | Net SRAM saved |
+|---|---:|---:|---:|
+| 2 | 4,096 | 24 | 4,072 |
+| 8 | 4,096 | 264 | 3,832 |
+| 16 | 4,096 | 1,032 | 3,064 |
+| 24 | 4,096 | 2,312 | 1,784 |
+| 32 | 4,096 | 4,104 | -8 |
+
+These savings apply independently of voice count. With one voice and eight
+segments, total requested normal-build SRAM is 28,216 -> 24,384 bytes. At the
+default 32 segments there is no cache reduction and SRAM grows by the descriptor's
+8 bytes. State itself is 26,500 -> 22,404 bytes, with the cache now accounted for
+separately in the total allocation. DRAM/DTC data requests remain zero.
+
+The initial normal ARM build changed ITC from 19,022 to 19,278 bytes. Testing
+forced inlining of the two helpers that the compiler had stopped inlining gave
+19,144 bytes for geometry only, 19,216 for stage calculation only, and 19,178 for
+both. Geometry-only inlining is retained: ITC is now 19,022 -> 19,144 (+122).
+DRAM code is 9,736 -> 9,800 (+64), for 186 bytes of net code growth. The audio
+callback's own frame is 528 -> 536 bytes; construction remains 240 bytes. These
+include saved registers, not nested call peaks. The full suite passes: 155 normal
+and 158 profiling Wavesmith tests, 38 API unit tests, other Rust plugins, ABI,
+static-placement probes and documentation tests. No device CPU gain is claimed.
+
+The preceding voice-storage RAM tables describe the committed pre-prototype
+layout; apply the net savings above for the current boundary-cache prototype.
+
 ### Optional profiling build
 
 Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer

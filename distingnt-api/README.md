@@ -38,6 +38,23 @@ these objects out as a fixed-size array in the host-provided RAM and calls
 `Processing::regions` expose that initialized array. These are memory regions,
 not musical voices; a plugin needing no additional objects specifies zero.
 
+Plugins also declare `type ExtraRegions = ();` when no second array is needed.
+This opt-out has a zero-sized descriptor, so existing plugins gain no instance
+RAM cost. For two independently sized element types, select
+`type ExtraRegions = api::plugin::ExtraRegions<T>;`, return the second count
+from `extra_region_count(specifications)`, and initialize each element in
+`initialize_extra_region`. Both arrays are included in the firmware SRAM request
+using checked, disjoint, aligned layouts. `Context::extra_regions()` and
+`Processing::extra_regions` expose the completed second array. Include the same
+policy as the sixth `Context` type argument in that plugin's callback alias.
+Counts are sampled once during construction; incomplete element initialization
+or overflowing requirements fail before the instance is published.
+
+For fixed arrays of aggregate objects inside State, use
+`RegionInitializer::initialize_each` with an element initializer. This initializes
+each object directly at its final address rather than returning an aggregate
+through `fill_with`.
+
 Construction requires the direct `initialize_state` and `initialize_region`
 hooks; value-returning constructors and generic whole-state setters are unavailable. This is a required API migration for downstream plugins.
 Instance state retains its selected SRAM/DTC placement; preallocated regions

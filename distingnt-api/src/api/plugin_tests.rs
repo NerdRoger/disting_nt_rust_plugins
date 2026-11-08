@@ -31,6 +31,7 @@ impl Plugin for Example {
     type State = u32;
     type Region = u32;
     type StateMemory = Sram;
+    type ExtraRegions = ();
     const GUID: u32 = 1;
     const NAME: &'static CStr = c"Framework test";
     const DESCRIPTION: &'static CStr = c"";
@@ -134,6 +135,7 @@ impl<const ENABLED: bool> Plugin for AllCallbacks<ENABLED> {
     type State = [u8; 8];
     type Region = ();
     type StateMemory = Sram;
+    type ExtraRegions = ();
     const GUID: u32 = 2;
     const NAME: &'static CStr = c"All callbacks";
     const DESCRIPTION: &'static CStr = c"";
@@ -962,4 +964,143 @@ fn aggregate_array_elements_initialize_in_place_and_reject_unfinished_entries() 
     let mut destination = unsafe { RegionInitializer::new(empty.as_mut_ptr()) };
     destination.initialize_each(|_, _| panic!("empty array has no elements"));
     assert!(destination.initialized);
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct ExtraValue {
+    index: u32,
+    payload: [u32; 3],
+}
+struct ExtraExample;
+std::thread_local! {
+    static EXTRA_COUNT: Cell<usize> = const { Cell::new(3) };
+    static EXTRA_CALLS: Cell<usize> = const { Cell::new(0) };
+    static EXTRA_FINISH: Cell<bool> = const { Cell::new(true) };
+}
+impl Plugin for ExtraExample {
+    type State = u32;
+    type Region = u32;
+    type StateMemory = Sram;
+    type ExtraRegions = ExtraRegions<ExtraValue>;
+    const GUID: u32 = 2;
+    const NAME: &'static CStr = c"Extra array test";
+    const DESCRIPTION: &'static CStr = c"";
+    const TAGS: u32 = TAG_UTILITY;
+    const SPECIFICATIONS: &'static [Specification] = &[];
+    fn configuration(specs: &[i32]) -> Option<Configuration> {
+        Example::configuration(specs)
+    }
+    fn initialize_state(p: &mut RegionInitializer<'_, u32>, _: &[i32], _: u32) -> Option<()> {
+        p.set(123);
+        Some(())
+    }
+    fn initialize_region(p: &mut RegionInitializer<'_, u32>, _: &[i32], i: usize) -> Option<()> {
+        p.set(i as u32);
+        Some(())
+    }
+    fn metadata(specs: &[i32], m: &mut Metadata<'_>) -> Option<()> {
+        Example::metadata(specs, m)
+    }
+    fn extra_region_count(_: &[i32]) -> usize {
+        EXTRA_CALLS.with(|c| c.set(c.get() + 1));
+        EXTRA_COUNT.with(Cell::get)
+    }
+    fn initialize_extra_region(
+        p: &mut RegionInitializer<'_, ExtraValue>,
+        _: &[i32],
+        index: usize,
+    ) -> Option<()> {
+        if EXTRA_FINISH.with(Cell::get) {
+            crate::initialize_region!(
+                p,
+                ExtraValue {
+                    index: index as u32
+                },
+                arrays {
+                    payload: |i| (index * 3 + i) as u32
+                }
+            );
+        }
+        Some(())
+    }
+}
+#[test]
+fn extra_regions_are_sized_aligned_disjoint_and_initialized_before_publication() {
+    MODE.with(|m| m.set(Mode::Valid));
+    EXTRA_FINISH.with(|v| v.set(true));
+    for count in [0, 1, 3, 512] {
+        EXTRA_COUNT.with(|v| v.set(count));
+        let allocation = Allocation::for_plugin::<ExtraExample>();
+        // Allocation includes at least one alignment unit after the request.
+        unsafe {
+            ptr::write_bytes(allocation.raw.add(allocation.req.sram as usize), 0xa5, 16);
+        }
+        EXTRA_CALLS.with(|v| v.set(0));
+        let base = allocation.construct_plugin::<ExtraExample>();
+        assert!(!base.is_null());
+        assert_eq!(
+            EXTRA_CALLS.with(Cell::get),
+            1,
+            "construction must not recompute the array count"
+        );
+        let values = [7i16];
+        unsafe {
+            (*base).v = values.as_ptr();
+        }
+        let mut context =
+            unsafe { Context::<u32, u32, Audio, Sram, ExtraRegions<ExtraValue>>::admit(base) };
+        assert_eq!(context.extra_regions().len(), count);
+        {
+            let data = context.processing();
+            *data.state = 456;
+            data.regions[1] = 99;
+            for (i, extra) in data.extra_regions.iter_mut().enumerate() {
+                assert_eq!(extra as *const ExtraValue as usize % 16, 0);
+                assert_eq!(extra.index, i as u32);
+                assert_eq!(
+                    extra.payload,
+                    [(i * 3) as u32, (i * 3 + 1) as u32, (i * 3 + 2) as u32]
+                );
+                extra.index = 77;
+            }
+        }
+        assert_eq!(*context.state(), 456);
+        assert_eq!(context.regions(), &[0, 99]);
+        assert!(context.extra_regions().iter().all(|v| v.index == 77));
+        let guard =
+            unsafe { slice::from_raw_parts(allocation.raw.add(allocation.req.sram as usize), 16) };
+        assert!(guard.iter().all(|&v| v == 0xa5));
+    }
+    EXTRA_COUNT.with(|v| v.set(3));
+    EXTRA_FINISH.with(|v| v.set(false));
+    let allocation = Allocation::for_plugin::<ExtraExample>();
+    assert!(allocation.construct_plugin::<ExtraExample>().is_null());
+    EXTRA_FINISH.with(|v| v.set(true));
+}
+#[test]
+fn extra_region_overflow_is_rejected_and_disabled_policy_has_no_descriptor_storage() {
+    MODE.with(|m| m.set(Mode::Valid));
+    EXTRA_COUNT.with(|v| v.set(usize::MAX));
+    let mut req = NtAlgorithmRequirements {
+        num_parameters: 0,
+        sram: 1,
+        dram: 1,
+        dtc: 1,
+        itc: 1,
+    };
+    unsafe {
+        Registration::<ExtraExample, 0>::calculate_requirements(&mut req, ptr::null());
+    }
+    assert_eq!(
+        (req.num_parameters, req.sram, req.dram, req.dtc, req.itc),
+        (0, 0, 0, 0, 0)
+    );
+    EXTRA_COUNT.with(|v| v.set(3));
+    assert_eq!(
+        core::mem::size_of::<<() as ExtraRegionLayout>::Descriptor>(),
+        0
+    );
+    let config = Example::configuration(&[]).unwrap();
+    assert!(InstanceLayout::with_extra::<u32, u32, Sram, ()>(config, 1).is_none());
 }

@@ -108,6 +108,7 @@ impl Plugin for RustSynth {
     type State = SynthState;
     type Region = ();
     type StateMemory = Dtc;
+    type ExtraRegions = ();
     const GUID: u32 = multichar(b'A', b'T', b'm', b's');
     const NAME: &'static core::ffi::CStr = c"Rustsynth";
     const DESCRIPTION: &'static core::ffi::CStr = c"A Rust MIDI synth with a safe DSP core";

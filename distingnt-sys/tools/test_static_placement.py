@@ -37,6 +37,7 @@ impl Plugin for Probe {
     type State = [u8; 8];
     type Region = ();
     type StateMemory = Sram;
+    type ExtraRegions = ();
     const GUID: u32 = 1;
     const NAME: &'static core::ffi::CStr = c"Static probe";
     const DESCRIPTION: &'static core::ffi::CStr = c"";

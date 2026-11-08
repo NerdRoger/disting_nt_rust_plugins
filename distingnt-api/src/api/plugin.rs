@@ -23,6 +23,55 @@ use core::{
     ptr, slice,
 };
 
+/// Optional second, independently sized array in firmware-allocated SRAM.
+/// Use `()` to omit it without adding an instance descriptor or RAM cost.
+pub struct ExtraRegions<T: Copy + 'static>(PhantomData<T>);
+
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct ExtraRegionDescriptor {
+    offset: usize,
+    count: usize,
+}
+
+mod extra_sealed {
+    pub trait Sealed {}
+    impl Sealed for () {}
+    impl<T: Copy + 'static> Sealed for super::ExtraRegions<T> {}
+}
+
+/// Sealed policies for an optional additional typed region array.
+pub trait ExtraRegionLayout: extra_sealed::Sealed + 'static {
+    type Element: Copy + 'static;
+    type Descriptor: Copy;
+    #[doc(hidden)]
+    const ENABLED: bool;
+    #[doc(hidden)]
+    fn descriptor(offset: usize, count: usize) -> Self::Descriptor;
+    #[doc(hidden)]
+    fn span(descriptor: &Self::Descriptor) -> (usize, usize);
+}
+impl ExtraRegionLayout for () {
+    type Element = ();
+    type Descriptor = ();
+    const ENABLED: bool = false;
+    fn descriptor(_: usize, _: usize) {}
+    fn span(_: &()) -> (usize, usize) {
+        (0, 0)
+    }
+}
+impl<T: Copy + 'static> ExtraRegionLayout for ExtraRegions<T> {
+    type Element = T;
+    type Descriptor = ExtraRegionDescriptor;
+    const ENABLED: bool = true;
+    fn descriptor(offset: usize, count: usize) -> Self::Descriptor {
+        ExtraRegionDescriptor { offset, count }
+    }
+    fn span(descriptor: &Self::Descriptor) -> (usize, usize) {
+        (descriptor.offset, descriptor.count)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Configuration {
     pub parameters: usize,
@@ -343,6 +392,7 @@ pub unsafe fn __initialize_array_field<T: Copy, const N: usize>(
 ///     type State = ();
 ///     type Region = ();
 ///     type StateMemory = Sram;
+///     type ExtraRegions = ();
 ///     const GUID: u32 = 1;
 ///     const NAME: &'static core::ffi::CStr = c"Missing initializers";
 ///     const DESCRIPTION: &'static core::ffi::CStr = c"";
@@ -356,6 +406,17 @@ pub trait Plugin: Sized + 'static {
     type State: Copy + 'static;
     type Region: Copy + 'static;
     type StateMemory: StateMemory<Self::State>;
+    type ExtraRegions: ExtraRegionLayout;
+    fn extra_region_count(_: &[i32]) -> usize {
+        0
+    }
+    fn initialize_extra_region(
+        _: &mut RegionInitializer<'_, <Self::ExtraRegions as ExtraRegionLayout>::Element>,
+        _: &[i32],
+        _: usize,
+    ) -> Option<()> {
+        None
+    }
     const GUID: u32;
     const NAME: &'static CStr;
     const DESCRIPTION: &'static CStr;
@@ -401,56 +462,107 @@ pub trait Plugin: Sized + 'static {
     ) -> Option<()>;
     fn metadata(specifications: &[i32], metadata: &mut Metadata<'_>) -> Option<()>;
     fn parameter_changed(
-        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            Audio,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: i32,
     ) {
     }
     fn step(
-        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            Audio,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: &mut [f32],
         _: usize,
     ) {
     }
     fn draw(
-        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory, Self::ExtraRegions>,
         _: Canvas<'_>,
     ) -> bool {
         false
     }
     fn custom_ui(
-        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>,
+        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory, Self::ExtraRegions>,
         _: &NtUiData,
     ) {
     }
     /// Return the currently overridden controls, within the CUSTOM_UI mask.
     fn has_custom_ui(
-        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
     ) -> u32 {
         Self::CUSTOM_UI
     }
-    fn setup_ui(_: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory>) -> NtFloat3 {
+    fn setup_ui(
+        _: &mut Context<'_, Self::State, Self::Region, Ui, Self::StateMemory, Self::ExtraRegions>,
+    ) -> NtFloat3 {
         [0.5; 3]
     }
     fn serialise(
-        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: &mut JsonWriter<'_>,
     ) {
     }
     fn deserialise(
-        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: &mut JsonReader<'_>,
     ) -> bool {
         true
     }
     fn prefix(
-        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: i32,
         _: &mut [c_char],
     ) -> i32 {
         0
     }
     fn parameter_string(
-        _: &mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: i32,
         _: i32,
         _: &mut [c_char],
@@ -458,12 +570,26 @@ pub trait Plugin: Sized + 'static {
         0
     }
     fn midi_realtime(
-        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            Audio,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: u8,
     ) {
     }
     fn midi_message(
-        _: &mut Context<'_, Self::State, Self::Region, Audio, Self::StateMemory>,
+        _: &mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            Audio,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: u8,
         _: u8,
         _: u8,
@@ -480,13 +606,20 @@ pub trait Plugin: Sized + 'static {
     /// ```compile_fail
     /// use distingnt_api::api::{plugin::{Plugin, Context}, parameters::ReadOnly};
     /// fn retain<P: Plugin>(
-    ///     context: &mut Context<'_, P::State, P::Region, ReadOnly, P::StateMemory>,
+    ///     context: &mut Context<'_, P::State, P::Region, ReadOnly, P::StateMemory, P::ExtraRegions>,
     /// ) -> &'static mut [u8] {
     ///     P::string_parameter_buffer(context, 0).unwrap()
     /// }
     /// ```
     fn string_parameter_buffer<'a>(
-        _: &'a mut Context<'_, Self::State, Self::Region, ReadOnly, Self::StateMemory>,
+        _: &'a mut Context<
+            '_,
+            Self::State,
+            Self::Region,
+            ReadOnly,
+            Self::StateMemory,
+            Self::ExtraRegions,
+        >,
         _: i32,
     ) -> Option<&'a mut [u8]> {
         None
@@ -495,25 +628,36 @@ pub trait Plugin: Sized + 'static {
 
 /// The fields are private: plugin code cannot forge callback state or counts.
 #[repr(C)]
-struct Storage<S: Copy, M: StateMemory<S>> {
+struct Storage<S: Copy, M: StateMemory<S>, E: ExtraRegionLayout = ()> {
     base: NtAlgorithm,
     pages: NtParameterPages,
     parameter_count: usize,
     region_count: usize,
     region_offset: usize,
     state: M::Slot,
+    extra: E::Descriptor,
 }
 
-pub struct Context<'callback, S: Copy, V: Copy, Mode, M: StateMemory<S> = Sram> {
-    raw: *mut Storage<S, M>,
+pub struct Context<
+    'callback,
+    S: Copy,
+    V: Copy,
+    Mode,
+    M: StateMemory<S> = Sram,
+    E: ExtraRegionLayout = (),
+> {
+    raw: *mut Storage<S, M, E>,
     _lifetime: PhantomData<&'callback mut (S, V, Mode)>,
 }
-pub struct Processing<'a, S, V> {
+pub struct Processing<'a, S, V, E = ()> {
     pub state: &'a mut S,
     pub regions: &'a mut [V],
+    pub extra_regions: &'a mut [E],
     pub parameters: ParameterValues<'a>,
 }
-impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
+impl<S: Copy, V: Copy, Mode, M: StateMemory<S>, E: ExtraRegionLayout>
+    Context<'_, S, V, Mode, M, E>
+{
     /// ABI admission for external host harnesses. Normal plugins receive contexts
     /// from Registration and never call this constructor.
     /// # Safety
@@ -564,9 +708,25 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
         // SAFETY: the exclusive context borrow excludes all aliases to this region.
         unsafe { slice::from_raw_parts_mut(self.region_pointer(), (*self.raw).region_count) }
     }
+    fn extra_region_parts(&self) -> (*mut E::Element, usize) {
+        // SAFETY: the descriptor is published only after all extra elements are
+        // initialized in a checked, disjoint layout.
+        let (offset, count) = E::span(unsafe { &(*self.raw).extra });
+        let pointer = if count == 0 {
+            core::ptr::NonNull::<E::Element>::dangling().as_ptr()
+        } else {
+            unsafe { self.raw.cast::<u8>().add(offset).cast() }
+        };
+        (pointer, count)
+    }
+    /// Read-only access to the optional additional initialized region array.
+    pub fn extra_regions(&self) -> &[E::Element] {
+        let (pointer, count) = self.extra_region_parts();
+        unsafe { slice::from_raw_parts(pointer, count) }
+    }
     /// Borrows state and regions together without calling or borrowing the host.
     #[inline]
-    pub fn processing(&mut self) -> Processing<'_, S, V> {
+    pub fn processing(&mut self) -> Processing<'_, S, V, E::Element> {
         // SAFETY: state, region storage, definitions and host v are disjoint.
         // The exclusive context borrow prevents creating a setter until these
         // references have expired; these references cannot escape the callback.
@@ -574,6 +734,10 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
             Processing {
                 state: &mut *M::pointer(ptr::addr_of_mut!((*self.raw).state)),
                 regions: slice::from_raw_parts_mut(self.region_pointer(), (*self.raw).region_count),
+                extra_regions: {
+                    let (pointer, count) = self.extra_region_parts();
+                    slice::from_raw_parts_mut(pointer, count)
+                },
                 parameters: ParameterValues::new(
                     if (*self.raw).parameter_count == 0 {
                         &[]
@@ -627,7 +791,7 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>> Context<'_, S, V, Mode, M> {
     }
 }
 
-impl<S: Copy, V: Copy, M: StateMemory<S>> Context<'_, S, V, Audio, M> {
+impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V, Audio, M, E> {
     /// Send a complete SysEx message from an audio callback. Include F0 and
     /// seven-bit payload bytes; the host appends F7 synchronously.
     pub fn send_midi_sysex(&mut self, destination: u32, message: &[u8]) -> bool {
@@ -724,13 +888,24 @@ struct InstanceLayout {
     pages: usize,
     indices: usize,
     regions: usize,
+    extra_regions: usize,
 }
 impl InstanceLayout {
+    #[cfg(test)]
     fn new<S: Copy, V: Copy, M: StateMemory<S>>(config: Configuration) -> Option<Self> {
+        Self::with_extra::<S, V, M, ()>(config, 0)
+    }
+    fn with_extra<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout>(
+        config: Configuration,
+        extra_count: usize,
+    ) -> Option<Self> {
+        if !E::ENABLED && extra_count != 0 {
+            return None;
+        }
         if config.parameters > 256 || config.pages > u32::MAX as usize {
             return None;
         }
-        let (layout, parameters) = Layout::new::<Storage<S, M>>()
+        let (layout, parameters) = Layout::new::<Storage<S, M, E>>()
             .extend(Layout::array::<NtParameter>(config.parameters).ok()?)
             .ok()?;
         let (layout, pages) = layout
@@ -739,8 +914,11 @@ impl InstanceLayout {
         let (layout, indices) = layout
             .extend(Layout::array::<u8>(config.page_indices).ok()?)
             .ok()?;
-        let (allocation, regions) = layout
+        let (layout, regions) = layout
             .extend(Layout::array::<V>(config.regions).ok()?)
+            .ok()?;
+        let (allocation, extra_regions) = layout
+            .extend(Layout::array::<E::Element>(extra_count).ok()?)
             .ok()?;
         if allocation.size() > u32::MAX as usize || M::dtc_size() > u32::MAX as usize {
             return None;
@@ -751,6 +929,7 @@ impl InstanceLayout {
             pages,
             indices,
             regions,
+            extra_regions,
         })
     }
 }
@@ -914,9 +1093,12 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
     }
     pub fn alignment(specs: &[i32]) -> Option<usize> {
         Some(
-            InstanceLayout::new::<P::State, P::Region, P::StateMemory>(P::configuration(specs)?)?
-                .allocation
-                .align(),
+            InstanceLayout::with_extra::<P::State, P::Region, P::StateMemory, P::ExtraRegions>(
+                P::configuration(specs)?,
+                P::extra_region_count(specs),
+            )?
+            .allocation
+            .align(),
         )
     }
     crate::nt_dram_section! {
@@ -1030,15 +1212,15 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
             itc: 0,
         };
         // SAFETY: host callback supplies readable specs and a writable result.
-        if let Some((config, layout)) = unsafe { Self::specs(specs) }
-            .and_then(P::configuration)
-            .and_then(|config| {
-                Some((
+        if let Some((config, layout)) = unsafe { Self::specs(specs) }.and_then(|specs| {
+            let config = P::configuration(specs)?;
+            let layout =
+                InstanceLayout::with_extra::<P::State, P::Region, P::StateMemory, P::ExtraRegions>(
                     config,
-                    InstanceLayout::new::<P::State, P::Region, P::StateMemory>(config)?,
-                ))
-            })
-        {
+                    P::extra_region_count(specs),
+                )?;
+            Some((config, layout))
+        }) {
             result.num_parameters = config.parameters as u32;
             result.sram = layout.allocation.size() as u32;
             result.dtc = P::StateMemory::dtc_size() as u32;
@@ -1064,7 +1246,12 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         let Some(config) = P::configuration(specs) else {
             return ptr::null_mut();
         };
-        let Some(layout) = InstanceLayout::new::<P::State, P::Region, P::StateMemory>(config)
+        let extra_count = P::extra_region_count(specs);
+        let Some(layout) =
+            InstanceLayout::with_extra::<P::State, P::Region, P::StateMemory, P::ExtraRegions>(
+                config,
+                extra_count,
+            )
         else {
             return ptr::null_mut();
         };
@@ -1084,7 +1271,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         {
             return ptr::null_mut();
         }
-        let raw = ram.cast::<Storage<P::State, P::StateMemory>>();
+        let raw = ram.cast::<Storage<P::State, P::StateMemory, P::ExtraRegions>>();
         // SAFETY: checked aligned allocation layout, exclusively available here.
         let (parameters, pages, indices, regions) = unsafe {
             (
@@ -1098,6 +1285,20 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
             // SAFETY: each disjoint aligned region slot is initialized in place.
             let mut destination = unsafe { RegionInitializer::new(regions.add(index)) };
             if P::initialize_region(&mut destination, specs, index).is_none()
+                || !destination.initialized
+            {
+                return ptr::null_mut();
+            }
+        }
+        let extra = unsafe {
+            ram.add(layout.extra_regions)
+                .cast::<<P::ExtraRegions as ExtraRegionLayout>::Element>()
+        };
+        for index in 0..extra_count {
+            // SAFETY: layout checked the full array's size/alignment and its
+            // disjointness from state, primary regions and metadata.
+            let mut destination = unsafe { RegionInitializer::new(extra.add(index)) };
+            if P::initialize_extra_region(&mut destination, specs, index).is_none()
                 || !destination.initialized
             {
                 return ptr::null_mut();
@@ -1158,6 +1359,10 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
             ptr::write(ptr::addr_of_mut!((*raw).parameter_count), config.parameters);
             ptr::write(ptr::addr_of_mut!((*raw).region_count), config.regions);
             ptr::write(ptr::addr_of_mut!((*raw).region_offset), layout.regions);
+            ptr::write(
+                ptr::addr_of_mut!((*raw).extra),
+                P::ExtraRegions::descriptor(layout.extra_regions, extra_count),
+            );
         }
         raw.cast()
     }

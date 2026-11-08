@@ -393,8 +393,8 @@ fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts()
     for tables in 1..=MAX_TABLES {
         for n in [2, 7, 32] {
             for smoothing in [0, 50, 100] {
-                let mut storage = [Block::ZERO; blocks(MAX_TABLES)];
-                let memory = &mut storage[..blocks(tables)];
+                let mut storage = [Block::ZERO; reference_blocks(MAX_TABLES)];
+                let memory = &mut storage[..reference_blocks(tables)];
                 let mut engine = Engine::with_tables(n, 48000, tables);
                 let mut wave = Wave::new(n);
                 wave.smoothing = smoothing;
@@ -867,7 +867,7 @@ fn fold_limit_controls_excursion_and_preserves_bounded_curves_and_anchors() {
 #[test]
 fn changing_fold_limit_rebuilds_the_audio_and_editor_without_changing_other_shape_values() {
     let mut engine = Engine::with_tables(8, 48000, 1);
-    let mut storage = [Block::ZERO; blocks(1)];
+    let mut storage = [Block::ZERO; reference_blocks(1)];
     let mut wave = Wave::new(8);
     wave.curves.fill(73);
     let mut previous = None;
@@ -1173,8 +1173,8 @@ fn every_specification_has_distinct_nested_limits_and_safe_selection() {
 #[test]
 fn all_table_counts_build_complete_banks_and_single_table_bypasses_filtering() {
     for tables in 1..=MAX_TABLES {
-        let mut storage = [Block::ZERO; blocks(MAX_TABLES)];
-        let memory = &mut storage[..blocks(tables)];
+        let mut storage = [Block::ZERO; reference_blocks(MAX_TABLES)];
+        let memory = &mut storage[..reference_blocks(tables)];
         let mut engine = Engine::with_tables(32, 48000, tables);
         let mut wave = Wave::new(32);
         for i in 0..32 {
@@ -1933,6 +1933,54 @@ fn unwarped_sampling_matches_zero_warp_copy_without_changing_source() {
                     assert_eq!(wave.sample_unwarped(phase), reference.sample(phase));
                 }
                 assert_eq!(wave, original);
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_sized_boundary_cache_matches_packed_fixture_and_preserves_guards() {
+    for n in 2..=MAX_SEGMENTS {
+        let mut actual = Engine::new(n, 48000);
+        let mut reference = Engine::new(n, 48000);
+        let mut memory = [Block::ZERO; BLOCK_COUNT];
+        let mut reference_memory = [Block::ZERO; BLOCKS];
+        let length = basis_entries(n);
+        let sentinel = Complex {
+            re: 12345.25,
+            im: -6789.5,
+        };
+        let mut cache = std::vec![sentinel; length + 2];
+        for &(smooth, warp) in &[(0, 0), (1, -100), (63, 100), (100, 47)] {
+            let mut wave = Wave::new(n);
+            wave.smoothing = smooth;
+            wave.warp_amount = warp;
+            for i in 0..n {
+                wave.boundaries[i] = ((i * 73 + n * 17) % 201) as i16 - 100;
+                wave.curves[i] = ((i * 31 + n * 19) % 201) as i16 - 100;
+            }
+            actual.request(wave);
+            reference.request(wave);
+            for _ in 0..200 {
+                actual.advance_with_basis(&mut memory, &mut cache[1..length + 1]);
+                reference.advance(&mut reference_memory);
+                for _ in 0..64 {
+                    assert_eq!(
+                        actual.tick(&memory, 440.0, 48000.0, 1.0),
+                        reference.tick(&reference_memory, 440.0, 48000.0, 1.0)
+                    );
+                }
+            }
+            assert_eq!(actual.waves[actual.active], wave);
+            for (a, b) in memory.iter().zip(&reference_memory) {
+                for (x, y) in a.data.iter().zip(&b.data) {
+                    assert_eq!(x.re, y.re);
+                    assert_eq!(x.im, y.im);
+                }
+            }
+            for guard in [cache[0], cache[length + 1]] {
+                assert_eq!(guard.re, sentinel.re);
+                assert_eq!(guard.im, sentinel.im);
             }
         }
     }

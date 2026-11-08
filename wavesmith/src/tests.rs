@@ -90,6 +90,7 @@ impl Instance {
             assert!(
                 req.sram
                     < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>()
+                        + dsp::basis_entries(n as usize) * core::mem::size_of::<dsp::Complex>()
                         + 14000) as u32
             );
             assert!(core::mem::size_of::<State>() < 32768);
@@ -721,7 +722,7 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
             assert_eq!(config.pages, voices + 5);
             assert_eq!(
                 dsp::BLOCK_COUNT * core::mem::size_of::<dsp::Block>(),
-                24 * 1024
+                20 * 1024
             );
             unsafe {
                 let pages = &*(*instance.base).parameter_pages;
@@ -3978,5 +3979,29 @@ fn instance_requirement_contains_only_requested_voice_storage() {
             count * size_of::<Voice>()
         );
         previous = Some(req.sram as usize);
+    }
+}
+
+#[test]
+fn boundary_cache_allocation_matches_segments_and_leaves_voice_storage_unchanged() {
+    for segments in 2..=32 {
+        for voices in [1, 5, 24] {
+            let mut instance = Instance::configured(segments, voices);
+            let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+            let expected = segments as usize * (segments as usize / 2);
+            assert_eq!(context.extra_regions().len(), expected);
+            assert_eq!(context.regions().len(), voices as usize);
+            let pointer = context.extra_regions().as_ptr() as usize;
+            assert_eq!(pointer % core::mem::align_of::<dsp::Complex>(), 0);
+            let mut samples = [0.0; LAST_BUS * 24];
+            instance.change(SMOOTHING, 63);
+            instance.change(WARP_AMOUNT, -47);
+            for _ in 0..100 {
+                instance.render(&mut samples);
+            }
+            let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+            assert_eq!(context.extra_regions().as_ptr() as usize, pointer);
+            instance.assert_guard();
+        }
     }
 }
