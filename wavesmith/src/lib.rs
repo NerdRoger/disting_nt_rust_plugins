@@ -383,6 +383,9 @@ struct State {
     // CV startup/reconnect gates, or MIDI membership/None fades.
     voice_gains: [f32; MAX_VOICES],
     cv_pitch: dsp::CvPitchCache,
+    // Fixed-capacity block scratch; size from Voices in a later layout change.
+    tuning_octaves: [f32; MAX_VOICES],
+    cv_inputs: [(i16, f32); MAX_VOICES],
     levels: levels::LevelControl,
     level: levels::Level,
     mode_transition: levels::ModeTransition,
@@ -745,6 +748,8 @@ impl Plugin for Wavesmith {
                 pans: |_| stereo::Pan::new(),
                 voice_groups: default_group,
                 group_gates: |_| [0.0; levels::CHUNK],
+                tuning_octaves: |_| 0.0,
+                cv_inputs: |_| (0, 0.0),
             },
             regions {
                 engine: |field| dsp::Engine::initialize(field, segments, rate),
@@ -1151,12 +1156,15 @@ impl Plugin for Wavesmith {
         };
         // Tuning remains in octaves throughout setup; render_voice owns eligibility,
         // including release tails. No pitch value doubles as an enabled flag.
-        let mut tuning_octaves = [0.0f32; MAX_VOICES];
-        let mut cv_inputs = [(0i16, 0.0f32); MAX_VOICES];
+        let processing = context.processing();
+        let state = processing.state;
+        state.tuning_octaves.fill(0.0);
+        state.cv_inputs.fill((0, 0.0));
         // Snapshot CV before clearing or writing the shared destination. MIDI
         // tuning is read later, after binding resolution and the sounding check.
         if output_enabled && midi_setting == 0 {
-            for (voice, (pitch, &render)) in tuning_octaves
+            for (voice, (pitch, &render)) in state
+                .tuning_octaves
                 .iter_mut()
                 .zip(&render_voice)
                 .take(voices)
@@ -1165,31 +1173,34 @@ impl Plugin for Wavesmith {
                 if !render {
                     continue;
                 }
-                let voice_fine = p
+                let voice_fine = processing
+                    .parameters
                     .value(voice_fine_parameter(voice))
                     .unwrap_or(0)
                     .clamp(-100, 100) as f32
                     / 1200.0;
-                let transpose = p
+                let transpose = processing
+                    .parameters
                     .value(voice_transpose_parameter(voice))
                     .unwrap_or(0)
                     .clamp(-48, 48) as f32
                     / 12.0;
-                let bus = p.value(voice_pitch_parameter(voice)).unwrap_or(1);
+                let bus = processing
+                    .parameters
+                    .value(voice_pitch_parameter(voice))
+                    .unwrap_or(1);
                 let cv = buses.read_first(bus);
                 let cv = if cv.is_finite() {
                     cv.clamp(-10.0, 10.0)
                 } else {
                     0.0
                 };
-                if let Some(input) = cv_inputs.get_mut(voice) {
+                if let Some(input) = state.cv_inputs.get_mut(voice) {
                     *input = (bus, cv);
                 }
                 *pitch = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
-        let processing = context.processing();
-        let state = processing.state;
         state.engine.update_request(|requested| {
             read_wave_into(requested, n, |index| processing.parameters.value(index));
         });
@@ -1224,8 +1235,8 @@ impl Plugin for Wavesmith {
             .zip(&mut state.voice_groups)
             .zip(&desired_groups)
             .zip(&enabled)
-            .zip(&tuning_octaves)
-            .zip(&cv_inputs)
+            .zip(&state.tuning_octaves)
+            .zip(&state.cv_inputs)
             .zip(&mut render_voice)
             .take(voices)
             .enumerate()

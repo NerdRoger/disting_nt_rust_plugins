@@ -982,6 +982,41 @@ fn shared_output_none_skips_all_voices_and_clears_midi_notes() {
 }
 
 #[test]
+fn preallocated_cv_scratch_is_reused_and_cleared_across_modes() {
+    let mut instance = Instance::configured(8, 5);
+    let pointers = {
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        let state = context.state();
+        (state.tuning_octaves.as_ptr(), state.cv_inputs.as_ptr())
+    };
+    let mut samples = [0.0; LAST_BUS * 24];
+    samples[..24].fill(0.5);
+    instance.render(&mut samples);
+    {
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        let state = context.state();
+        assert_eq!(&state.cv_inputs[..5], &[(1, 0.5); 5]);
+        assert!(state.tuning_octaves[..5].iter().all(|&v| v == -1.75));
+        assert!(state.cv_inputs[5..].iter().all(|&v| v == (0, 0.0)));
+        assert!(state.tuning_octaves[5..].iter().all(|&v| v == 0.0));
+    }
+    for midi in [1, 0] {
+        instance.change(MIDI_CHANNEL, midi);
+        instance.change(LEFT_OUTPUT, 0);
+        instance.change(RIGHT_OUTPUT, 0);
+        instance.render(&mut samples);
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        let state = context.state();
+        assert_eq!(
+            pointers,
+            (state.tuning_octaves.as_ptr(), state.cv_inputs.as_ptr())
+        );
+        assert!(state.tuning_octaves.iter().all(|&v| v == 0.0));
+        assert!(state.cv_inputs.iter().all(|&v| v == (0, 0.0)));
+    }
+}
+
+#[test]
 fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
     const FRAMES: usize = 24;
     for voices in 1..=MAX_VOICES {

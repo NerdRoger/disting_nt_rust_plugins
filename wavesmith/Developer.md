@@ -604,6 +604,30 @@ occur together in setup; the incremental builder remains afterwards, so whole
 callback measurements are the appropriate before/after CPU comparison. The
 per-block CV/tuning scratch arrays have not changed.
 
+### Preallocated CV/tuning scratch
+
+The audio callback reuses instance-owned CV snapshots and tuning values instead
+of constructing two fixed-capacity arrays on its stack. Both arrays are cleared
+at the start of setup; CV is still captured before any destination bus writes.
+This moves 288 bytes into firmware-preallocated SRAM per instance. The normal
+ARM callback's own frame falls from 968 to 680 bytes, including saved registers;
+this is not the full nested-call stack high-water mark. Compared with the prior
+build, ITC code increases by 32 bytes and DRAM code by 40 bytes. Normal and
+profiling host tests pass, including scratch reuse/mode-transition checks and
+existing CV/output aliasing regressions.
+
+### Stack-memory follow-ups
+
+- [ ] Size per-voice scratch and persistent voice storage from the Voices
+  specification instead of always reserving 24 slots. This includes CV/tuning
+  scratch, oscillators, pan state, gains, bindings, and the CV cache. Update the
+  firmware requirement calculation, aligned layout, and in-place initialization
+  together. Shared waveform/FFT buffers and the fixed MIDI-group count are
+  separate from voice capacity. For example, CV/tuning scratch alone would use
+  60 bytes for five voices instead of the fixed-capacity 288 bytes, before any
+  layout alignment. This layout change is deliberately deferred until after
+  testing the fixed-capacity stack reductions.
+
 ### Optional profiling build
 
 Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer
