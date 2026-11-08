@@ -265,10 +265,11 @@ the preset after finding a sound you want to keep.
 Copy `wavesmith.o` to `/programs/plug-ins/` on the NT's SD card, then rescan plugins
 or restart the module and add Wavesmith. Use firmware that supports plugin API 14.
 
+Here is a video I made covering most of the functionality described above.
+
+[Video](https://www.youtube.com/watch?v=wuIpuhD0L1Y)
+
 Report bugs and suggestions on [GitHub](https://github.com/NerdRoger/disting_nt_rust_plugins/issues).
-When upgrading from a build without Attack and Release, add a fresh Wavesmith
-instance and review your voice settings and mappings; the voice parameter
-positions have changed.
 
 For build instructions, implementation notes, and profiling, see
 [Developer.md](Developer.md).
