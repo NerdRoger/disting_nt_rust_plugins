@@ -1859,3 +1859,52 @@ fn batched_envelope_rejection_does_not_advance_or_modify_output() {
     assert_eq!(voice, before);
     assert_eq!(samples, [0.0; 16]);
 }
+
+#[test]
+fn in_place_requests_match_snapshot_requests_during_rebuilds_and_crossfades() {
+    for count in [2, 8, 31, 32] {
+        let mut actual = Engine::new(count, 48000);
+        let mut reference = actual;
+        let mut memory = [Block::ZERO; BLOCKS];
+        let mut reference_memory = memory;
+        let mut desired = Wave::new(count);
+        let target = core::ptr::from_ref(&actual.requested);
+        for block in 0..220 {
+            if block % 3 == 0 && block < 150 {
+                desired.boundaries[0] = ((block * 7) % 201) as i16 - 100;
+                desired.curves[(block / 3) % count] = ((block * 11) % 201) as i16 - 100;
+                desired.smoothing = (block % 101) as i16;
+                desired.warp_position = (block % 256) as i16;
+                desired.warp_amount = (block % 151) as i16 - 75;
+            }
+            let building = actual.building;
+            let banks = actual.waves;
+            actual.update_request(|requested| {
+                assert_eq!(core::ptr::from_mut(requested).cast_const(), target);
+                // Populate fields, rather than assigning another whole Wave.
+                requested.boundaries.copy_from_slice(&desired.boundaries);
+                requested.curves.copy_from_slice(&desired.curves);
+                requested.count = desired.count;
+                requested.smoothing = desired.smoothing;
+                requested.warp_position = desired.warp_position;
+                requested.warp_amount = desired.warp_amount;
+                requested.fold_limit = desired.fold_limit;
+            });
+            assert_eq!(actual.building, building);
+            assert_eq!(actual.waves, banks);
+            reference.request(desired);
+            assert_eq!(actual, reference);
+            actual.advance(&mut memory);
+            reference.advance(&mut reference_memory);
+            for _ in 0..24 {
+                assert_eq!(
+                    actual.tick(&memory, 440.0, 48000.0, 0.5),
+                    reference.tick(&reference_memory, 440.0, 48000.0, 0.5)
+                );
+            }
+            assert_eq!(actual, reference);
+        }
+        assert_eq!(actual.requested, desired);
+        assert_eq!(actual.waves[actual.active], desired);
+    }
+}

@@ -296,6 +296,14 @@ distingnt_api::nt_dram_section! {
 
 fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
     let mut wave = dsp::Wave::blank(n);
+    read_wave_into(&mut wave, n, value);
+    wave
+}
+
+fn read_wave_into(wave: &mut dsp::Wave, n: usize, value: impl Fn(usize) -> Option<i16>) {
+    wave.count = n.clamp(2, dsp::MAX_SEGMENTS);
+    wave.boundaries.fill(0);
+    wave.curves.fill(0);
     wave.boundaries[0] = value(WAVEFORM_START).unwrap_or(0).clamp(-100, 100);
     wave.smoothing = value(SMOOTHING).unwrap_or(0).clamp(0, 100);
     wave.warp_position = value(WARP_POSITION)
@@ -311,7 +319,6 @@ fn read_wave(n: usize, value: impl Fn(usize) -> Option<i16>) -> dsp::Wave {
     for i in 0..n.min(dsp::MAX_SEGMENTS) {
         wave.curves[i] = value(curve_parameter(i)).unwrap_or(0).clamp(-100, 100);
     }
-    wave
 }
 
 // Temporary playback profiler: average total voice-render/mix cycles per audio
@@ -1104,7 +1111,6 @@ impl Plugin for Wavesmith {
         let n = context.state().count.clamp(2, 32);
         let voices = context.state().voices;
         let p = context.read_parameters();
-        let wave = read_wave(n, |index| p.value(index));
         let note = p.value(PITCH).unwrap_or(48).clamp(0, 127) as f32;
         let fine = p.value(FINE).unwrap_or(0).clamp(-100, 100) as f32 / 1200.0;
         let level_db = p.value(LEVEL).unwrap_or(levels::LEVEL_DEFAULT);
@@ -1184,6 +1190,9 @@ impl Plugin for Wavesmith {
         }
         let processing = context.processing();
         let state = processing.state;
+        state.engine.update_request(|requested| {
+            read_wave_into(requested, n, |index| processing.parameters.value(index));
+        });
         state.ui.advance(frames);
         state.midi.set_envelope(attack_ms, release_ms);
         let level = state.level.amplitude(level_db);
@@ -1285,7 +1294,6 @@ impl Plugin for Wavesmith {
         }
         #[cfg(feature = "profiling")]
         let setup_end = distingnt_api::api::cpu_cycle_count();
-        state.engine.request(wave);
         state.engine.advance(memory);
         #[cfg(feature = "profiling")]
         let build_end = distingnt_api::api::cpu_cycle_count();

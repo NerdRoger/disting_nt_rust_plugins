@@ -3853,3 +3853,21 @@ fn directly_initialized_subobjects_match_value_constructor_references() {
         }
     }
 }
+
+#[test]
+fn reused_waveform_storage_clears_inactive_fields_and_reads_host_defaults() {
+    let mut reused = dsp::Wave::new(32);
+    reused.boundaries.fill(99);
+    reused.curves.fill(-99);
+    for count in (2..=32).rev() {
+        let instance = Instance::new(count as i32);
+        read_wave_into(&mut reused, count, |index| {
+            instance.values.get(index).copied()
+        });
+        assert_eq!(reused, dsp::Wave::new(count));
+        assert!(reused.boundaries[count..].iter().all(|&value| value == 0));
+        assert!(reused.curves[count..].iter().all(|&value| value == 0));
+        assert_eq!(reused.sample(0.0), reused.sample(1.0));
+        instance.assert_guard();
+    }
+}

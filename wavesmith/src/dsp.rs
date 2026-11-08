@@ -1273,6 +1273,21 @@ impl Engine {
         }
     }
 
+    /// Update the preallocated requested shape without a callback-local snapshot.
+    /// Active playback and an in-progress build retain their separate copies.
+    #[inline(always)]
+    pub fn update_request(&mut self, update: impl FnOnce(&mut Wave)) {
+        update(&mut self.requested);
+        let latest = if self.fade > 0 {
+            1 - self.active
+        } else {
+            self.active
+        };
+        self.dirty = !self.ready[latest & 1] || self.requested != self.waves[latest & 1];
+    }
+
+    // Preserve the prior value-taking path as an independent test reference.
+    #[cfg(test)]
     pub fn request(&mut self, wave: Wave) {
         self.requested = wave;
         let latest = if self.fade > 0 {

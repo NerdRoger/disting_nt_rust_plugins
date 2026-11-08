@@ -589,6 +589,21 @@ memory requirements and audio processing are unchanged. A small initial Wave
 value remains for seeding the engine's existing snapshots. Per-block requested
 waveform and CV/tuning scratch are separate follow-up candidates, not changed here.
 
+### In-place requested waveform updates
+
+The audio callback now fills the engine's existing requested Wave directly,
+then updates its dirty flag. Active playback and in-progress building snapshots
+remain separate. All parameter fields, including unused boundary/curve slots,
+are refreshed so previous contents cannot leak into a new request. The GUI
+reader retains its independent local snapshot. No instance memory is added.
+
+The measured normal ARM audio callback frame falls from 1,112 to 968 bytes,
+removing the 144-byte callback-local Wave. ITC grows by 24 bytes and DRAM code by
+8 bytes versus the direct-constructor build. Shape reading/dirty checking now
+occur together in setup; the incremental builder remains afterwards, so whole
+callback measurements are the appropriate before/after CPU comparison. The
+per-block CV/tuning scratch arrays have not changed.
+
 ### Optional profiling build
 
 Normal builds exclude CPU cycle reads, profiling state, the cycle-count footer
