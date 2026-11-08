@@ -703,6 +703,7 @@ impl CvPitchCache {
     pub fn begin_block(&mut self) {
         self.used = 0;
     }
+    #[inline(always)]
     pub fn factor<'a>(
         &mut self,
         bus: i16,

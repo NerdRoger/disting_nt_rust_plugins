@@ -1192,3 +1192,72 @@ framework tests, documentation tests and ARM relocation checks. These are code
 size results, not device CPU measurements. Future compiler changes can alter
 the trade-offs; local audit objects, logs and trial summaries are under ignored
 `target/wavesmith-inline-audit`.
+
+
+### Generic-function follow-up
+
+At baseline `c3d73f6`, 16 independent annotation trials checked generic layout,
+text formatting, parameter-definition access, CV-factor iteration, waveform
+reading, MIDI group/routing readers and the renderer's `TRACK` specializations.
+Both forced inlining and forced out-of-line versions were tested where useful.
+This is a focused generic-helper audit, not an exhaustive search over all
+possible annotation combinations or compiler-generated standard-library code.
+
+Three forced-inline annotations were retained. Their independent savings also
+hold in combination:
+
+| Generic helper | Wavesmith ITC change | Wavesmith DRAM code change | Window Comparator ITC change | Window Comparator DRAM code change |
+|---|---:|---:|---:|---:|
+| InstanceLayout::with_extra | 0 | -120 | 0 | -136 |
+| TextBuffer::format_float | 0 | -56 | -54 | 0 |
+| CvPitchCache::factor | -12 | 0 | 0 | 0 |
+| **Total** | **-12** | **-176** | **-54** | **-136** |
+
+Wavesmith finishes at 19,064 ITC bytes and 9,424 DRAM code bytes; Window
+Comparator at 6,510 and 2,236 respectively. Rustsynth remains unchanged at
+1,246 ITC bytes and no DRAM code. Read-only data and all memory requirements
+are unchanged. These annotations allow call-site specialization; they do not
+combine different plugins' code into a single shared implementation.
+
+Most examined helpers were already inlined. Forcing the two const-generic
+renderer variants out of line added 92 ITC bytes, the CV cache iterator added
+108, and routing added 80. Forcing routing inline also added 12 bytes. Other
+trials were neutral or grew code, and were discarded. No changes were made to
+the deliberate shared scaling/reader wrappers or ITC/DRAM placement boundaries.
+The complete `make test` suite passed. No device CPU timing claim is made for
+these code-size changes. Raw results and build logs are in ignored
+`target/wavesmith-generic-inline-audit`.
+
+
+### Multi-caller inlining follow-up
+
+Using the pending generic-helper improvements as the baseline, the ARM call
+graph identified 14 source-level functions with multiple distinct callers.
+Each was forced inline independently, including the intentionally shared
+routing readers as controlled experiments. Assembly memory helpers and
+compiler-generated standard-library functions were excluded.
+
+Only the API `finish_text` helper was retained: it removes 14 ITC bytes from
+Wavesmith and 30 from Window Comparator, with no DRAM code, read-only data or
+data-memory growth. Rustsynth is unchanged. Together with the generic-helper
+changes, Wavesmith uses 19,050 ITC bytes and 9,424 DRAM code bytes; Window
+Comparator uses 6,480 ITC bytes and 2,236 DRAM code bytes.
+
+The other 13 trials were neutral or grew total code. Examples (relative to the
+generic-helper baseline):
+
+| Forced-inline function | ITC change | DRAM code change |
+|---|---:|---:|
+| sync_parameter_graying | +516 | 0 |
+| State::set_midi_channel | +420 | 0 |
+| Wave::segment_sample | +360 | +840 |
+| Wave::boundary_position | -28 | +1,368 |
+| Engine::lookup | +112 | +120 |
+| TableLayout::playback_levels | +40 | 0 |
+| group_parameters | 0 | 0 |
+
+The boundary-position trade-off was rejected because the small ITC saving did
+not justify the much larger DRAM code increase. No rejected annotations remain.
+The full `make test` suite passed. These are object-code measurements; runtime
+CPU gains have not been measured. Raw results and logs are under ignored
+`target/wavesmith-multicaller-inline-audit`.

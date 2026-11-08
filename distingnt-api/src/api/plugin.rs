@@ -895,6 +895,7 @@ impl InstanceLayout {
     fn new<S: Copy, V: Copy, M: StateMemory<S>>(config: Configuration) -> Option<Self> {
         Self::with_extra::<S, V, M, ()>(config, 0)
     }
+    #[inline(always)]
     fn with_extra<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout>(
         config: Configuration,
         extra_count: usize,
@@ -1560,6 +1561,7 @@ macro_rules! export_plugin {
         }
     };
 }
+#[inline(always)]
 fn finish_text(buffer: &mut [c_char], length: i32) -> i32 {
     if let Ok(index) = usize::try_from(length) {
         if let Some(terminator) = buffer.get_mut(index) {

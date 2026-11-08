@@ -27,6 +27,7 @@ impl<const N: usize> TextBuffer<N> {
     /// On a formatting failure, retain the prefix. An oversized prefix produces
     /// empty text. Interior NULs terminate the result, including when the host
     /// reports an in-bounds length beyond the actual end of its output.
+    #[inline(always)]
     pub fn format_float(&mut self, prefix: &[u8], value: f32, decimals: u8) -> bool {
         self.length = 0;
         self.bytes[0] = 0;
