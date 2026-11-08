@@ -85,6 +85,7 @@ struct TableLayout {
 }
 
 impl TableLayout {
+    #[inline(always)]
     fn new(count: usize) -> Self {
         let count = count.clamp(1, MAX_TABLES);
         // Nested refinements retain existing harmonic limits. Production uses six;
@@ -157,6 +158,7 @@ impl Wave {
         }
     }
 
+    #[inline(always)]
     pub fn new(count: usize) -> Self {
         let mut wave = Self::blank(count);
         for i in 0..wave.count {

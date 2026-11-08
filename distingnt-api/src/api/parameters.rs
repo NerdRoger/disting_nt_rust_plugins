@@ -12,6 +12,7 @@ pub struct ParameterInfo<'a> {
     pub unit: u8,
     pub scaling: u8,
 }
+#[inline(always)]
 fn information<'a>(definition: NtParameter) -> ParameterInfo<'a> {
     // SAFETY: only framework-created definitions enter this layer, whose names
     // are immutable static C strings. The result is conservatively borrow-bound.

@@ -1150,3 +1150,45 @@ Normal builds exclude these counters and all profiling telemetry. The raw
 artifacts, patches, disassemblies, CSVs, and JSON summaries for this round live
 in ignored `target/wavesmith-*-bench` and experiment directories; the tables here
 retain the decisions independently of those local artifacts.
+
+
+## Measured inlining audit
+
+An ARM release-object audit at baseline `a25cf9c` examined explicit functions
+left out of line in Wavesmith and its API call paths. Candidates were selected
+from the compiled call graph, then tested independently and cumulatively. A
+single distinct caller may contain several call sites; it does not guarantee
+that forced inlining will reduce code size. Existing ITC/DRAM placement
+boundaries and deliberately shared mono/stereo processing were preserved.
+
+The retained `#[inline(always)]` annotations have these incremental effects in
+the final combination (bytes):
+
+| Function | ITC change | DRAM code change |
+|---|---:|---:|
+| Wavesmith MIDI callback | -26 | 0 |
+| Wavesmith parameter-prefix callback | -14 | 0 |
+| Wavesmith parameter-string callback | -28 | 0 |
+| TableLayout::new | 0 | -104 |
+| Wave::new | 0 | -24 |
+| Wavesmith draw callback | 0 | -16 |
+| API parameter-information conversion | 0 | -56 |
+| **Total** | **-68** | **-200** |
+
+Normal Wavesmith ITC changes from 19,144 to 19,076 bytes; DRAM code changes from
+9,800 to 9,600 bytes. Read-only data remains 1,769 bytes. Instance/static data
+requirements and parameter layouts are unchanged. The shared API annotation
+leaves Rust Window Comparator and Rustsynth code sizes unchanged.
+
+Of 21 independent trials, most increased code size. For example, forcing the
+audio callback inline added 650 ITC bytes, and forcing the split FFT helper
+inline added 976. Inlining the API named-page helper saved 24 DRAM bytes in
+Wavesmith but added 224 in Window Comparator, so it was rejected. Two callback
+trials produced unsupported ARM relocations and were also rejected. The final
+choices were rebuilt together because individual savings do not always add up.
+
+The full `make test` suite passes, including normal/profiling native tests,
+framework tests, documentation tests and ARM relocation checks. These are code
+size results, not device CPU measurements. Future compiler changes can alter
+the trade-offs; local audit objects, logs and trial summaries are under ignored
+`target/wavesmith-inline-audit`.

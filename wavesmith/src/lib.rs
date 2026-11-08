@@ -1088,6 +1088,7 @@ impl Plugin for Wavesmith {
         apply_reshape(context, trigger);
     }
 
+    #[inline(always)]
     fn parameter_string(
         _context: &mut Callback<'_, ReadOnly>,
         parameter: i32,
@@ -1110,6 +1111,7 @@ impl Plugin for Wavesmith {
         (bytes.len() - 1) as i32
     }
 
+    #[inline(always)]
     fn prefix(_context: &mut Callback<'_, ReadOnly>, parameter: i32, buffer: &mut [c_char]) -> i32 {
         #[cfg(feature = "profiling")]
         _context.state_mut().profiling.telemetry.record_label(1);
@@ -1142,6 +1144,7 @@ impl Plugin for Wavesmith {
         telemetry::control(bytes);
     }
 
+    #[inline(always)]
     fn midi_message(context: &mut Callback<'_, Audio>, status: u8, data1: u8, data2: u8) {
         sync_parameter_graying(context);
         let p = context.read_parameters();
@@ -1601,6 +1604,7 @@ impl Plugin for Wavesmith {
         }
     }
 
+    #[inline(always)]
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {
         #[cfg(feature = "profiling")]
         let start = distingnt_api::api::cpu_cycle_count();
