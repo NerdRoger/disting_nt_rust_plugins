@@ -61,14 +61,14 @@ impl UiState {
 }
 
 /// Port of Common/potManager.cpp: map the remaining virtual range onto the
-/// remaining physical travel in the direction of movement. Ignore jumps from
-/// other screens, and snap to the stops only when moving toward them.
+/// remaining physical travel in the direction of movement, accepting large
+/// movements and snapping to the stops only when moving toward them.
 fn pickup(previous: f32, current: f32, value: f32) -> Option<f32> {
     if !(0.0..=1.0).contains(&previous) || !(0.0..=1.0).contains(&current) {
         return None;
     }
     let delta = current - previous;
-    if delta == 0.0 || delta.abs() > 0.01 {
+    if delta == 0.0 {
         return None;
     }
     let increasing = delta > 0.0;
@@ -298,7 +298,10 @@ mod tests {
         assert!(pickup(1.0, 0.995, 100.0).unwrap() < 100.0);
         assert!(pickup(0.0, 0.005, -100.0).unwrap() > -100.0);
         assert_eq!(pickup(0.5, 0.5, 25.0), None);
-        assert_eq!(pickup(0.5, 0.6, 25.0), None);
+        assert!((pickup(0.5, 0.6, 25.0).unwrap() - 40.0).abs() < 0.001);
+        assert!((pickup(0.5, 0.4, 25.0).unwrap()).abs() < 0.001);
+        assert_eq!(pickup(0.5, 1.0, 25.0), Some(100.0));
+        assert_eq!(pickup(0.5, 0.0, 25.0), Some(-100.0));
         assert_eq!(pickup(f32::NAN, 0.5, 25.0), None);
         assert_eq!(pickup(0.5, f32::NAN, 25.0), None);
     }
