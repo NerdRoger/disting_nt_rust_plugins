@@ -6,7 +6,7 @@ ARM-object packaging tool. Production plugins use `distingnt-api` instead.
 ## Header bindings
 
 - `raw`: every core `api.h` type, constant, factory callback and host function;
-  `API_VERSION_CURRENT` is 14 and `LAST_BUS` is 64.
+  `API_VERSION_CURRENT` is 15 and `LAST_BUS` is 64.
 - `file`: complete `file.h` declarations, results, flags, handles and file info.
 - `wav`: sample folders, sample reads, wavetables, streaming and MIDI folders.
 - `microtuning`: Scala scale requests, note union, ratio helpers and callbacks.
@@ -39,10 +39,23 @@ accept a pointer to a null-terminated name. Rust's `.len()` replaces ARRAY_SIZE.
 and prevents inlining it into ITC. It also accepts impl-method items. No existing
 plugin callbacks are moved to DRAM automatically.
 
-Both current plugins now advertise API v14 and require firmware supporting that
-API. Plugins use a 96-byte factory on ARM, including the new optional
-`string_parameter_buffer` callback. Use `None` for algorithms without editable
-string parameters. Earlier numeric parameter ordinals and GUIDs are unchanged.
+The current header version is API v15. The ARM factory is 100 bytes, including
+the appended `audio_worker_stack_size` field (zero disables worker submission).
+The firmware adds the declared worker stack to its allocation; do not request
+that stack again in instance requirements. `NT_audioWorkerSubmit` returns false
+when the callback has not been queued.
+
+`dsp` provides the C-linked `NT_constructFFT`, `NT_FFT`, `NT_IFFT` and the
+checked `fft_object_size(log2)` equivalent of the header's inline calculation.
+The opaque object includes mutable work space. Its storage is plugin-owned,
+must stay at its constructed address, and cannot be used concurrently.
+The N-float spectrum has real bins 0..=N/2 and imaginary bins at N/2+k.
+The inverse is unnormalized; apply 1/N if required.
+
+The large SysEx request binds both callbacks and their output references
+exactly. Requests, callback data and fetched bytes must remain valid through
+asynchronous consumption/completion. Raw bindings do not supply ownership,
+cancellation, synchronization, or firmware feature detection.
 
 From the repository root, `make test` runs `tools/check_api.py`: it compiles C++ and Rust
 ARM metadata probes and compares every concrete struct/union size, alignment,

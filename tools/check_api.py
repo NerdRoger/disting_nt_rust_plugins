@@ -29,6 +29,7 @@ type_map = {
     "NtAlgorithmMemoryPtrs": "_NT_algorithmMemoryPtrs", "NtParameter": "_NT_parameter",
     "NtParameterPage": "_NT_parameterPage", "NtParameterPages": "_NT_parameterPages",
     "NtAlgorithm": "_NT_algorithm", "NtSpecification": "_NT_specification",
+    "NtSendLargeSysExRequest": "_NT_sendLargeSysExRequest",
     "NtUiData": "_NT_uiData", "NtFactory": "_NT_factory", "NtSlot": "_NT_slot",
     "NtFileInfo": "_NT_fileInfo", "NtWavFolderInfo": "_NT_wavFolderInfo",
     "NtWavInfo": "_NT_wavInfo", "NtWavRequest": "_NT_wavRequest",
@@ -41,28 +42,65 @@ type_map = {
 
 def camel(field):
     special = {"default": "def", "kind": "type", "midi_sysex": "midiSysEx",
-               "mipmap_size": "mipmapSize", "using_mip_maps": "usingMipMaps"}
+               "mipmap_size": "mipmapSize", "using_mip_maps": "usingMipMaps",
+               "fetch_callback": "fetchCallback", "complete_callback": "completeCallback",
+               "callback_data": "callbackData", "audio_worker_stack_size": "audioWorkerStackSize"}
     if field in special:
         return special[field]
     first, *rest = field.split("_")
     return first + "".join(w.title() for w in rest)
 
 
+def split_arguments(text):
+    parts, start, depth = [], 0, 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
+
+
+def argument_types(args):
+    result = []
+    for arg in split_arguments(args):
+        arg = arg.strip().split("=")[0].strip()
+        if arg in {"", "void"}:
+            continue
+        result.append(rust_type(arg if "(*" in arg else re.sub(r"\b\w+$", "", arg).strip()))
+    return result
+
+
 def rust_type(cpp):
     cpp = re.sub(r"\bclass\s+", "", cpp.strip())
-    if "(*" in cpp:
-        return 'Option<unsafe extern "C" fn(*mut c_void)>'
+    callback = re.fullmatch(r"(.*?)\(\s*\*\s*\w*\s*\)\s*\((.*)\)", cpp, re.S)
+    if callback:
+        result, args = callback.groups()
+        ret = "" if result.strip() == "void" else " -> " + rust_type(result)
+        return 'Option<unsafe extern "C" fn(' + ", ".join(argument_types(args)) + ')' + ret + '>'
     if cpp.endswith("&"):
-        return ("*const " if cpp.startswith("const ") else "*mut ") + rust_type(cpp.removeprefix("const ")[:-1])
+        inner = cpp[:-1].strip()
+        constant = (inner.startswith("const ") and not inner.endswith("*")) or inner.endswith(" const")
+        if constant:
+            inner = inner.removeprefix("const ").removesuffix(" const").strip()
+        return ("*const " if constant else "*mut ") + rust_type(inner)
     if cpp.endswith("*"):
-        return ("*const " if cpp.startswith("const ") else "*mut ") + rust_type(cpp.removeprefix("const ")[:-1])
+        inner = cpp[:-1].strip()
+        constant = inner.startswith("const ") or inner.endswith(" const")
+        inner = inner.removeprefix("const ").removesuffix(" const").strip()
+        return ("*const " if constant else "*mut ") + rust_type(inner)
     cpp = cpp.strip()
     base = {"void": "c_void", "char": "c_char", "int": "i32", "float": "f32", "bool": "bool",
             "uint8_t": "u8", "int8_t": "i8", "uint16_t": "u16", "int16_t": "i16",
             "uint32_t": "u32", "int32_t": "i32", "size_t": "usize", "uintptr_t": "usize",
             "_NT_fileHandle": "NtFileHandle", "_NT_fileResult": "NtFileResult",
             "_NT_stream": "NtStream", "_NT_frame": "NtFrame", "_NT_float3": "NtFloat3",
-            "_NT_jsonStream": "NtJsonStream", "_NT_jsonParse": "NtJsonParse", "_NT_selector": "u8"}
+            "_NT_jsonStream": "NtJsonStream", "_NT_jsonParse": "NtJsonParse", "_NT_selector": "u8",
+            "_NT_FFT": "NtFft"}
     if cpp in base:
         return base[cpp]
     reverse = {v: k for k, v in type_map.items()}
@@ -77,9 +115,9 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     run("cargo", "build", "-p", "distingnt-sys", "--target", TARGET, "--release")
     rust = ["#![no_std]", "use core::ffi::{c_char,c_void};", "use distingnt_sys::*;",
-            "use distingnt_sys::{file::*,wav::*,microtuning::*};"]
+            "use distingnt_sys::{dsp::*,file::*,wav::*,microtuning::*};"]
     cpp = ["#include <cstddef>", "#include <cstdint>"]
-    headers = ["api.h", "file.h", "wav.h", "microtuning.h", "serialisation.h", "slot.h"]
+    headers = ["dsp.h", "api.h", "file.h", "wav.h", "microtuning.h", "serialisation.h", "slot.h"]
     cpp += [f"#include <distingnt/{h}>" for h in headers]
     labels, rexprs, cexprs = [], [], []
 
@@ -117,7 +155,7 @@ def main():
         "NUM_AVAILABLE_FILE_HANDLES": "kNT_numAvailableFileHandles",
         "FILE_OK": "kNT_fileOK", "DB_MIN_INF": "kNT_unitDb_minInf",
     }
-    for version in range(1, 15):
+    for version in range(1, 16):
         constants[f"API_VERSION_{version}"] = f"kNT_apiVersion{version}"
     for const, original in constants.items():
         if const != "DB_MIN_INF":
@@ -134,25 +172,23 @@ def main():
         check(const, const, original)
 
     signatures = 0
-    def arguments(args):
-        types = []
-        for arg in args.split(","):
-            arg = arg.strip().split("=")[0].strip()
-            if arg in {"", "void"}:
-                continue
-            if "(*" in arg:
-                types.append(rust_type(arg))
-            else:
-                types.append(rust_type(re.sub(r"\b\w+$", "", arg).strip()))
-        return types
-    for header in ["api.h", "file.h", "wav.h", "microtuning.h"]:
+    arguments = argument_types
+    for header in ["api.h", "dsp.h", "file.h", "wav.h", "microtuning.h"]:
         text = strip_comments((INCLUDE / "distingnt" / header).read_text())
-        for result, name, args in re.findall(r"^\s*([\w* ]+?)\s+(NT_\w+)\s*\((.*?)\)\s*;", text, flags=re.M | re.S):
+        for result, name, args in re.findall(r"^\s*([\w* ]+?)\s+(NT_\w+)\s*\(([^{};]*?)\)\s*;", text, flags=re.M | re.S):
             result = result.strip()
             types = arguments(args)
             ret = "" if result == "void" else " -> " + rust_type(result)
             rust.append(f'const _: unsafe extern "C" fn({", ".join(types)}){ret} = {name};')
             signatures += 1
+    # Non-factory callbacks also need exact reference/pointer ABI verification.
+    rust += [
+        'const _: Option<unsafe extern "C" fn(*mut NtAlgorithm, u32)> = None::<AudioWorker>;',
+        'const _: Option<unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut u32, *mut bool)> = None::<LargeSysExFetch>;',
+        'const _: Option<unsafe extern "C" fn(*mut c_void)> = None::<LargeSysExComplete>;',
+    ]
+    for log2 in range(1, 28):
+        check(f"FFT object size log2={log2}", f"dsp::fft_object_size({log2}).unwrap()", f"NT_FFT_objectSize({log2})")
     callback_count = 0
     api_text = strip_comments((INCLUDE / "distingnt/api.h").read_text())
     factory = api_text.split("struct _NT_factory", 1)[1].split('extern "C"', 1)[0]
@@ -161,6 +197,13 @@ def main():
         ret = "" if result.strip() == "void" else " -> " + rust_type(result)
         rust.append(f'const _: Option<unsafe extern "C" fn({", ".join(arguments(args))}){ret}> = None::<{aliases[name]}>;')
         callback_count += 1
+    request = api_text.split("struct _NT_sendLargeSysExRequest", 1)[1].split("};", 1)[0]
+    request_callback_count = 0
+    for result, name, args in re.findall(r"^\s*([\w* ]+?)\s*\(\s*\*\s*(\w+)\s*\)\s*\((.*?)\)\s*;", request, flags=re.M | re.S):
+        ret = "" if result.strip() == "void" else " -> " + rust_type(result)
+        rust.append(f'const _: Option<unsafe extern "C" fn({", ".join(arguments(args))}){ret}> = None::<{aliases[name]}>;')
+        request_callback_count += 1
+    assert request_callback_count == 2
     assert callback_count == 18, f"Expected every factory callback, got {callback_count}"
     rust += ['nt_dram_section! { #[no_mangle] pub extern "C" fn api_probe_dram(x: u32) -> u32 { x ^ 55 } }',
              f'#[used] #[unsafe(link_section=".nt_abi")] static ABI: [u32; {len(labels)}] = [', ",\n".join(rexprs), "];" ]

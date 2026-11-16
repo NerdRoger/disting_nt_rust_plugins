@@ -24,6 +24,7 @@ fn main() {
     );
     for header in [
         "api.h",
+        "dsp.h",
         "file.h",
         "wav.h",
         "microtuning.h",

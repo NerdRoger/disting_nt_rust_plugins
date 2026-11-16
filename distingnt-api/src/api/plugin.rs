@@ -38,12 +38,24 @@ mod extra_sealed {
     pub trait Sealed {}
     impl Sealed for () {}
     impl<T: Copy + 'static> Sealed for super::ExtraRegions<T> {}
+    impl<T: Copy + Send + 'static, E: super::ExtraRegionLayout> Sealed
+        for super::SharedResources<T, E>
+    {
+    }
 }
 
 /// Sealed policies for an optional additional typed region array.
 pub trait ExtraRegionLayout: extra_sealed::Sealed + 'static {
     type Element: Copy + 'static;
     type Descriptor: Copy;
+    type Shared: Copy + Send + 'static;
+    type SharedDescriptor: Copy;
+    #[doc(hidden)]
+    const SHARED: bool;
+    #[doc(hidden)]
+    fn shared_descriptor(offset: usize, worker: Option<AudioWorker>) -> Self::SharedDescriptor;
+    #[doc(hidden)]
+    fn shared_parts(descriptor: &Self::SharedDescriptor) -> Option<(usize, Option<AudioWorker>)>;
     #[doc(hidden)]
     const ENABLED: bool;
     #[doc(hidden)]
@@ -54,6 +66,13 @@ pub trait ExtraRegionLayout: extra_sealed::Sealed + 'static {
 impl ExtraRegionLayout for () {
     type Element = ();
     type Descriptor = ();
+    type Shared = ();
+    type SharedDescriptor = ();
+    const SHARED: bool = false;
+    fn shared_descriptor(_: usize, _: Option<AudioWorker>) {}
+    fn shared_parts(_: &()) -> Option<(usize, Option<AudioWorker>)> {
+        None
+    }
     const ENABLED: bool = false;
     fn descriptor(_: usize, _: usize) {}
     fn span(_: &()) -> (usize, usize) {
@@ -63,12 +82,68 @@ impl ExtraRegionLayout for () {
 impl<T: Copy + 'static> ExtraRegionLayout for ExtraRegions<T> {
     type Element = T;
     type Descriptor = ExtraRegionDescriptor;
+    type Shared = ();
+    type SharedDescriptor = ();
+    const SHARED: bool = false;
+    fn shared_descriptor(_: usize, _: Option<AudioWorker>) {}
+    fn shared_parts(_: &()) -> Option<(usize, Option<AudioWorker>)> {
+        None
+    }
     const ENABLED: bool = true;
     fn descriptor(offset: usize, count: usize) -> Self::Descriptor {
         ExtraRegionDescriptor { offset, count }
     }
     fn span(descriptor: &Self::Descriptor) -> (usize, usize) {
         (descriptor.offset, descriptor.count)
+    }
+}
+
+/// Opt in to one synchronized preallocated shared object. Wrap an existing
+/// ExtraRegions policy in E to retain its independently sized array.
+/// Access is closure-scoped; queued workers and SysEx transfers reserve the
+/// object, and normal callbacks receive Busy instead of waiting.
+///
+/// Shared references cannot escape a reservation:
+/// ```compile_fail
+/// use distingnt_api::api::{plugin::{Context,SharedResources}, parameters::Audio,
+///     state_memory::Sram};
+/// fn escape(c: &mut Context<'_,(),(),Audio,Sram,SharedResources<u32>>) -> &mut u32 {
+///     c.with_shared_resources(|data| data).unwrap()
+/// }
+/// ```
+/// Payloads must support safe transfer to the worker:
+/// ```compile_fail
+/// use distingnt_api::api::plugin::{SharedResources,ExtraRegionLayout};
+/// fn require_policy<T: ExtraRegionLayout>() {}
+/// require_policy::<SharedResources<*mut u32>>();
+/// ```
+pub struct SharedResources<T: Copy + Send + 'static, E: ExtraRegionLayout = ()>(
+    PhantomData<(T, E)>,
+);
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct SharedDescriptor {
+    offset: usize,
+    worker: Option<AudioWorker>,
+}
+impl<T: Copy + Send + 'static, E: ExtraRegionLayout> ExtraRegionLayout for SharedResources<T, E> {
+    type Element = E::Element;
+    type Descriptor = E::Descriptor;
+    type Shared = T;
+    type SharedDescriptor = SharedDescriptor;
+    const ENABLED: bool = E::ENABLED;
+    const SHARED: bool = true;
+    fn descriptor(offset: usize, count: usize) -> Self::Descriptor {
+        E::descriptor(offset, count)
+    }
+    fn span(descriptor: &Self::Descriptor) -> (usize, usize) {
+        E::span(descriptor)
+    }
+    fn shared_descriptor(offset: usize, worker: Option<AudioWorker>) -> SharedDescriptor {
+        SharedDescriptor { offset, worker }
+    }
+    fn shared_parts(descriptor: &SharedDescriptor) -> Option<(usize, Option<AudioWorker>)> {
+        Some((descriptor.offset, descriptor.worker))
     }
 }
 
@@ -122,13 +197,13 @@ pub struct Specification {
 /// ```
 pub struct RegionInitializer<'a, S: Copy> {
     destination: *mut S,
-    initialized: bool,
+    pub(crate) initialized: bool,
     lifetime: PhantomData<&'a mut MaybeUninit<S>>,
 }
 
 impl<S: Copy> RegionInitializer<'_, S> {
     // SAFETY: caller supplies exclusive aligned storage for S for this lifetime.
-    unsafe fn new(destination: *mut S) -> Self {
+    pub(crate) unsafe fn new(destination: *mut S) -> Self {
         Self {
             destination,
             initialized: false,
@@ -417,11 +492,37 @@ pub trait Plugin: Sized + 'static {
     ) -> Option<()> {
         None
     }
+    /// Initialize the optional shared object directly in firmware-owned SRAM.
+    fn initialize_shared_resources(
+        _: &mut RegionInitializer<'_, <Self::ExtraRegions as ExtraRegionLayout>::Shared>,
+        _: &[i32],
+    ) -> Option<()> {
+        None
+    }
+    /// Runs with exclusive access to the shared object; no unrestricted access
+    /// to ordinary state, parameter setters, or live audio buffers is provided.
+    fn audio_worker(_: &mut <Self::ExtraRegions as ExtraRegionLayout>::Shared, _: u32) {}
+    /// Return the next chunk. Firmware consumes it before asking for another;
+    /// the shared object stays reserved until completion, even after the last fetch.
+    fn large_sysex_chunk(
+        _: &mut <Self::ExtraRegions as ExtraRegionLayout>::Shared,
+    ) -> super::background::SysExChunk<'_> {
+        super::background::SysExChunk {
+            bytes: &[],
+            end: true,
+        }
+    }
     const GUID: u32;
     const NAME: &'static CStr;
     const DESCRIPTION: &'static CStr;
     const TAGS: u32;
     const SPECIFICATIONS: &'static [Specification];
+    /// Version advertised by this factory. Override only when its complete ABI
+    /// and referenced firmware symbols are available in that older host.
+    const API_VERSION: usize = API_VERSION_CURRENT;
+    /// Bytes reserved by firmware for background callbacks; zero disables jobs.
+    /// Do not add this stack to configuration/state memory requirements.
+    const AUDIO_WORKER_STACK_SIZE: u32 = 0;
     const CUSTOM_UI: u32 = 0;
     const PRESETS: bool = false;
     const PARAMETER_TEXT: bool = false;
@@ -636,6 +737,7 @@ struct Storage<S: Copy, M: StateMemory<S>, E: ExtraRegionLayout = ()> {
     region_offset: usize,
     state: M::Slot,
     extra: E::Descriptor,
+    shared: E::SharedDescriptor,
 }
 
 pub struct Context<
@@ -658,6 +760,46 @@ pub struct Processing<'a, S, V, E = ()> {
 impl<S: Copy, V: Copy, Mode, M: StateMemory<S>, E: ExtraRegionLayout>
     Context<'_, S, V, Mode, M, E>
 {
+    fn shared_slot(
+        &self,
+    ) -> Result<&super::background::SharedSlot<E::Shared>, super::background::Error> {
+        let (offset, _) = E::shared_parts(unsafe { &(*self.raw).shared })
+            .ok_or(super::background::Error::Disabled)?;
+        // Descriptor is immutable, published after initialization, in checked SRAM.
+        Ok(unsafe { &*self.raw.cast::<u8>().add(offset).cast() })
+    }
+    /// Try exclusive shared-object access without blocking the audio thread.
+    /// The reference cannot escape this closure or overlap a background job.
+    pub fn with_shared_resources<R>(
+        &mut self,
+        f: impl FnOnce(&mut E::Shared) -> R,
+    ) -> Result<R, super::background::Error> {
+        self.shared_slot()?.with(f)
+    }
+    /// Reserve the shared object before queuing. Queue rejection releases it.
+    pub fn submit_audio_worker(&mut self, data: u32) -> Result<(), super::background::Error> {
+        let (_, worker) = E::shared_parts(unsafe { &(*self.raw).shared })
+            .ok_or(super::background::Error::Disabled)?;
+        let worker = worker.ok_or(super::background::Error::Disabled)?;
+        let index = self
+            .algorithm_index()
+            .ok_or(super::background::Error::NoAlgorithm)?;
+        let slot = self.shared_slot()?;
+        slot.reserve()?;
+        // Host contract: false means no callback; accepted jobs are drained or
+        // stopped before instance memory or plugin code can be unloaded.
+        if unsafe { NT_audioWorkerSubmit(Some(worker), index, data) } {
+            Ok(())
+        } else {
+            slot.release();
+            Err(super::background::Error::QueueFull)
+        }
+    }
+    /// Stream chunks from the shared object, reserved through completion.
+    pub fn send_large_sysex(&mut self, destination: u32) -> Result<(), super::background::Error> {
+        self.shared_slot()?.send(destination)
+    }
+
     /// ABI admission for external host harnesses. Normal plugins receive contexts
     /// from Registration and never call this constructor.
     /// # Safety
@@ -795,7 +937,9 @@ impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V
     /// Request setup_ui for the displayed algorithm to synchronize host takeover.
     pub fn request_setup_ui(&mut self) {
         // SAFETY: restricted to a UI callback; no state borrow spans the host call.
-        unsafe { NT_requestSetupUi(); }
+        unsafe {
+            NT_requestSetupUi();
+        }
     }
 }
 
@@ -897,6 +1041,7 @@ struct InstanceLayout {
     indices: usize,
     regions: usize,
     extra_regions: usize,
+    shared: usize,
 }
 impl InstanceLayout {
     #[cfg(test)]
@@ -926,9 +1071,16 @@ impl InstanceLayout {
         let (layout, regions) = layout
             .extend(Layout::array::<V>(config.regions).ok()?)
             .ok()?;
-        let (allocation, extra_regions) = layout
+        let (layout, extra_regions) = layout
             .extend(Layout::array::<E::Element>(extra_count).ok()?)
             .ok()?;
+        let (allocation, shared) = if E::SHARED {
+            layout
+                .extend(Layout::new::<super::background::SharedSlot<E::Shared>>())
+                .ok()?
+        } else {
+            (layout, 0)
+        };
         if allocation.size() > u32::MAX as usize || M::dtc_size() > u32::MAX as usize {
             return None;
         }
@@ -939,6 +1091,7 @@ impl InstanceLayout {
             indices,
             regions,
             extra_regions,
+            shared,
         })
     }
 }
@@ -971,6 +1124,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         result
     };
     pub(crate) const FACTORY: NtFactory = NtFactory {
+        audio_worker_stack_size: P::AUDIO_WORKER_STACK_SIZE,
         guid: P::GUID,
         name: P::NAME.as_ptr(),
         description: P::DESCRIPTION.as_ptr(),
@@ -1078,7 +1232,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
     };
     pub fn entry(selector: u8, data: u32) -> usize {
         match selector {
-            SELECTOR_VERSION => API_VERSION_CURRENT,
+            SELECTOR_VERSION => P::API_VERSION,
             SELECTOR_NUM_FACTORIES => 1,
             SELECTOR_FACTORY_INFO if data == 0 => &Self::FACTORY as *const NtFactory as usize,
             _ => 0,
@@ -1313,6 +1467,26 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 return ptr::null_mut();
             }
         }
+        if P::ExtraRegions::SHARED {
+            let shared = unsafe {
+                ram.add(layout.shared).cast::<super::background::SharedSlot<
+                <P::ExtraRegions as ExtraRegionLayout>::Shared>>()
+            };
+            // Initialize only the value through the safe plugin initializer, then
+            // the atomic and request fields directly; no aggregate stack copy.
+            if unsafe {
+                super::background::SharedSlot::initialize(
+                    shared,
+                    |destination| P::initialize_shared_resources(destination, specs),
+                    Self::sysex_fetch,
+                    Self::sysex_complete,
+                )
+            }
+            .is_none()
+            {
+                return ptr::null_mut();
+            }
+        }
         let mut metadata = Metadata {
             // SAFETY: these checked layout regions are disjoint and uninitialized.
             parameters: unsafe { slice::from_raw_parts_mut(parameters.cast(), config.parameters) },
@@ -1372,8 +1546,57 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 ptr::addr_of_mut!((*raw).extra),
                 P::ExtraRegions::descriptor(layout.extra_regions, extra_count),
             );
+            ptr::write(
+                ptr::addr_of_mut!((*raw).shared),
+                P::ExtraRegions::shared_descriptor(
+                    layout.shared,
+                    if P::AUDIO_WORKER_STACK_SIZE == 0 {
+                        None
+                    } else {
+                        Some(Self::audio_worker)
+                    },
+                ),
+            );
         }
         raw.cast()
+    }
+    unsafe extern "C" fn audio_worker(base: *mut NtAlgorithm, data: u32) {
+        let raw = base.cast::<Storage<P::State, P::StateMemory, P::ExtraRegions>>();
+        let (offset, _) = P::ExtraRegions::shared_parts(unsafe { &(*raw).shared }).unwrap();
+        let slot = unsafe {
+            &*raw.cast::<u8>().add(offset)
+            .cast::<super::background::SharedSlot<<P::ExtraRegions as ExtraRegionLayout>::Shared>>()
+        };
+        // Reservation owns this value from successful submission through return.
+        unsafe {
+            slot.run(|value| P::audio_worker(value, data));
+        }
+    }
+    unsafe extern "C" fn sysex_fetch(
+        data: *mut core::ffi::c_void,
+        bytes: *mut *const u8,
+        count: *mut u32,
+        end: *mut bool,
+    ) {
+        let slot = unsafe {
+            &*data.cast::<super::background::SharedSlot<
+            <P::ExtraRegions as ExtraRegionLayout>::Shared>>()
+        };
+        let chunk = P::large_sysex_chunk(unsafe { slot.reserved_value() });
+        // Check the ABI length; invalid oversized chunks terminate the message.
+        let length = u32::try_from(chunk.bytes.len());
+        unsafe {
+            *bytes = chunk.bytes.as_ptr();
+            *count = length.unwrap_or(0);
+            *end = chunk.end || length.is_err();
+        }
+    }
+    unsafe extern "C" fn sysex_complete(data: *mut core::ffi::c_void) {
+        let slot = unsafe {
+            &*data.cast::<super::background::SharedSlot<
+            <P::ExtraRegions as ExtraRegionLayout>::Shared>>()
+        };
+        slot.release();
     }
     /// # Safety
     /// base is this registration's live host instance; v/metadata are initialized.

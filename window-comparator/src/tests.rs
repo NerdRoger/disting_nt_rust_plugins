@@ -14,7 +14,7 @@ unsafe fn update_definition(
 }
 use core::{ffi::c_char, ptr};
 #[test]
-fn api_v14_routes_input_gates_and_triggers_above_bus_28() {
+fn current_api_routes_input_gates_and_triggers_above_bus_28() {
     unsafe {
         let mut instance = Instance::new(1);
         instance.values[4 + cp::INPUT] = LAST_BUS as i16;
@@ -35,7 +35,7 @@ fn api_v14_routes_input_gates_and_triggers_above_bus_28() {
             }
             assert_eq!(samples[60 * frames], 10.0);
         }
-        assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_14);
+        assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_CURRENT);
         assert!(factory().string_parameter_buffer.is_none());
         assert!(factory().calculate_static_requirements.is_none());
         assert!(factory().initialise.is_none());

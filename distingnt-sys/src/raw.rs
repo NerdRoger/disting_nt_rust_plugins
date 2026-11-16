@@ -1,4 +1,4 @@
-//! Raw ABI bindings from `distingnt/api.h` (API v14).
+//! Raw ABI bindings from `distingnt/api.h` (API v15).
 //!
 //! Names use idiomatic Rust spelling; each item has the exact C layout or
 //! function signature from the header.
@@ -6,7 +6,7 @@
 use core::ffi::c_char;
 
 // Other upstream headers, also available through the legacy crate-root paths.
-pub use crate::{file, microtuning, serialisation, slot, wav};
+pub use crate::{dsp, file, microtuning, serialisation, slot, wav};
 
 pub const API_VERSION_1: usize = 1;
 pub const API_VERSION_2: usize = 2;
@@ -22,7 +22,8 @@ pub const API_VERSION_11: usize = 11;
 pub const API_VERSION_12: usize = 12;
 pub const API_VERSION_13: usize = 13;
 pub const API_VERSION_14: usize = 14;
-pub const API_VERSION_CURRENT: usize = API_VERSION_14;
+pub const API_VERSION_15: usize = 15;
+pub const API_VERSION_CURRENT: usize = API_VERSION_15;
 pub const NUM_INPUT_BUSSES: usize = 12;
 pub const NUM_OUTPUT_BUSSES: usize = 8;
 pub const NUM_AUX_BUSSES: usize = 44;
@@ -239,6 +240,20 @@ pub type ParameterUiPrefix = unsafe extern "C" fn(*mut NtAlgorithm, i32, *mut c_
 pub type ParameterString = unsafe extern "C" fn(*mut NtAlgorithm, i32, i32, *mut c_char) -> i32;
 pub type StringParameterBuffer =
     unsafe extern "C" fn(*mut NtAlgorithm, i32, *mut *mut c_char) -> i32;
+/// Firmware background worker, supplied the live algorithm and caller's u32 tag.
+pub type AudioWorker = unsafe extern "C" fn(*mut NtAlgorithm, u32);
+pub type LargeSysExFetch =
+    unsafe extern "C" fn(*mut core::ffi::c_void, *mut *const u8, *mut u32, *mut bool);
+pub type LargeSysExComplete = unsafe extern "C" fn(*mut core::ffi::c_void);
+
+#[repr(C)]
+pub struct NtSendLargeSysExRequest {
+    pub destination: u32,
+    pub fetch_callback: Option<LargeSysExFetch>,
+    pub complete_callback: Option<LargeSysExComplete>,
+    pub callback_data: *mut core::ffi::c_void,
+}
+
 pub type PluginEntry = unsafe extern "C" fn(u8, u32) -> usize;
 
 #[repr(C)]
@@ -268,6 +283,7 @@ pub struct NtFactory {
     pub parameter_ui_prefix: Option<ParameterUiPrefix>,
     pub parameter_string: Option<ParameterString>,
     pub string_parameter_buffer: Option<StringParameterBuffer>,
+    pub audio_worker_stack_size: u32,
 }
 
 /// Rust counterpart to the `NT_PARAMETER_IO()` C macro.
@@ -344,6 +360,12 @@ unsafe extern "C" {
     pub fn NT_sendMidi2ByteMessage(destination: u32, b0: u8, b1: u8);
     pub fn NT_sendMidi3ByteMessage(destination: u32, b0: u8, b1: u8, b2: u8);
     pub fn NT_sendMidiSysEx(destination: u32, data: *const u8, count: u32, end: bool);
+    pub fn NT_audioWorkerSubmit(
+        worker: Option<AudioWorker>,
+        algorithm_index: u32,
+        data: u32,
+    ) -> bool;
+    pub fn NT_sendLargeMidiSysEx(request: *mut NtSendLargeSysExRequest);
     pub fn exp2f(x: f32) -> f32;
     pub fn rust_nt_globals() -> *const NtGlobals;
     pub fn rust_nt_screen() -> *mut u8;

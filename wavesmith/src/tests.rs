@@ -388,7 +388,7 @@ fn every_segment_count_builds_complete_metadata_and_shared_seam() {
     for n in [0, 25, 33, -1] {
         assert!(Wavesmith::configuration(&[n, DEFAULT_SEGMENTS as i32]).is_none());
     }
-    assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_14);
+    assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_CURRENT);
 }
 
 #[test]

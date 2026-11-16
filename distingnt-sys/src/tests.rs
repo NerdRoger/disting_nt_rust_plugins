@@ -50,3 +50,14 @@ fn string_buffer_callback_exposes_pointer_and_capacity() {
     );
     assert_eq!(result, storage.as_mut_ptr().cast());
 }
+
+#[test]
+fn fft_storage_size_matches_header_formula_and_rejects_undefined_arithmetic() {
+    for (log2, bytes) in [(3, 88), (8, 2568), (10, 10248), (11, 20488)] {
+        assert_eq!(dsp::fft_object_size(log2), Some(bytes));
+    }
+    assert_eq!(dsp::fft_object_size(0), None);
+    assert_eq!(dsp::fft_object_size(28), None);
+    assert_eq!(dsp::fft_object_size(u32::MAX), None);
+    assert_eq!(API_VERSION_CURRENT, 15);
+}

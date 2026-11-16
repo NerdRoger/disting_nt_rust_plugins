@@ -83,7 +83,7 @@ fn routes_audio_to_bus_64_and_keeps_dsp_state_in_dtc() {
     assert!(samples[..(LAST_BUS - 1) * 4].iter().all(|&v| v == 0.0));
     assert!(samples[(LAST_BUS - 1) * 4..].iter().all(|&v| v > 0.0));
     assert!(unsafe { (*instance.dtc.cast::<SynthState>()).gate });
-    assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_14);
+    assert_eq!(pluginEntry(SELECTOR_VERSION, 0), API_VERSION_CURRENT);
 }
 #[test]
 fn midi_filter_note_off_and_output_modes_preserve_behavior() {

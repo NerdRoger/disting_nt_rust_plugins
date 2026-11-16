@@ -2,6 +2,7 @@
 
 pub mod raw;
 pub use raw::*;
+pub mod dsp;
 pub mod file;
 pub mod microtuning;
 pub mod serialisation;

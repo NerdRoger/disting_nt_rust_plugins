@@ -131,7 +131,7 @@ fn formatting_rejects_malformed_host_lengths() {
     }
 }
 
-struct Host {
+pub(super) struct Host {
     algorithm: NtAlgorithm,
     definitions: [NtParameter; 2],
     values: [i16; 2],
@@ -141,7 +141,7 @@ struct Host {
     gray: Option<(u32, bool)>,
 }
 impl Host {
-    fn new() -> Box<Self> {
+    pub(super) fn new() -> Box<Self> {
         let definition = NtParameter {
             name: c"Test".as_ptr(),
             min: -5000,

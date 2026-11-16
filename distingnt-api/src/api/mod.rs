@@ -8,7 +8,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod audio;
+pub mod background;
 pub mod drawing;
+pub mod fft;
 pub mod json;
 pub mod math;
 pub mod metadata;

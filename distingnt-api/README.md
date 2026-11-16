@@ -150,9 +150,9 @@ ordinary inline hints; there is no allocation or dynamic dispatch.
 The framework covers numeric/enum/I/O metadata, audio, parameter changes,
 UI/drawing, presets, text and editable-string buffers, MIDI channel/realtime and
 factory-wide SysEx messages, and value state in SRAM/DTC, plus bounded
-factory-wide static initialization. Heap-owned Drop state, persistent
-shared-memory access, other memory regions and asynchronous APIs require
-further framework support.
+factory-wide static initialization. Optional shared resources support background
+workers and large SysEx (see the host contract below). Heap-owned Drop state and
+other memory regions require further framework support.
 The raw sys crate remains available for advanced clients.
 
 The host must honor allocation/buffer lifetimes and prevent incompatible
@@ -172,3 +172,86 @@ production dependencies do not enable it.
 `make all` uses Cargo static libraries and the sys-owned object packager, then
 checks loader symbols/relocations. Plugins do not compile/link native shims
 themselves. Code placement is unchanged; no functions move to DRAM implicitly.
+
+
+## Safe-plugin requirement for every header adaptation
+
+Production plugin code must remain compatible with `#![forbid(unsafe_code)]`.
+New headers are first represented faithfully in `distingnt-sys`; the safe facade
+must then enforce buffer bounds, initialization, ownership and callback lifetime
+requirements internally. Do not shift raw pointers or unsafe admission calls into
+plugin code. Add positive examples compiled with forbid(unsafe_code), negative
+borrow/visibility tests, native adapter tests and ARM ABI/loader checks.
+
+A safe facade relies on an explicit firmware contract; native tests cannot prove
+host scheduling or teardown. In particular, Pin and Rust guards cannot stop
+firmware freeing plugin memory or unloading callback code. The background APIs
+below adopt the agreed host lifetime assumption. Raw bindings remain unsafe in
+the sys crate for explicitly low-level integrations.
+
+## API v15: firmware FFT and background boundaries
+
+The raw adaptation covers the factory worker-stack field, worker submission,
+large SysEx requests and all of `dsp.h`. Existing plugin DSP implementations
+are unchanged. Rebuilt plugins advertise API v15 by default and require
+compatible firmware; updating headers does not install firmware functions.
+
+`api::fft::Fft::construct` safely borrows caller storage, checks size and
+eight-byte alignment, and initializes the firmware plan. Its checked forward
+and inverse methods use separate slices without copying their contents.
+There is no public unchecked admission of an arbitrary initialized plan.
+
+`FftPlan<WORDS>` is directly initialized through RegionInitializer and can
+reside in ordinary firmware-preallocated state. Its private storage is aligned,
+and its private address marker ensures moved/copied opaque plans are reconstructed
+before use. It is initialized lazily on first use at the final address, and
+reused thereafter. This avoids retaining self-referential borrowed handles in
+plugin state. Use `object_size(log2).div_ceil(4)` to choose the word count.
+A 256-sample transform requires 2,568 bytes of opaque storage, plus metadata and
+the caller's input/output buffers. Non-FFT plugins allocate no FFT resources.
+
+### Background ownership and firmware contract
+
+**Required host assumption:** before freeing instance memory, replacing a preset,
+respecifying an algorithm, or unloading plugin code, firmware completes or stops
+all queued/running jobs and large-SysEx transfers. Stopping must prevent any later
+callback or access to retained request/chunk pointers. Queue handoff must publish
+prior writes to the background execution context. This is an assumed contract,
+not a guarantee established by the headers or our native tests. Firmware that
+does not honor it cannot safely use these asynchronous wrappers.
+
+Opt in with `type ExtraRegions = SharedResources<MyData>` or
+`SharedResources<MyData, ExtraRegions<MyOtherElement>>` when also using the
+optional array. `MyData` must be Copy + Send + 'static; initialize it directly
+through `Plugin::initialize_shared_resources` and `RegionInitializer`. The
+framework requests one aligned SRAM slot with an atomic ownership flag and
+persistent SysEx request. It does not put a large object on the stack or allocate
+from a heap. Ordinary state/region allocations remain separate and accessible.
+Plugins that do not opt in retain their original RAM layout and audio path.
+
+`Context::with_shared_resources` grants closure-scoped exclusive access and
+returns Busy instead of waiting when another execution context owns the slot.
+`Context::submit_audio_worker(tag)` reserves it **before** queueing, and
+`Plugin::audio_worker(&mut MyData, tag)` receives the same object. Queued jobs
+reserve it too, so edits cannot race even before work begins. Queue rejection
+releases the reservation and reports QueueFull. A zero AUDIO_WORKER_STACK_SIZE
+reports Disabled without submission; firmware allocates a nonzero worker stack
+separately. One job or transfer may be pending per instance. Keep the worker
+payload general: no waveform, voice, or particular buffering model is imposed.
+Worker callbacks cannot access unsynchronized ordinary state, live parameters,
+setters or host audio buffers. Put data shared with a worker in this region.
+
+`Context::send_large_sysex(destination)` reserves that same object through
+completion. `Plugin::large_sysex_chunk(&mut MyData)` returns a `SysExChunk` whose
+bytes may borrow the reserved object's buffer. Firmware must consume each chunk
+before its next fetch, invoke fetch callbacks sequentially, and invoke completion
+only after the final bytes are consumed, with no later request access. The slot
+is released at completion, **not** when the final chunk is fetched. It cannot be
+reused or modified through the safe API during transmission. Empty final chunks
+are allowed; lengths that exceed the ABI's u32 terminate with an empty chunk.
+
+The optional reservation uses acquire/release atomics and never spins or masks
+interrupts. Normal callbacks can keep using previously published results when
+Busy. Safe plugin code never handles raw callback pointers, casts or locks.
+These wrappers do not automatically move background computation into Wavesmith;
+its DSP remains unchanged until a separate integration.

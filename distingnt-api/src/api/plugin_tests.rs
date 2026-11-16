@@ -147,6 +147,7 @@ impl<const ENABLED: bool> Plugin for AllCallbacks<ENABLED> {
     const MIDI: bool = ENABLED;
     const MIDI_SYSEX: bool = ENABLED;
     const STRING_PARAMETERS: bool = ENABLED;
+    const AUDIO_WORKER_STACK_SIZE: u32 = if ENABLED { 1024 } else { 0 };
     const STATIC_INITIALIZATION: bool = ENABLED;
     fn configuration(_: &[i32]) -> Option<Configuration> {
         Some(Configuration {
@@ -1103,4 +1104,224 @@ fn extra_region_overflow_is_rejected_and_disabled_policy_has_no_descriptor_stora
     );
     let config = Example::configuration(&[]).unwrap();
     assert!(InstanceLayout::with_extra::<u32, u32, Sram, ()>(config, 1).is_none());
+}
+
+#[test]
+fn background_disabled_policy_has_no_storage_or_submission() {
+    let allocation = Allocation::for_plugin::<AllCallbacks<true>>();
+    let base = allocation.construct_plugin::<AllCallbacks<true>>();
+    let mut context = unsafe { Context::<[u8; 8], (), Audio>::admit(base) };
+    assert_eq!(
+        context.submit_audio_worker(123),
+        Err(crate::api::background::Error::Disabled)
+    );
+    assert_eq!(
+        context.send_large_sysex(1),
+        Err(crate::api::background::Error::Disabled)
+    );
+    assert_eq!(
+        core::mem::size_of::<<() as ExtraRegionLayout>::SharedDescriptor>(),
+        0
+    );
+}
+
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct SharedData {
+    counter: u32,
+    cursor: usize,
+    bytes: [u8; 16],
+}
+struct BackgroundExample<const STACK: bool = true>;
+std::thread_local! {
+    static ACCEPT_WORK: Cell<bool> = const { Cell::new(true) };
+    static PENDING_WORK: Cell<Option<(AudioWorker,u32,u32)>> = const { Cell::new(None) };
+    static PENDING_SYSEX: Cell<*mut NtSendLargeSysExRequest> = const { Cell::new(ptr::null_mut()) };
+    static SHARED_FINISH: Cell<bool> = const { Cell::new(true) };
+}
+impl<const STACK: bool> Plugin for BackgroundExample<STACK> {
+    type State = u32;
+    type Region = u32;
+    type StateMemory = Sram;
+    type ExtraRegions = SharedResources<SharedData, ExtraRegions<u32>>;
+    const GUID: u32 = 3;
+    const NAME: &'static CStr = c"Background test";
+    const DESCRIPTION: &'static CStr = c"";
+    const TAGS: u32 = TAG_UTILITY;
+    const SPECIFICATIONS: &'static [Specification] = &[];
+    const AUDIO_WORKER_STACK_SIZE: u32 = if STACK { 1024 } else { 0 };
+    fn configuration(s: &[i32]) -> Option<Configuration> {
+        Example::configuration(s)
+    }
+    fn initialize_state(p: &mut RegionInitializer<'_, u32>, _: &[i32], _: u32) -> Option<()> {
+        p.set(12);
+        Some(())
+    }
+    fn initialize_region(p: &mut RegionInitializer<'_, u32>, _: &[i32], i: usize) -> Option<()> {
+        p.set(i as u32);
+        Some(())
+    }
+    fn metadata(s: &[i32], m: &mut Metadata<'_>) -> Option<()> {
+        Example::metadata(s, m)
+    }
+    fn extra_region_count(_: &[i32]) -> usize {
+        3
+    }
+    fn initialize_extra_region(
+        p: &mut RegionInitializer<'_, u32>,
+        _: &[i32],
+        i: usize,
+    ) -> Option<()> {
+        p.set(100 + i as u32);
+        Some(())
+    }
+    fn initialize_shared_resources(
+        p: &mut RegionInitializer<'_, SharedData>,
+        _: &[i32],
+    ) -> Option<()> {
+        if SHARED_FINISH.with(Cell::get) {
+            crate::initialize_region!(
+                p,
+                SharedData {
+                    counter: 17,
+                    cursor: 0
+                },
+                arrays { bytes: |i| i as u8 }
+            );
+        }
+        Some(())
+    }
+    fn audio_worker(data: &mut SharedData, tag: u32) {
+        data.counter += tag;
+    }
+    fn large_sysex_chunk(data: &mut SharedData) -> crate::api::background::SysExChunk<'_> {
+        let start = data.cursor;
+        data.cursor = (start + 8).min(16);
+        crate::api::background::SysExChunk {
+            bytes: &data.bytes[start..data.cursor],
+            end: data.cursor == 16,
+        }
+    }
+}
+#[no_mangle]
+unsafe extern "C" fn NT_audioWorkerSubmit(
+    worker: Option<AudioWorker>,
+    index: u32,
+    data: u32,
+) -> bool {
+    if !ACCEPT_WORK.with(Cell::get) {
+        return false;
+    }
+    PENDING_WORK.with(|q| {
+        assert!(q.get().is_none());
+        q.set(Some((worker.unwrap(), index, data)));
+    });
+    true
+}
+#[no_mangle]
+unsafe extern "C" fn NT_sendLargeMidiSysEx(request: *mut NtSendLargeSysExRequest) {
+    PENDING_SYSEX.with(|q| {
+        assert!(q.get().is_null());
+        q.set(request);
+    });
+}
+type BackgroundPolicy = SharedResources<SharedData, ExtraRegions<u32>>;
+
+#[test]
+fn queued_worker_reserves_shared_data_and_rejection_releases_it() {
+    use crate::api::background::Error;
+    let _host = super::super::tests::Host::new();
+    let allocation = Allocation::for_plugin::<BackgroundExample>();
+    let base = allocation.construct_plugin::<BackgroundExample>();
+    assert!(!base.is_null());
+    let mut context = unsafe { Context::<u32, u32, Audio, Sram, BackgroundPolicy>::admit(base) };
+    assert_eq!(context.extra_regions(), &[100, 101, 102]);
+    assert_eq!(
+        context.with_shared_resources(|d| {
+            assert_eq!(d as *mut _ as usize % 64, 0);
+            d.counter
+        }),
+        Ok(17)
+    );
+    ACCEPT_WORK.with(|a| a.set(false));
+    assert_eq!(context.submit_audio_worker(5), Err(Error::QueueFull));
+    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(17));
+    ACCEPT_WORK.with(|a| a.set(true));
+    assert_eq!(context.submit_audio_worker(5), Ok(()));
+    assert_eq!(context.with_shared_resources(|_| ()), Err(Error::Busy));
+    assert_eq!(context.submit_audio_worker(6), Err(Error::Busy));
+    assert_eq!(context.send_large_sysex(1), Err(Error::Busy));
+    // Unrelated ordinary state/array memory remains available.
+    *context.state_mut() = 77;
+    context.regions_mut()[0] = 55;
+    let (worker, index, tag) = PENDING_WORK.with(|q| q.take()).unwrap();
+    assert_eq!((index, tag), (3, 5));
+    unsafe {
+        worker(base, tag);
+    }
+    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(22));
+    assert_eq!(*context.state(), 77);
+    assert_eq!(context.regions()[0], 55);
+    assert_eq!(context.submit_audio_worker(8), Ok(()));
+    let (worker, _, tag) = PENDING_WORK.with(|q| q.take()).unwrap();
+    unsafe {
+        worker(base, tag);
+    }
+    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(30));
+}
+#[test]
+fn sysex_retains_chunks_and_request_until_completion_and_can_be_reused() {
+    use crate::api::background::Error;
+    let allocation = Allocation::for_plugin::<BackgroundExample>();
+    let base = allocation.construct_plugin::<BackgroundExample>();
+    let mut context = unsafe { Context::<u32, u32, Ui, Sram, BackgroundPolicy>::admit(base) };
+    for _ in 0..2 {
+        context.with_shared_resources(|d| d.cursor = 0).unwrap();
+        assert_eq!(context.send_large_sysex(DESTINATION_USB), Ok(()));
+        assert_eq!(context.with_shared_resources(|_| ()), Err(Error::Busy));
+        let request = PENDING_SYSEX.with(Cell::get);
+        assert!(!request.is_null());
+        for start in [0, 8] {
+            let mut bytes = ptr::null();
+            let mut count = 0;
+            let mut end = false;
+            unsafe {
+                ((*request).fetch_callback.unwrap())(
+                    (*request).callback_data,
+                    &mut bytes,
+                    &mut count,
+                    &mut end,
+                );
+            }
+            assert_eq!(count, 8);
+            assert_eq!(
+                unsafe { slice::from_raw_parts(bytes, 8) },
+                &(start..start + 8).collect::<std::vec::Vec<u8>>()[..]
+            );
+            assert_eq!(end, start == 8);
+            assert_eq!(context.with_shared_resources(|_| ()), Err(Error::Busy));
+        }
+        // Even the final borrowed chunk remains protected until sent.
+        unsafe {
+            ((*request).complete_callback.unwrap())((*request).callback_data);
+        }
+        PENDING_SYSEX.with(|q| q.set(ptr::null_mut()));
+        assert_eq!(context.with_shared_resources(|d| d.cursor), Ok(16));
+    }
+}
+#[test]
+fn incomplete_shared_initialization_fails_and_zero_stack_disables_only_workers() {
+    SHARED_FINISH.with(|f| f.set(false));
+    let bad = Allocation::for_plugin::<BackgroundExample>();
+    assert!(bad.construct_plugin::<BackgroundExample>().is_null());
+    SHARED_FINISH.with(|f| f.set(true));
+    let allocation = Allocation::for_plugin::<BackgroundExample<false>>();
+    let base = allocation.construct_plugin::<BackgroundExample<false>>();
+    assert!(!base.is_null());
+    let mut context = unsafe { Context::<u32, u32, Audio, Sram, BackgroundPolicy>::admit(base) };
+    assert_eq!(
+        context.submit_audio_worker(0),
+        Err(crate::api::background::Error::Disabled)
+    );
+    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(17));
 }

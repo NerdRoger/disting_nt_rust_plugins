@@ -100,3 +100,14 @@ fields into the final allocation; scalar/unit states use `set`, and arrays use
 `fill`/`fill_with`. There is no value-returning constructor fallback. Keep plugin
 code safe and avoid large field-constructor temporaries as well. See
 [distingnt-api](distingnt-api/README.md) for the construction contract.
+
+
+### Rust API adaptation policy
+
+Production plugins must stay compatible with `#![forbid(unsafe_code)]`.
+Keep unsafe FFI, pointer admission and ownership enforcement inside
+`distingnt-api`/`distingnt-sys`. Every new header capability needs a genuinely
+safe plugin-facing path, tested with that restriction. If firmware lifetime or
+concurrency guarantees are insufficient, expose the raw sys binding and make
+the safe path explicitly unavailable; do not disguise an unsafe requirement as
+a safe method or ask individual plugins to relax the rule.
