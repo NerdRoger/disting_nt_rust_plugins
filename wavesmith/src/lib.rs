@@ -14,6 +14,7 @@ use core::ffi::{c_char, CStr};
 use distingnt_api::api::{
     audio::AudioBuses,
     drawing::Canvas,
+    json::{JsonReader, JsonWriter, Reader},
     metadata::{Definition, EnumStrings},
     parameters::{Audio, ReadOnly, Ui},
     plugin::{Configuration, Context, Metadata, Plugin, Specification},
@@ -743,6 +744,8 @@ impl Plugin for Wavesmith {
         | ENCODER_BUTTON_R;
     const INITIALIZATION_IN_DRAM: bool = true;
     const DRAWING_IN_DRAM: bool = true;
+    const PRESETS: bool = true;
+    const SERIALIZATION_IN_DRAM: bool = true;
     const MIDI: bool = true;
     const MIDI_SYSEX: bool = cfg!(feature = "profiling");
     const PARAMETER_TEXT: bool = true;
@@ -1617,13 +1620,62 @@ impl Plugin for Wavesmith {
         // The waveform editor owns the controls while this view is active.
         true
     }
-    // The normal build uses the identical framework default (centered pots).
-    #[cfg(feature = "profiling")]
+    fn serialise(context: &mut Callback<'_, ReadOnly>, writer: &mut JsonWriter<'_>) {
+        let ui = &context.state().ui;
+        // Explicit IDs keep the preset schema independent of enum layout.
+        let mode = match ui.mode {
+            ui::EditMode::Segment => 0,
+            ui::EditMode::Warp => 1,
+            ui::EditMode::Tuning => 2,
+        };
+        writer.member(c"editMode");
+        writer.integer(mode);
+        writer.member(c"selectedSegment");
+        writer.integer(ui.selected as i32); // zero-based
+    }
+    fn deserialise(context: &mut Callback<'_, ReadOnly>, reader: &mut JsonReader<'_>) -> bool {
+        let Some(count) = reader.member_count().filter(|&count| count >= 0) else {
+            return false;
+        };
+        let mut mode = context.state().ui.mode;
+        let mut selected = context.state().ui.selected as i32;
+        for _ in 0..count {
+            if reader.matches(c"editMode") {
+                let Some(value) = reader.integer() else {
+                    return false;
+                };
+                mode = match value {
+                    1 => ui::EditMode::Warp,
+                    2 => ui::EditMode::Tuning,
+                    _ => ui::EditMode::Segment,
+                };
+            } else if reader.matches(c"selectedSegment") {
+                let Some(value) = reader.integer() else {
+                    return false;
+                };
+                selected = value;
+            } else if !reader.skip() {
+                return false;
+            }
+        }
+        // Apply only after successful parsing; do not persist transient pot state.
+        let last = context.state().count.clamp(2, dsp::MAX_SEGMENTS) as i32 - 1;
+        let mut restored = ui::UiState::new();
+        restored.mode = mode;
+        restored.selected = selected.clamp(0, last) as usize;
+        context.state_mut().ui = restored;
+        true
+    }
+
     fn setup_ui(context: &mut Callback<'_, Ui>) -> NtFloat3 {
+        #[cfg(feature = "profiling")]
         let start = distingnt_api::api::cpu_cycle_count();
-        let values = [0.5; 3];
-        let cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(start);
-        context.state_mut().profiling.telemetry.record_ui(2, cycles);
+        let values = ui::setup_values(context);
+        #[cfg(feature = "profiling")]
+        {
+            let cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(start);
+            context.state_mut().profiling.telemetry.record_ui(2, cycles);
+        }
         values
     }
     fn custom_ui(context: &mut Callback<'_, Ui>, data: &NtUiData) {

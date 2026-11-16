@@ -629,13 +629,13 @@ fn both_end_pots_edit_the_same_seam_and_preview_follows_it() {
         let seam = WAVEFORM_START;
         instance.change(seam, 25);
         instance.event([0.5; 3], [0, 0]);
-        instance.event([0.508, 0.5, 0.5], [0, 0]);
+        instance.event([0.75, 0.5, 0.5], [0, 0]);
         let after_left = instance.values[seam];
-        assert!(after_left > 25);
-        instance.event([0.508, 0.5, 0.5], [(n - 1) as i8, 0]);
+        assert_eq!(after_left, 50);
+        instance.event([0.75, 0.5, 0.5], [(n - 1) as i8, 0]);
         assert_eq!(segment_parameter(n - 1, 1), seam);
-        instance.event([0.508, 0.5, 0.508], [0, 0]);
-        assert!(instance.values[seam] > after_left);
+        instance.event([0.75, 0.5, 0.9], [0, 0]);
+        assert_eq!(instance.values[seam], 80);
         for level in [-100, 37, 100] {
             instance.change(seam, level);
             for smoothing in [0, 100] {
@@ -660,19 +660,19 @@ fn both_pots_edit_the_same_shared_boundary_from_neighboring_segments() {
     instance.event([0.5; 3], [2, 0]);
     let boundary = segment_parameter(2, 1);
     instance.change(boundary, 25);
-    instance.event([0.5, 0.5, 0.508], [0, 0]);
+    instance.event([0.5, 0.5, 0.75], [0, 0]);
     let after_right = instance.values[boundary];
-    assert!(after_right > 25);
+    assert_eq!(after_right, 50);
 
-    instance.event([0.5, 0.5, 0.508], [1, 0]);
+    instance.event([0.5, 0.5, 0.75], [1, 0]);
     assert_eq!(segment_parameter(3, 0), boundary);
     assert_eq!(instance.values[segment_parameter(3, 0)], after_right);
     assert_eq!(instance.values[segment_parameter(3, 0)], after_right);
-    instance.event([0.508, 0.5, 0.508], [0, 0]);
+    instance.event([0.9, 0.5, 0.75], [0, 0]);
     let after_left = instance.values[boundary];
-    assert!(after_left > after_right);
+    assert_eq!(after_left, 80);
 
-    instance.event([0.508, 0.5, 0.508], [-1, 0]);
+    instance.event([0.9, 0.5, 0.75], [-1, 0]);
     assert_eq!(instance.values[segment_parameter(2, 1)], after_left);
     let wave = read_wave(8, |p| instance.values.get(p).copied());
     assert_eq!(wave.segment_sample(2, 1.0), wave.segment_sample(3, 0.0));
@@ -1271,7 +1271,7 @@ fn drawn_endpoint_handles_do_not_move_with_curve_or_smoothing() {
 }
 
 #[test]
-fn smart_pickup_reaches_both_stops_for_every_pot_after_segment_selection() {
+fn firmware_adjusted_positions_reach_both_stops_and_preserve_small_changes() {
     let mut instance = Instance::new(8);
     for field in 0..3 {
         instance.change(segment_parameter(1, field), -80);
@@ -1301,7 +1301,7 @@ fn smart_pickup_reaches_both_stops_for_every_pot_after_segment_selection() {
         assert!(instance.values[segment_parameter(1, field)] > -100);
     }
 
-    // Another screen moved the pots: ignore its jump, then resume from there.
+    // Supply logical positions as firmware does after takeover.
     instance.event([0.5; 3], [0, 0]);
     for field in 0..3 {
         instance.change(segment_parameter(1, field), -50);
@@ -1312,8 +1312,8 @@ fn smart_pickup_reaches_both_stops_for_every_pot_after_segment_selection() {
     for field in 0..3 {
         let value = instance.values[segment_parameter(1, field)];
         assert!(
-            value > -50 && value < -45,
-            "slow movement lost or jumped: {value}"
+            value == 2,
+            "absolute position must determine the value: {value}"
         );
     }
 }
@@ -1379,7 +1379,7 @@ fn warp_position_marker_grid_and_handles_follow_redistributed_boundaries() {
 }
 
 #[test]
-fn tuning_mode_edits_pitch_fine_and_level_with_pickup_and_wraps_back_to_segment() {
+fn tuning_mode_edits_absolute_pitch_fine_and_level_and_wraps_back_to_segment() {
     let mut instance = Instance::new(8);
     instance.event([0.8; 3], [2, 0]);
     instance.change(PITCH, 57);
@@ -1498,9 +1498,9 @@ fn segment_encoder_wraps_both_directions_and_large_deltas_without_pot_jumps() {
                     .any(|(_, y, value)| *y == 10 && value == &expected))
             });
         }
-        instance.event([0.508, 0.517, 0.508], [0, 0]);
+        instance.event([0.508, 0.9, 0.508], [0, 0]);
         let edited = curve_parameter(selected as usize);
-        assert!(instance.values[edited] > before[edited]);
+        assert_eq!(instance.values[edited], 80);
         for p in 0..before.len() {
             if p != edited {
                 assert_eq!(instance.values[p], before[p]);
@@ -1714,7 +1714,7 @@ fn right_encoder_click_switches_pot_modes_without_jumps_and_reaches_all_ranges()
 }
 
 #[test]
-fn editor_selection_relative_pots_and_permanent_footer() {
+fn editor_selection_absolute_pots_and_permanent_footer() {
     let mut instance = Instance::new(32);
     instance.event([0.5; 3], [0, 0]);
     instance.event([0.51; 3], [0, 1]);
@@ -1939,8 +1939,8 @@ fn persistence_metadata(instance: &Instance) -> Vec<String> {
     let mut result = Vec::new();
     unsafe {
         let factory = factory();
-        assert!(factory.serialise.is_none());
-        assert!(factory.deserialise.is_none());
+        assert!(factory.serialise.is_some());
+        assert!(factory.deserialise.is_some());
         assert!(factory.parameter_string.is_some());
         assert!(factory.parameter_ui_prefix.is_some());
         assert!(factory.string_parameter_buffer.is_none());
@@ -2110,7 +2110,9 @@ fn midi_pitch_pot_is_inactive_and_dim_but_fine_and_level_remain_editable() {
     }
     assert_eq!(instance.values[PITCH], 69);
     assert!(instance.values[FINE] > 0);
-    assert!(instance.values[LEVEL] > levels::LEVEL_DEFAULT);
+    let d = unsafe { *(*instance.base).parameters.add(LEVEL) };
+    let expected = d.min as f32 + 0.55 * (d.max - d.min) as f32;
+    assert_eq!(instance.values[LEVEL], (expected - 0.5) as i16);
     instance.draw();
     HEADER_COLORS.with(|colors| assert_eq!(&*colors.borrow(), &[5, 15, 15]));
     instance.change(MIDI_CHANNEL, 0);
@@ -3858,7 +3860,7 @@ fn midi_attacks_and_long_releases_use_batched_playback_for_all_group_members() {
 }
 
 #[test]
-fn idle_ui_gate_tracks_unflagged_pots_before_pickup_resumes() {
+fn idle_ui_gate_ignores_unflagged_positions_and_edits_from_next_host_position() {
     let mut instance = Instance::new(8);
     let boundary = editor_parameter(8, 0, 0).unwrap();
     instance.change(boundary, 0);
@@ -3879,7 +3881,7 @@ fn idle_ui_gate_tracks_unflagged_pots_before_pickup_resumes() {
     instance.event([0.525, 0.5, 0.5], [0, 0]);
     assert!(
         instance.values[boundary] > 0,
-        "pickup must use the most recent idle sample"
+        "the next flagged position must map directly to its value"
     );
     instance.assert_guard();
 }
@@ -4003,5 +4005,307 @@ fn boundary_cache_allocation_matches_segments_and_leaves_voice_storage_unchanged
             assert_eq!(context.extra_regions().as_ptr() as usize, pointer);
             instance.assert_guard();
         }
+    }
+}
+
+std::thread_local! {
+    static SETUP_REQUESTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+#[no_mangle]
+unsafe extern "C" fn NT_requestSetupUi() {
+    SETUP_REQUESTS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[test]
+fn firmware_takeover_setup_and_absolute_editing_follow_current_bindings() {
+    let mut instance = Instance::new(8);
+    let left = editor_parameter(8, 0, 0).unwrap();
+    instance.change(left, 44);
+    let before = instance.values.clone();
+    let mut pots = [0.0; 3];
+    unsafe {
+        factory().setup_ui.unwrap()(instance.base, &mut pots);
+    }
+    assert!((pots[0] - 0.72).abs() < 1e-6);
+    assert_eq!(instance.values, before);
+    instance.event([0.25, pots[1], pots[2]], [0; 2]);
+    assert_eq!(instance.values[left], -50);
+    instance.event([0.75, pots[1], pots[2]], [0; 2]);
+    assert_eq!(instance.values[left], 50);
+    SETUP_REQUESTS.with(|calls| calls.set(0));
+    let before = instance.values.clone();
+    instance.event([0.1; 3], [1, 0]);
+    assert_eq!(instance.values, before);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 1));
+    instance.click_right([0.1; 3]);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 2));
+    unsafe {
+        factory().setup_ui.unwrap()(instance.base, &mut pots);
+    }
+    assert!((pots[0] - instance.values[WARP_POSITION] as f32 / 255.0).abs() < 1e-6);
+    instance.event_buttons([0.1; 3], [0; 2], POT_BUTTON_L, 0);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 3));
+}
+
+#[test]
+fn firmware_setup_reports_each_modes_current_parameter_values_without_writes() {
+    for count in [2, 8, 32] {
+        let mut instance = Instance::new(count);
+        instance.event([0.5; 3], [1, 0]);
+        for mode in 0..3 {
+            let parameters = match mode {
+                0 => [0, 2, 1].map(|f| editor_parameter(count as usize, 1, f).unwrap()),
+                1 => [WARP_POSITION, WARP_AMOUNT, SMOOTHING],
+                _ => [PITCH, FINE, LEVEL],
+            };
+            for (pot, parameter) in parameters.into_iter().enumerate() {
+                let d = unsafe { *(*instance.base).parameters.add(parameter) };
+                let value = [d.min, d.default, d.max][pot];
+                instance.change(parameter, value);
+            }
+            let before = instance.values.clone();
+            let mut pots = [0.0; 3];
+            unsafe {
+                factory().setup_ui.unwrap()(instance.base, &mut pots);
+            }
+            for (pot, parameter) in parameters.into_iter().enumerate() {
+                let d = unsafe { *(*instance.base).parameters.add(parameter) };
+                let expected = (before[parameter] - d.min) as f32 / (d.max - d.min) as f32;
+                assert!((pots[pot] - expected).abs() < 1e-6);
+            }
+            assert_eq!(instance.values, before);
+            instance.click_right(pots);
+        }
+    }
+}
+
+#[test]
+fn reset_hold_expiry_resynchronizes_host_before_accepting_more_positions() {
+    let mut instance = Instance::new(8);
+    instance.event([0.5; 3], [0; 2]);
+    let left = editor_parameter(8, 0, 0).unwrap();
+    instance.event_buttons([0.5; 3], [0; 2], POT_BUTTON_L, 0);
+    instance.event_buttons([0.9, 0.5, 0.5], [0; 2], 0, POT_BUTTON_L);
+    SETUP_REQUESTS.with(|calls| calls.set(0));
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..200 {
+        instance.render(&mut samples);
+    }
+    instance.event([0.9, 0.5, 0.5], [0; 2]);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 1));
+    assert_eq!(instance.values[left], 0);
+    let mut pots = [0.0; 3];
+    unsafe {
+        factory().setup_ui.unwrap()(instance.base, &mut pots);
+    }
+    assert_eq!(pots[0], 0.5);
+    instance.event([0.75, pots[1], pots[2]], [0; 2]);
+    assert_eq!(instance.values[left], 50);
+}
+
+#[test]
+fn accepted_pot_edit_requests_setup_with_the_new_value_not_the_old_target() {
+    let mut instance = Instance::new(8);
+    let left = editor_parameter(8, 0, 0).unwrap();
+    instance.change(left, 54);
+    let mut pots = [0.0; 3];
+    unsafe {
+        factory().setup_ui.unwrap()(instance.base, &mut pots);
+    }
+    assert!((pots[0] - 0.77).abs() < 1e-6);
+    SETUP_REQUESTS.with(|calls| calls.set(0));
+    pots[0] = 110.0 / 4095.0;
+    instance.event(pots, [0; 2]);
+    assert_eq!(instance.values[left], -95);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 1));
+    unsafe {
+        factory().setup_ui.unwrap()(instance.base, &mut pots);
+    }
+    assert!((pots[0] - 0.025).abs() < 1e-6);
+    instance.event(pots, [0; 2]);
+    assert_eq!(instance.values[left], -95);
+    SETUP_REQUESTS.with(|calls| assert_eq!(calls.get(), 1));
+}
+
+// Small host JSON mock: exercise the exported callbacks and the safe adapters.
+#[derive(Default)]
+struct UiPresetJson {
+    members: Vec<(String, Option<i32>)>,
+    name: String,
+    position: usize,
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_add_member_name(
+    raw: *mut distingnt_sys::NtJsonStream,
+    name: *const c_char,
+) {
+    let json = unsafe { &mut *raw.cast::<UiPresetJson>() };
+    json.name = unsafe { CStr::from_ptr(name) }.to_str().unwrap().into();
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_add_number_i32(
+    raw: *mut distingnt_sys::NtJsonStream,
+    value: i32,
+) {
+    let json = unsafe { &mut *raw.cast::<UiPresetJson>() };
+    json.members.push((json.name.clone(), Some(value)));
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_number_of_object_members(
+    raw: *mut distingnt_sys::NtJsonParse,
+    count: *mut i32,
+) -> bool {
+    unsafe {
+        *count = (*raw.cast::<UiPresetJson>()).members.len() as i32;
+    }
+    true
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_match_name(
+    raw: *mut distingnt_sys::NtJsonParse,
+    name: *const c_char,
+) -> bool {
+    let json = unsafe { &*raw.cast::<UiPresetJson>() };
+    json.members
+        .get(json.position)
+        .is_some_and(|(member, _)| member == unsafe { CStr::from_ptr(name) }.to_str().unwrap())
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_number_i32(
+    raw: *mut distingnt_sys::NtJsonParse,
+    value: *mut i32,
+) -> bool {
+    let json = unsafe { &mut *raw.cast::<UiPresetJson>() };
+    let Some((_, Some(number))) = json.members.get(json.position) else {
+        return false;
+    };
+    unsafe {
+        *value = *number;
+    }
+    json.position += 1;
+    true
+}
+#[no_mangle]
+unsafe extern "C" fn rust_nt_json_skip_member(raw: *mut distingnt_sys::NtJsonParse) -> bool {
+    let json = unsafe { &mut *raw.cast::<UiPresetJson>() };
+    if json.position >= json.members.len() {
+        return false;
+    }
+    json.position += 1;
+    true
+}
+fn restore_ui_preset(instance: &mut Instance, json: &mut UiPresetJson) -> bool {
+    unsafe { factory().deserialise.unwrap()(instance.base, (json as *mut UiPresetJson).cast()) }
+}
+
+#[test]
+fn preset_callbacks_round_trip_each_edit_mode_and_segment_without_parameter_changes() {
+    for count in [2, 8, 32] {
+        for (mode_id, mode) in [
+            ui::EditMode::Segment,
+            ui::EditMode::Warp,
+            ui::EditMode::Tuning,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for selected in [0, count as usize - 1] {
+                let mut instance = Instance::new(count);
+                {
+                    let mut context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+                    context.state_mut().ui.mode = mode;
+                    context.state_mut().ui.selected = selected;
+                }
+                let before = instance.values.clone();
+                let mut json = UiPresetJson::default();
+                unsafe {
+                    factory().serialise.unwrap()(
+                        instance.base,
+                        (&mut json as *mut UiPresetJson).cast(),
+                    );
+                }
+                assert_eq!(
+                    json.members,
+                    std::vec![
+                        ("editMode".into(), Some(mode_id as i32)),
+                        ("selectedSegment".into(), Some(selected as i32))
+                    ]
+                );
+                unsafe { Callback::<ReadOnly>::from_raw(instance.base) }
+                    .state_mut()
+                    .ui = ui::UiState::new();
+                assert!(restore_ui_preset(&mut instance, &mut json));
+                let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+                assert!(context.state().ui.mode == mode);
+                assert_eq!(context.state().ui.selected, selected);
+                assert_eq!(instance.values, before);
+                // First display setup must use the restored assignments.
+                let mut pots = [0.0; 3];
+                unsafe {
+                    factory().setup_ui.unwrap()(instance.base, &mut pots);
+                }
+                assert!(pots.iter().all(|p| (0.0..=1.0).contains(p)));
+                instance.assert_guard();
+            }
+        }
+    }
+}
+
+#[test]
+fn ui_preset_accepts_old_and_future_presets_and_clamps_selection_after_respecification() {
+    let mut instance = Instance::new(8);
+    assert!(restore_ui_preset(
+        &mut instance,
+        &mut UiPresetJson::default()
+    ));
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    assert!(context.state().ui.mode == ui::EditMode::Segment);
+    assert_eq!(context.state().ui.selected, 0);
+    for (mode, selected, expected_mode, expected_selected) in [
+        (2, 31, ui::EditMode::Tuning, 7),
+        (1, -10, ui::EditMode::Warp, 0),
+        (99, i32::MAX, ui::EditMode::Segment, 7),
+    ] {
+        let mut json = UiPresetJson {
+            members: std::vec![
+                ("future".into(), None),
+                ("selectedSegment".into(), Some(selected)),
+                ("editMode".into(), Some(mode))
+            ],
+            ..UiPresetJson::default()
+        };
+        assert!(restore_ui_preset(&mut instance, &mut json));
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert!(context.state().ui.mode == expected_mode);
+        assert_eq!(context.state().ui.selected, expected_selected);
+    }
+}
+
+#[test]
+fn malformed_ui_preset_does_not_partially_apply_changes() {
+    let mut instance = Instance::new(8);
+    {
+        let mut context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        context.state_mut().ui.mode = ui::EditMode::Warp;
+        context.state_mut().ui.selected = 3;
+    }
+    for members in [
+        std::vec![
+            ("editMode".into(), Some(2)),
+            ("selectedSegment".into(), None)
+        ],
+        std::vec![
+            ("selectedSegment".into(), Some(7)),
+            ("editMode".into(), None)
+        ],
+    ] {
+        let mut json = UiPresetJson {
+            members,
+            ..UiPresetJson::default()
+        };
+        assert!(!restore_ui_preset(&mut instance, &mut json));
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        assert!(context.state().ui.mode == ui::EditMode::Warp);
+        assert_eq!(context.state().ui.selected, 3);
     }
 }

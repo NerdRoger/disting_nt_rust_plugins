@@ -202,7 +202,6 @@ impl<const ENABLED: bool> Plugin for AllCallbacks<ENABLED> {
         }
     }
 }
-
 #[test]
 fn all_eighteen_header_endpoints_are_available_and_optional_hooks_can_be_disabled() {
     fn availability(factory: &NtFactory) -> [bool; 18] {
@@ -239,7 +238,6 @@ fn all_eighteen_header_endpoints_are_available_and_optional_hooks_can_be_disable
         ]
     );
 }
-
 #[test]
 fn sysex_forwards_exact_factory_wide_bytes_and_handles_empty_or_null_input() {
     SYSEX_MESSAGES.with(|messages| messages.borrow_mut().clear());
@@ -1025,6 +1023,7 @@ impl Plugin for ExtraExample {
         Some(())
     }
 }
+
 #[test]
 fn extra_regions_are_sized_aligned_disjoint_and_initialized_before_publication() {
     MODE.with(|m| m.set(Mode::Valid));
@@ -1078,6 +1077,7 @@ fn extra_regions_are_sized_aligned_disjoint_and_initialized_before_publication()
     assert!(allocation.construct_plugin::<ExtraExample>().is_null());
     EXTRA_FINISH.with(|v| v.set(true));
 }
+
 #[test]
 fn extra_region_overflow_is_rejected_and_disabled_policy_has_no_descriptor_storage() {
     MODE.with(|m| m.set(Mode::Valid));

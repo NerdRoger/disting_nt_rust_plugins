@@ -63,6 +63,9 @@ endpoints are highlighted. Warp mode shows a vertical marker for Warp Position.
 The zero line and segment dividers help you see the waveform's layout, and the
 encoder hints remain visible at the bottom.
 
+Saving a preset also saves the current editing mode and selected segment.
+Loading it returns the waveform editor to that view.
+
 Press a pot to reset the value it controls. Boundary levels reset to zero, Curve
 to zero, and the other controls to their defaults. Pot movement is ignored while
 you press and for 100 ms after release, so releasing the button does not knock

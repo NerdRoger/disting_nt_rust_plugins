@@ -60,11 +60,21 @@ and Turn: Select on the left only in Segment mode. Pot assignments are shown
 only in the header. Switching modes preserves the selected segment and parameter values;
 smart pickup resumes from the current knob positions without a value jump.
 
-Pots use the C++ plugins' smart soft takeover: the remaining virtual range is
-mapped onto the remaining knob travel, so either physical stop always reaches
-the corresponding minimum or maximum, even after selecting another segment.
-Fractional movement is retained for slow turns, and unexpected position jumps
-are ignored to resynchronize after visiting another screen. Adjacent segments
+Preset custom JSON stores `editMode` (0 Segment, 1 Warp, 2 Tuning) and
+`selectedSegment` (zero-based). Missing fields retain the current/default view;
+unknown members are skipped, unknown integer modes fall back to Segment, and
+the segment is clamped to the current specification. Parse failures leave the
+UI state untouched. Only the mode/selection persist; reset timers and pot tracking
+are initialized afresh, with firmware takeover initialized through `setupUi`.
+Serialization callbacks live in DRAM.
+
+Pot takeover is handled by the firmware. `setupUi` supplies the normalized
+values represented by the current pot assignments, and `NT_requestSetupUi`
+resynchronizes them after segment/mode changes, resets, and accepted pot edits. Incoming logical pot
+positions map directly to the parameter range; Wavesmith does not inspect remote
+pot SysEx messages or apply a second pickup calculation. The 100 ms reset hold
+remains, followed by another setup request to discard suppressed movement.
+Adjacent segments
 share a single boundary level and always meet. For example, the right pot on
 Segment 3 and the left pot on Segment 4 both edit Boundary 03. The beginning and
 end of the complete waveform share Boundary 00, editable from either endpoint.

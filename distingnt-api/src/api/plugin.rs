@@ -791,6 +791,14 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>, E: ExtraRegionLayout>
     }
 }
 
+impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V, Ui, M, E> {
+    /// Request setup_ui for the displayed algorithm to synchronize host takeover.
+    pub fn request_setup_ui(&mut self) {
+        // SAFETY: restricted to a UI callback; no state borrow spans the host call.
+        unsafe { NT_requestSetupUi(); }
+    }
+}
+
 impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V, Audio, M, E> {
     /// Send a complete SysEx message from an audio callback. Include F0 and
     /// seven-bit payload bytes; the host appends F7 synchronously.

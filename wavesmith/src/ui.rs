@@ -25,8 +25,7 @@ pub struct UiState {
     pub selected: usize,
     pub mode: EditMode,
     previous: [f32; 3],
-    residual: [f32; 3],
-    last_written: [i16; 3],
+    reset_resync: bool,
     primed: bool,
     reset_hold: [usize; 3],
 }
@@ -37,8 +36,7 @@ impl UiState {
             selected: 0,
             mode: EditMode::Segment,
             previous: [0.5; 3],
-            residual: [0.0; 3],
-            last_written: [0; 3],
+            reset_resync: false,
             primed: false,
             reset_hold: [0; 3],
         }
@@ -49,6 +47,7 @@ impl UiState {
         const ACTIVITY: u32 =
             POT_L | POT_C | POT_R | POT_BUTTON_L | POT_BUTTON_C | POT_BUTTON_R | ENCODER_BUTTON_R;
         !self.primed
+            || (self.reset_resync && self.reset_hold == [0; 3])
             || (data.controls | data.last_buttons) as u32 & ACTIVITY != 0
             || data.encoders != [0, 0]
     }
@@ -60,39 +59,50 @@ impl UiState {
     }
 }
 
-/// Port of Common/potManager.cpp: map the remaining virtual range onto the
-/// remaining physical travel in the direction of movement, accepting large
-/// movements and snapping to the stops only when moving toward them.
-fn pickup(previous: f32, current: f32, value: f32) -> Option<f32> {
-    if !(0.0..=1.0).contains(&previous) || !(0.0..=1.0).contains(&current) {
-        return None;
+/// Current bindings in left/centre/right pot order.
+fn bindings(state: &State) -> [Option<usize>; 3] {
+    match state.ui.mode {
+        EditMode::Segment => {
+            [0, 2, 1].map(|field| editor_parameter(state.count, state.ui.selected, field))
+        }
+        EditMode::Warp => [Some(WARP_POSITION), Some(WARP_AMOUNT), Some(SMOOTHING)],
+        EditMode::Tuning => [Some(PITCH), Some(FINE), Some(LEVEL)],
     }
-    let delta = current - previous;
-    if delta == 0.0 {
-        return None;
-    }
-    let increasing = delta > 0.0;
-    if increasing && current > 0.995 {
-        return Some(100.0);
-    }
-    if !increasing && current < 0.005 {
-        return Some(-100.0);
-    }
-    let value = value.clamp(-100.0, 100.0);
-    let remaining_value = if increasing {
-        100.0 - value
-    } else {
-        value + 100.0
-    };
-    let remaining_travel = if increasing { 1.0 - previous } else { previous };
-    if remaining_travel <= 0.0 {
-        return None;
-    }
-    Some((value + remaining_value / remaining_travel * delta).clamp(-100.0, 100.0))
 }
 
-// Leave the common no-activity path in ITC. Track even unflagged pot samples so
-// pickup measures travel since the previous callback rather than accumulating noise.
+distingnt_api::nt_dram_section! {
+/// Give the firmware the represented values so it owns potentiometer takeover.
+pub fn setup_values(context: &mut Callback<'_, Ui>) -> NtFloat3 {
+    let values = bindings(context.state()).map(|parameter| {
+        let p = context.read_parameters();
+        let Some(parameter) = parameter else { return 0.5; };
+        let Some(d) = p.definition(parameter) else { return 0.5; };
+        let span = i32::from(d.max) - i32::from(d.min);
+        if span <= 0 { return 0.5; }
+        let value = p.value(parameter).unwrap_or(d.default).clamp(d.min, d.max);
+        (i32::from(value) - i32::from(d.min)) as f32 / span as f32
+    });
+    let ui = &mut context.state_mut().ui;
+    ui.previous = values;
+    ui.primed = true;
+    values
+}
+}
+
+/// The host has already applied pickup; map its position directly to the parameter.
+fn pot_value(position: f32, min: i16, max: i16) -> Option<i16> {
+    if !position.is_finite() || max <= min {
+        return None;
+    }
+    let value = min as f32 + position.clamp(0.0, 1.0) * (i32::from(max) - i32::from(min)) as f32;
+    Some(if value < 0.0 {
+        (value - 0.5) as i16
+    } else {
+        (value + 0.5) as i16
+    })
+}
+
+// Keep the no-activity dispatcher in ITC and edit work in DRAM.
 pub fn handle(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
     if !context.state().ui.needs_handling(data) {
         context.state_mut().ui.previous = data.pots;
@@ -107,6 +117,9 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
         && data.last_buttons as u32 & ENCODER_BUTTON_R == 0;
     let changed_selection = data.encoders[0] != 0;
     let mut edited = changed_mode || changed_selection;
+    let reset_finished = context.state().ui.reset_resync && context.state().ui.reset_hold == [0; 3];
+    let mut resync = changed_mode || changed_selection || reset_finished;
+    if reset_finished { context.state_mut().ui.reset_resync = false; }
     {
         let state = context.state_mut();
         let count = state.count.clamp(2, dsp::MAX_SEGMENTS) as i32;
@@ -119,9 +132,6 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
         if changed_mode {
             state.ui.mode = state.ui.mode.next();
         }
-        if changed_selection || changed_mode {
-            state.ui.residual = [0.0; 3];
-        }
     }
     let midi = context
         .read_parameters()
@@ -129,31 +139,16 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
         .unwrap_or(0)
         .clamp(0, 17)
         != 0;
-    for (pot, (mask, button, field)) in [
-        (POT_L, POT_BUTTON_L, 0),
-        (POT_C, POT_BUTTON_C, 2),
-        (POT_R, POT_BUTTON_R, 1),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let selected = context.state().ui.selected;
-        let mode = context.state().ui.mode;
-        let parameter = match mode {
-            EditMode::Warp => Some(match pot {
-                0 => WARP_POSITION,
-                1 => WARP_AMOUNT,
-                _ => SMOOTHING,
-            }),
-            EditMode::Tuning => Some(match pot {
-                0 => PITCH,
-                1 => FINE,
-                _ => LEVEL,
-            }),
-            EditMode::Segment => editor_parameter(context.state().count, selected, field),
+    let parameters = bindings(context.state());
+    for pot in 0..3 {
+        let (mask, button) = match pot {
+            0 => (POT_L, POT_BUTTON_L),
+            1 => (POT_C, POT_BUTTON_C),
+            _ => (POT_R, POT_BUTTON_R),
         };
-        // Use the host definition for pickup bounds and resets so these stay
-        // consistent with parameter-page editing as controls evolve.
+        let parameter = parameters[pot];
+        let mode = context.state().ui.mode;
+        // Use the same definition for setup, editing, and reset bounds.
         let range = parameter.and_then(|p| {
             context
                 .read_parameters()
@@ -171,6 +166,7 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
         if !locked && (data.controls | data.last_buttons) as u32 & button != 0 {
             let hold_frames = (context.state().sample_rate as usize).div_ceil(10);
             context.state_mut().ui.reset_hold[pot] = hold_frames;
+            context.state_mut().ui.reset_resync = true;
         }
         if pressed && !locked {
             if let Some(parameter) = parameter {
@@ -179,13 +175,12 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
                 } else {
                     default
                 };
-                // Reset the actual host parameter and rebase pickup at the
-                // current physical position. Holding/releasing cannot undo it.
+                // Reset through the host, then synchronize firmware takeover.
+                // Holding/releasing cannot undo the reset.
                 {
                     let ui = &mut context.state_mut().ui;
                     ui.previous[pot] = data.pots[pot];
-                    ui.residual[pot] = 0.0;
-                    ui.last_written[pot] = reset_value;
+                    resync = true;
                 }
                 if value != reset_value {
                     let _ = context.parameters().set(parameter, reset_value);
@@ -199,45 +194,28 @@ fn handle_active(context: &mut Callback<'_, Ui>, data: &NtUiData) -> bool {
             let enabled = ui.primed
                 && !changed_selection
                 && !changed_mode
+                && !reset_finished
                 && !locked
                 && ui.reset_hold[pot] == 0
                 && data.controls as u32 & mask != 0
-                && (data.controls | data.last_buttons) as u32 & button == 0;
-            if value != ui.last_written[pot] {
-                ui.residual[pot] = 0.0;
-            }
-            let updated = if enabled {
-                // Keep pickup and fractional movement in the parameter's own
-                // units while mapping its range onto the bipolar pickup helper.
-                let span = (max - min) as f32;
-                let normalized =
-                    (value as f32 + ui.residual[pot] - min as f32) * 200.0 / span - 100.0;
-                pickup(ui.previous[pot], data.pots[pot], normalized).map(|updated| {
-                    ((updated + 100.0) * span / 200.0 + min as f32)
-                        .max(min as f32)
-                        .min(max as f32)
-                })
-            } else {
-                None
-            };
+                && (data.controls | data.last_buttons) as u32 & button == 0
+                && data.pots[pot] != ui.previous[pot];
             ui.previous[pot] = data.pots[pot];
-            if let Some(updated) = updated {
-                let whole = updated as i16;
-                ui.residual[pot] = updated - whole as f32;
-                ui.last_written[pot] = whole;
-                Some(whole)
-            } else {
-                None
-            }
+            if enabled { pot_value(data.pots[pot], min, max) } else { None }
         };
         if let (Some(updated), Some(parameter)) = (updated, parameter) {
             if updated != value {
                 let _ = context.parameters().set(parameter, updated);
                 edited = true;
+                // Keep the host's represented values synchronized with accepted edits.
+                resync = true;
             }
         }
     }
     context.state_mut().ui.primed = true;
+    if resync {
+        context.request_setup_ui();
+    }
     edited
 }
 }
@@ -290,20 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn pickup_maps_remaining_travel_and_does_not_stick_at_stops() {
-        assert!((pickup(0.8, 0.805, -50.0).unwrap() + 46.25).abs() < 0.001);
-        assert!((pickup(0.2, 0.195, 50.0).unwrap() - 46.25).abs() < 0.001);
-        assert_eq!(pickup(0.99, 0.996, -80.0), Some(100.0));
-        assert_eq!(pickup(0.01, 0.004, 80.0), Some(-100.0));
-        assert!(pickup(1.0, 0.995, 100.0).unwrap() < 100.0);
-        assert!(pickup(0.0, 0.005, -100.0).unwrap() > -100.0);
-        assert_eq!(pickup(0.5, 0.5, 25.0), None);
-        assert!((pickup(0.5, 0.6, 25.0).unwrap() - 40.0).abs() < 0.001);
-        assert!((pickup(0.5, 0.4, 25.0).unwrap()).abs() < 0.001);
-        assert_eq!(pickup(0.5, 1.0, 25.0), Some(100.0));
-        assert_eq!(pickup(0.5, 0.0, 25.0), Some(-100.0));
-        assert_eq!(pickup(f32::NAN, 0.5, 25.0), None);
-        assert_eq!(pickup(0.5, f32::NAN, 25.0), None);
+    fn host_positions_map_directly_to_parameter_ranges() {
+        assert_eq!(pot_value(0.25, -100, 100), Some(-50));
+        assert_eq!(pot_value(0.75, -100, 100), Some(50));
+        assert_eq!(pot_value(0.0, -100, 100), Some(-100));
+        assert_eq!(pot_value(1.0, -100, 100), Some(100));
+        assert_eq!(pot_value(0.5, 0, 255), Some(128));
+        assert_eq!(pot_value(f32::NAN, -100, 100), None);
+        assert_eq!(pot_value(0.5, 10, 10), None);
     }
 }
 
