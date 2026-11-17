@@ -1260,14 +1260,22 @@ fn queued_worker_reserves_shared_data_and_rejection_releases_it() {
         worker(base, tag);
     }
     assert_eq!(context.with_shared_resources(|d| d.counter), Ok(22));
-    assert_eq!(*context.state(), 77);
+    assert_eq!(
+        context.with_shared_state(|state, shared| {
+            *state += 1;
+            shared.counter += 1;
+            (*state, shared.counter)
+        }),
+        Ok((78, 23))
+    );
+    assert_eq!(*context.state(), 78);
     assert_eq!(context.regions()[0], 55);
     assert_eq!(context.submit_audio_worker(8), Ok(()));
     let (worker, _, tag) = PENDING_WORK.with(|q| q.take()).unwrap();
     unsafe {
         worker(base, tag);
     }
-    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(30));
+    assert_eq!(context.with_shared_resources(|d| d.counter), Ok(31));
 }
 #[test]
 fn sysex_retains_chunks_and_request_until_completion_and_can_be_reused() {

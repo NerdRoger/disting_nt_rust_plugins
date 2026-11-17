@@ -87,12 +87,14 @@ impl Instance {
                 req.num_parameters as usize,
                 VOICE_START + specified as usize * VOICE_PARAMETERS
             );
-            assert!(
-                req.sram
-                    < (dsp::blocks(dsp::DEFAULT_TABLES) * core::mem::size_of::<dsp::Block>()
-                        + dsp::basis_entries(n as usize) * core::mem::size_of::<dsp::Complex>()
-                        + 14000) as u32
-            );
+            let config = Wavesmith::configuration(&specs).unwrap();
+            let payload = core::mem::size_of::<State>()
+                + core::mem::size_of::<dsp::BuildJob>()
+                + config.regions * core::mem::size_of::<Voice>()
+                + config.parameters * core::mem::size_of::<distingnt_sys::NtParameter>()
+                + config.pages * core::mem::size_of::<distingnt_sys::NtParameterPage>()
+                + config.page_indices;
+            assert!((req.sram as usize) >= payload && (req.sram as usize) < payload + 512);
             assert!(core::mem::size_of::<State>() < 32768);
             let alignment =
                 distingnt_api::api::plugin::Registration::<Wavesmith, 2>::alignment(&specs)
@@ -154,6 +156,10 @@ impl Instance {
                 (samples.len() / LAST_BUS / 4) as i32,
             );
         }
+        // Simulate background scheduling after the audio callback has returned.
+        if AUTO_WORKER.with(core::cell::Cell::get) {
+            run_worker();
+        }
         self.assert_guard();
     }
     fn assert_guard(&self) {
@@ -205,6 +211,8 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // Firmware contract: drain queued callbacks before instance memory dies.
+        run_worker();
         unsafe {
             dealloc(self.base.cast(), self.layout);
         }
@@ -720,10 +728,8 @@ fn fixed_twenty_four_voices_have_shared_routing_and_grouped_voice_pages() {
             let instance = Instance::configured(n, MAX_VOICES as i32);
             let config = Wavesmith::configuration(&[MAX_VOICES as i32, n]).unwrap();
             assert_eq!(config.pages, voices + 5);
-            assert_eq!(
-                dsp::BLOCK_COUNT * core::mem::size_of::<dsp::Block>(),
-                20 * 1024
-            );
+            let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+            assert_eq!(core::mem::size_of_val(&context.state().tables), 14 * 1024);
             unsafe {
                 let pages = &*(*instance.base).parameter_pages;
                 let routing = &*pages.pages.add(1);
@@ -1072,8 +1078,16 @@ fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
                 mono
             })
             .collect();
+        // Isolate the mixer from startup gate ramps. Background builds can now
+        // finish before those ramps settle; envelope weighting has separate tests.
+        for instance in core::iter::once(&mut mixed).chain(references.iter_mut()) {
+            let mut context = unsafe { Callback::<Audio>::from_raw(instance.base) };
+            for voice in context.regions_mut() {
+                voice.gain = 1.0;
+            }
+        }
         let mut samples = [0.0; LAST_BUS * FRAMES];
-        for _ in 0..120 {
+        for block in 0..120 {
             for voice in 0..voices {
                 samples[voice * FRAMES..(voice + 1) * FRAMES].fill(voice as f32 * 0.25);
             }
@@ -1107,7 +1121,7 @@ fn shared_cv_output_normalizes_sum_and_snapshots_inputs_first() {
             for (&actual, &expected) in samples[..FRAMES].iter().zip(&expected) {
                 assert!(
                     (actual - expected).abs() < 0.00001,
-                    "voices {voices}: {actual} vs {expected}"
+                    "voices {voices}, block {block}: {actual} vs {expected}"
                 );
             }
         }
@@ -1790,7 +1804,8 @@ unsafe extern "C" fn NT_intToString(buffer: *mut c_char, value: i32) -> i32 {
     text.len() as i32
 }
 #[no_mangle]
-unsafe extern "C" fn NT_algorithmIndex(_: *const NtAlgorithm) -> i32 {
+unsafe extern "C" fn NT_algorithmIndex(base: *const NtAlgorithm) -> i32 {
+    SUBMIT_BASE.with(|value| value.set(base as usize));
     0
 }
 #[no_mangle]
@@ -3985,24 +4000,20 @@ fn instance_requirement_contains_only_requested_voice_storage() {
 }
 
 #[test]
-fn boundary_cache_allocation_matches_segments_and_leaves_voice_storage_unchanged() {
-    for segments in 2..=32 {
+fn worker_storage_replaces_audio_workspace_and_boundary_cache() {
+    for segments in [2, 8, 32] {
         for voices in [1, 5, 24] {
             let mut instance = Instance::configured(segments, voices);
             let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-            let expected = segments as usize * (segments as usize / 2);
-            assert_eq!(context.extra_regions().len(), expected);
+            assert!(context.extra_regions().is_empty());
+            assert_eq!(context.state().tables.len(), dsp::PLAYBACK_BLOCK_COUNT);
             assert_eq!(context.regions().len(), voices as usize);
-            let pointer = context.extra_regions().as_ptr() as usize;
-            assert_eq!(pointer % core::mem::align_of::<dsp::Complex>(), 0);
             let mut samples = [0.0; LAST_BUS * 24];
             instance.change(SMOOTHING, 63);
             instance.change(WARP_AMOUNT, -47);
             for _ in 0..100 {
                 instance.render(&mut samples);
             }
-            let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
-            assert_eq!(context.extra_regions().as_ptr() as usize, pointer);
             instance.assert_guard();
         }
     }
@@ -4308,4 +4319,147 @@ fn malformed_ui_preset_does_not_partially_apply_changes() {
         assert!(context.state().ui.mode == ui::EditMode::Warp);
         assert_eq!(context.state().ui.selected, 3);
     }
+}
+
+std::thread_local! {
+    static SUBMIT_BASE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static WORKER_QUEUE: core::cell::Cell<Option<(distingnt_sys::AudioWorker,usize,u32)>> = const { core::cell::Cell::new(None) };
+    static AUTO_WORKER: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    static ACCEPT_WORKER: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    static CUSTOM_FFT_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+fn run_worker() -> bool {
+    let queued = WORKER_QUEUE.with(|q| q.take());
+    if let Some((worker, base, tag)) = queued {
+        unsafe {
+            worker(base as *mut NtAlgorithm, tag);
+        }
+        true
+    } else {
+        false
+    }
+}
+#[no_mangle]
+unsafe extern "C" fn NT_audioWorkerSubmit(
+    worker: Option<distingnt_sys::AudioWorker>,
+    index: u32,
+    data: u32,
+) -> bool {
+    if !ACCEPT_WORKER.with(core::cell::Cell::get) {
+        return false;
+    }
+    assert_eq!(index, 0);
+    WORKER_QUEUE.with(|q| {
+        assert!(q.get().is_none());
+        q.set(Some((
+            worker.unwrap(),
+            SUBMIT_BASE.with(core::cell::Cell::get),
+            data,
+        )));
+    });
+    true
+}
+pub(super) fn with_build_job(count: usize, f: impl FnOnce(&mut dsp::BuildJob)) {
+    let instance = Instance::configured(count as i32, 1);
+    let mut context = unsafe { Callback::<Audio>::from_raw(instance.base) };
+    context.with_shared_resources(f).unwrap();
+}
+
+#[test]
+fn audio_never_runs_ffts_and_only_publishes_completed_worker_tables() {
+    let mut instance = Instance::new(16);
+    instance.change(OUTPUT_MODE, 1);
+    let mut samples = [0.0; LAST_BUS * 24];
+    for _ in 0..60 {
+        instance.render(&mut samples);
+    }
+    let snapshot = |instance: &Instance| {
+        let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+        core::array::from_fn::<_, 256, _>(|i| {
+            context
+                .state()
+                .engine
+                .editor_phase_sample(&context.state().tables, i as f32 / 256.0)
+        })
+    };
+    let original = snapshot(&instance);
+    AUTO_WORKER.with(|v| v.set(false));
+    CUSTOM_FFT_CALLS.with(|v| v.set(0));
+    instance.change(SMOOTHING, 57);
+    instance.change(boundary_parameter(1), 99);
+    instance.render(&mut samples);
+    assert!(WORKER_QUEUE.with(|q| q.get().is_some()));
+    for _ in 0..40 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get), 0);
+    assert_eq!(snapshot(&instance), original);
+    // A later edit stays on the audio side while the worker owns its snapshot.
+    instance.change(WARP_AMOUNT, 83);
+    assert!(run_worker());
+    assert_eq!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get), 6);
+    assert_eq!(snapshot(&instance), original);
+    AUTO_WORKER.with(|v| v.set(true));
+    for _ in 0..80 {
+        instance.render(&mut samples);
+    }
+    assert_ne!(snapshot(&instance), original);
+    assert!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get) >= 12);
+    assert!(samples.iter().all(|v| v.is_finite()));
+    instance.assert_guard();
+}
+#[test]
+fn rejected_worker_jobs_retry_without_losing_the_requested_waveform() {
+    let mut instance = Instance::new(8);
+    let mut samples = [0.0; LAST_BUS * 24];
+    ACCEPT_WORKER.with(|v| v.set(false));
+    CUSTOM_FFT_CALLS.with(|v| v.set(0));
+    for _ in 0..10 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get), 0);
+    assert!(WORKER_QUEUE.with(|q| q.get().is_none()));
+    ACCEPT_WORKER.with(|v| v.set(true));
+    for _ in 0..40 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get), 4);
+    assert_eq!(unsafe { factory() }.audio_worker_stack_size, 4096);
+}
+
+#[test]
+fn continuous_edits_follow_worker_availability_and_retain_the_latest_shape() {
+    let mut instance = Instance::new(8);
+    let mut samples = [0.0; LAST_BUS * 24];
+    CUSTOM_FFT_CALLS.with(|v| v.set(0));
+    for i in 0..2000 {
+        instance.change(boundary_parameter(1), (i % 201) as i16 - 100);
+        instance.render(&mut samples);
+    }
+    let transforms = CUSTOM_FFT_CALLS.with(core::cell::Cell::get);
+    assert_eq!(transforms % 4, 0);
+    // The simulated worker completes immediately; the former fixed cap must
+    // not hold back new requests once the edit crossfade has finished.
+    assert!(transforms / 4 > 39, "{} builds", transforms / 4);
+    // The last edit is retained even when another snapshot is already running.
+    instance.change(boundary_parameter(1), 83);
+    for _ in 0..120 {
+        instance.render(&mut samples);
+    }
+    let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
+    let value = context
+        .state()
+        .engine
+        .editor_phase_sample(&context.state().tables, 1.0 / 8.0);
+    assert!((value - 0.83).abs() < 0.00001, "latest boundary: {value}");
+    let settled = CUSTOM_FFT_CALLS.with(core::cell::Cell::get);
+    for _ in 0..50 {
+        instance.render(&mut samples);
+    }
+    assert_eq!(CUSTOM_FFT_CALLS.with(core::cell::Cell::get), settled);
+    instance.assert_guard();
+}
+
+pub(super) fn count_custom_fft() {
+    CUSTOM_FFT_CALLS.with(|value| value.set(value.get() + 1));
 }

@@ -776,6 +776,31 @@ impl<S: Copy, V: Copy, Mode, M: StateMemory<S>, E: ExtraRegionLayout>
     ) -> Result<R, super::background::Error> {
         self.shared_slot()?.with(f)
     }
+    /// Borrow ordinary state and the disjoint shared object together. No host
+    /// calls or context capabilities are admitted until this closure returns.
+    /// Neither reference can escape the reservation:
+    /// ```compile_fail
+    /// use distingnt_api::api::{plugin::{Context,SharedResources}, parameters::Audio,
+    ///     state_memory::Sram};
+    /// fn escape<'a>(c: &'a mut Context<'_,u32,(),Audio,Sram,SharedResources<u32>>)
+    ///     -> &'a mut u32 {
+    ///     c.with_shared_state(|state,_| state).unwrap()
+    /// }
+    /// ```
+    pub fn with_shared_state<R>(
+        &mut self,
+        f: impl FnOnce(&mut S, &mut E::Shared) -> R,
+    ) -> Result<R, super::background::Error> {
+        let slot = self.shared_slot()?;
+        // The checked layout gives state and shared storage disjoint addresses.
+        // Reserving the shared slot excludes worker/transfer access to its value.
+        slot.with(|shared| {
+            f(
+                unsafe { &mut *M::pointer(ptr::addr_of_mut!((*self.raw).state)) },
+                shared,
+            )
+        })
+    }
     /// Reserve the shared object before queuing. Queue rejection releases it.
     pub fn submit_audio_worker(&mut self, data: u32) -> Result<(), super::background::Error> {
         let (_, worker) = E::shared_parts(unsafe { &(*self.raw).shared })
@@ -1098,6 +1123,11 @@ impl InstanceLayout {
 
 pub struct Registration<P: Plugin, const N: usize>(PhantomData<P>);
 impl<P: Plugin, const N: usize> Registration<P, N> {
+    // Keep address-taken callbacks in a relocation-friendly constant table.
+    // Volatile reads avoid LLVM lowering direct function-address materialization
+    // to GOT_PREL, which the NT object loader does not support.
+    const BACKGROUND_CALLBACKS: (AudioWorker, LargeSysExFetch, LargeSysExComplete) =
+        (Self::audio_worker, Self::sysex_fetch, Self::sysex_complete);
     const SPECS: [NtSpecification; N] = {
         assert!(N == P::SPECIFICATIONS.len());
         let mut result = [NtSpecification {
@@ -1467,7 +1497,12 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 return ptr::null_mut();
             }
         }
-        if P::ExtraRegions::SHARED {
+        let callbacks = if P::ExtraRegions::SHARED {
+            Some(unsafe { ptr::read_volatile(&Self::BACKGROUND_CALLBACKS) })
+        } else {
+            None
+        };
+        if let Some((_, fetch, complete)) = callbacks {
             let shared = unsafe {
                 ram.add(layout.shared).cast::<super::background::SharedSlot<
                 <P::ExtraRegions as ExtraRegionLayout>::Shared>>()
@@ -1478,8 +1513,8 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 super::background::SharedSlot::initialize(
                     shared,
                     |destination| P::initialize_shared_resources(destination, specs),
-                    Self::sysex_fetch,
-                    Self::sysex_complete,
+                    fetch,
+                    complete,
                 )
             }
             .is_none()
@@ -1553,7 +1588,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                     if P::AUDIO_WORKER_STACK_SIZE == 0 {
                         None
                     } else {
-                        Some(Self::audio_worker)
+                        callbacks.map(|value| value.0)
                     },
                 ),
             );

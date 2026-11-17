@@ -10,21 +10,6 @@ pub const MAX_FOLDS: i16 = 2;
 pub const DEFAULT_FOLD_LIMIT: i16 = 2;
 pub const DEFAULT_TABLES: usize = 6;
 pub const MAX_TABLES: usize = 20;
-#[cfg(test)]
-const LEVELS: usize = DEFAULT_TABLES;
-#[cfg(test)]
-const TABLES_PER_BANK: usize = LEVELS + 1;
-// Pack two real-valued tables into each block's real/imaginary lanes.
-#[cfg(test)]
-const BANK_BLOCKS: usize = TABLES_PER_BANK;
-// Each paired inverse FFT produces at most two audio tables.
-const TABLES_PER_STEP: usize = 2;
-const TABLE_PAIR_STEPS: usize = 4;
-const HARMONICS_PER_STEP: usize = 4;
-const SAMPLES_PER_STEP: usize = 64;
-const SAMPLE_STEPS: usize = SIZE / SAMPLES_PER_STEP;
-const SOURCE_FFT_STAGE: usize = 1 + SAMPLE_STEPS;
-const SOURCE_STEPS: usize = SOURCE_FFT_STAGE + 2;
 // FFT uses 0..128; packed smoothing gains use 128..193. Cache geometry in
 // the remaining twiddle-buffer space: 33 positions and 32 reciprocal widths.
 const POSITION_CACHE: usize = SIZE / 2 + (SIZE / 2 + 1).div_ceil(2);
@@ -71,12 +56,6 @@ pub fn preset_boundary(shape: BoundaryShape, boundary: usize, count: usize) -> i
     }) as i16)
         .clamp(-100, 100)
 }
-#[cfg(test)]
-const TWIDDLES: usize = BANK_BLOCKS + 2;
-
-#[cfg(test)]
-const BUILD_STEPS: usize = LEVELS.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS + SOURCE_STEPS;
-
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct TableLayout {
@@ -186,8 +165,6 @@ impl Wave {
     }
 
     pub fn boundary_position(&self, boundary: usize) -> f32 {
-        #[cfg(test)]
-        tests::count_boundary_position();
         let x = boundary.min(self.count) as f32 / self.count.max(2) as f32;
         if boundary == 0 || boundary >= self.count || self.warp_amount == 0 {
             return x;
@@ -309,102 +286,6 @@ fn fold(mut value: f32, limit: usize) -> f32 {
 
 // The FFT needs only the first half-cycle. Recover the remaining phases by
 // symmetry, so harmonic synthesis can reuse those values without a new buffer.
-fn add_harmonic(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], k: usize, a: f32, b: f32) {
-    let mut phase = 0;
-    for value in data {
-        let basis = twiddles[phase & (SIZE / 2 - 1)];
-        let correction = a * basis.re - b * basis.im;
-        value.re += if phase < SIZE / 2 {
-            correction
-        } else {
-            -correction
-        };
-        phase = (phase + k) & (SIZE - 1);
-    }
-}
-
-// Cache one complex weight per boundary and correction harmonic.
-pub const fn basis_entries(count: usize) -> usize {
-    let n = if count < 2 {
-        2
-    } else if count > MAX_SEGMENTS {
-        MAX_SEGMENTS
-    } else {
-        count
-    };
-    n * (n / 2)
-}
-fn prepare_boundary_basis(n: usize, basis: &mut [Complex]) {
-    let n = n.clamp(2, MAX_SEGMENTS);
-    for k in 1..=n / 2 {
-        let angle = core::f32::consts::TAU * k as f32 / n as f32;
-        let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
-        let (mut cosine, mut sinusoid) = (1.0, 0.0);
-        for i in 0..n {
-            let index = (k - 1) * n + i;
-            let Some(slot) = basis.get_mut(index) else {
-                return;
-            };
-            *slot = Complex {
-                re: cosine,
-                im: sinusoid,
-            };
-            let next = cosine * wc - sinusoid * ws;
-            sinusoid = sinusoid * wc + cosine * ws;
-            cosine = next;
-        }
-    }
-}
-
-/// Explicit smoothing retains shared boundaries, including the seam. This is
-/// independent of oscillator pitch. The final anti-alias filter follows this.
-fn anchor_boundary_step(
-    wave: &Wave,
-    data: &mut [Complex; SIZE],
-    twiddles: &[Complex; SIZE],
-    basis: &[Complex],
-    errors: &mut [Complex; SIZE],
-    step: usize,
-) {
-    let n = wave.count.clamp(2, MAX_SEGMENTS);
-    if step == 0 {
-        // The source spectrum is no longer needed after the smoothing IFFT.
-        // Borrow it to retain errors across callbacks without another buffer.
-        for (i, error) in errors.iter_mut().take(n).enumerate() {
-            let position = i as f32 * SIZE as f32 / n as f32;
-            let index = position as usize & (SIZE - 1);
-            let fraction = position - index as f32;
-            let actual =
-                data[index].re + (data[(index + 1) & (SIZE - 1)].re - data[index].re) * fraction;
-            let target = wave.boundary_level(i);
-            error.re = target - actual;
-        }
-        let dc = errors.iter().take(n).map(|error| error.re).sum::<f32>() / n as f32;
-        for value in data.iter_mut() {
-            value.re += dc;
-        }
-    } else {
-        let first = 1 + (step - 1) * HARMONICS_PER_STEP;
-        for k in first..(first + HARMONICS_PER_STEP).min(n / 2 + 1) {
-            let (mut a, mut b) = (0.0, 0.0);
-            for (i, error) in errors.iter().take(n).enumerate() {
-                let index = (k - 1) * n + i;
-                let Some(&weight) = basis.get(index) else {
-                    return;
-                };
-                a += error.re * weight.re;
-                b += error.re * weight.im;
-            }
-            let scale = if n % 2 == 0 && k == n / 2 { 1.0 } else { 2.0 } / n as f32;
-            add_harmonic(data, twiddles, k, a * scale, b * scale);
-        }
-    }
-}
-
-fn correction_steps(count: usize) -> usize {
-    1 + (count.clamp(2, MAX_SEGMENTS) / 2).div_ceil(HARMONICS_PER_STEP)
-}
-
 fn cached_geometry(twiddles: &[Complex; SIZE], index: usize) -> f32 {
     let value = twiddles[POSITION_CACHE + index.min(MAX_SEGMENTS * 2) / 2];
     if index & 1 == 0 {
@@ -450,23 +331,6 @@ fn cached_segment_at(
     (*cursor, ((phase - start) * inverse_width).clamp(0.0, 1.0))
 }
 
-fn audio_table_stage(wave: &Wave) -> usize {
-    if wave.smoothing > 0 {
-        // Sampling, source FFT halves, filter, inverse FFT halves, correction,
-        // preview storage, corrected FFT halves, and spectrum copy.
-        SOURCE_STEPS
-            + 7
-            + 2 * correction_steps(wave.count)
-            + if wave.warp_amount != 0 {
-                SAMPLE_STEPS
-            } else {
-                0
-            }
-    } else {
-        SOURCE_STEPS
-    }
-}
-
 pub fn default_level(node: usize, count: usize) -> i16 {
     preset_boundary(BoundaryShape::Sine, node, count)
 }
@@ -506,10 +370,12 @@ fn sine(mut x: f32) -> f32 {
             + q * (1.0 / 120.0 + q * (-1.0 / 5040.0 + q * (1.0 / 362880.0 - q / 39916800.0)))))
 }
 
-#[cfg(test)]
 fn fft(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool) {
     #[cfg(test)]
-    tests::count_fft(inverse);
+    {
+        tests::count_fft(inverse);
+        crate::tests::count_custom_fft();
+    }
     for i in 0..SIZE {
         let j = (i.reverse_bits() >> (usize::BITS - 8)) & (SIZE - 1);
         if i < j {
@@ -550,54 +416,6 @@ fn fft(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool) {
 // Each callback performs four of the eight radix-2 stages. Reordering belongs
 // to the first half; inverse normalization belongs to the second. No other
 // build work may touch this buffer between these two calls.
-fn fft_half(data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE], inverse: bool, second: bool) {
-    #[cfg(test)]
-    {
-        tests::count_fft_half();
-        if second {
-            tests::count_fft(inverse);
-        }
-    }
-    if !second {
-        for i in 0..SIZE {
-            let j = (i.reverse_bits() >> (usize::BITS - 8)) & (SIZE - 1);
-            if i < j {
-                data.swap(i, j);
-            }
-        }
-    }
-    let mut width = if second { 32 } else { 2 };
-    let limit = if second { SIZE } else { 16 };
-    while width <= limit {
-        let half = width / 2;
-        for base in (0..SIZE).step_by(width) {
-            for k in 0..half {
-                let mut w = twiddles[(k * SIZE / width) & (SIZE / 2 - 1)];
-                if inverse {
-                    w.im = -w.im;
-                }
-                let a = data[(base + k) & (SIZE - 1)];
-                let b = data[(base + k + half) & (SIZE - 1)].mul(w);
-                data[(base + k) & (SIZE - 1)] = Complex {
-                    re: a.re + b.re,
-                    im: a.im + b.im,
-                };
-                data[(base + k + half) & (SIZE - 1)] = Complex {
-                    re: a.re - b.re,
-                    im: a.im - b.im,
-                };
-            }
-        }
-        width *= 2;
-    }
-    if inverse && second {
-        for value in data {
-            value.re /= SIZE as f32;
-            value.im /= SIZE as f32;
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct Block {
     data: [Complex; SIZE],
@@ -630,40 +448,8 @@ impl Block {
     };
 }
 
-// Fixed shared DSP buffers are initialized block-by-block in their final SRAM
-// locations through RegionInitializer::initialize_each, never returned as a
-// whole array. Each table uses one real or imaginary lane in a packed block.
-pub const fn blocks(tables: usize) -> usize {
-    tables + 4
-}
-pub const BLOCK_COUNT: usize = blocks(DEFAULT_TABLES);
-#[cfg(test)]
-const BLOCKS: usize = reference_blocks(DEFAULT_TABLES);
-// Native-only fixtures retain the former packed cache blocks to check the
-// existing reference traces and cache contents without production padding.
-#[cfg(test)]
-const fn reference_blocks(tables: usize) -> usize {
-    blocks(tables) + 2
-}
+// Packed real/imaginary lanes hold the two production playback banks.
 pub type Memory = [Block];
-
-fn store_table(
-    banks: &mut [Block],
-    index: usize,
-    source: &[Complex; SIZE],
-    imaginary: bool,
-) -> Option<()> {
-    let destination = banks.get_mut(index / 2)?;
-    for (to, from) in destination.data.iter_mut().zip(source) {
-        let value = if imaginary { from.im } else { from.re };
-        if index & 1 == 0 {
-            to.re = value;
-        } else {
-            to.im = value;
-        }
-    }
-    Some(())
-}
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -741,8 +527,6 @@ pub struct Oscillator {
     playback_blend: f32,
     selection_low: u32,
     selection_high: u32,
-    #[cfg(test)]
-    pitch_slew: i32,
     pitch_pair_slew: i32,
     pair_end: u32,
     pair_pending: bool,
@@ -783,8 +567,6 @@ impl Oscillator {
             playback_blend: 0.0,
             selection_low: 0,
             selection_high: 0,
-            #[cfg(test)]
-            pitch_slew: 0,
             pitch_pair_slew: 0,
             pair_end: 0,
             pair_pending: false,
@@ -818,13 +600,6 @@ impl Oscillator {
             tests::count_frequency_conversion();
         }
         self.cached_frequency
-    }
-
-    #[cfg(test)]
-    pub fn cv_frequency(&mut self, tuning: f32, factor: f32) -> f32 {
-        // exp2(tuning + CV) = exp2(tuning) * exp2(CV). The tuning factor is
-        // cached per voice; the input factor is shared even for detuned voices.
-        (self.frequency(tuning) * factor).clamp(440.0 / 65536.0, 440.0 * 65536.0)
     }
 
     pub fn prepare_cv(&mut self, tuning: f32, factor: f32, sample_rate: f32, level: f32) {
@@ -870,11 +645,6 @@ impl Oscillator {
         self.cached_rate = sample_rate;
         self.slew = (1000.0 / sample_rate).min(1.0);
         let pitch_slew = ((self.slew * PITCH_SLEW_SCALE) as i32).max(1);
-        #[cfg(test)]
-        {
-            // The independent one-sample reference uses the original coefficient.
-            self.pitch_slew = pitch_slew;
-        }
         // alpha_pair = alpha + alpha*(1-alpha), rounded in Q30.
         self.pitch_pair_slew = pitch_slew
             + ((pitch_slew as i64 * ((1i64 << 30) - pitch_slew as i64) + (1i64 << 29)) >> 30)
@@ -958,24 +728,6 @@ impl Oscillator {
                 self.pair_pending = true;
             }
             self.pitch_moving = self.phase_step != self.target_step || self.pair_pending;
-        }
-    }
-    #[cfg(test)]
-    fn advance_pitch_step_exact(&mut self) {
-        if self.pitch_moving {
-            let delta = (self.target_step as i32).wrapping_sub(self.phase_step as i32);
-            if delta != 0 {
-                let rounded = ((delta as i64 * self.pitch_slew as i64 + (1i64 << 29)) >> 30) as i32;
-                // Never stick short of the target: continue in one phase-step
-                // units when the rounded exponential adjustment reaches zero.
-                let change = if rounded == 0 {
-                    delta.signum()
-                } else {
-                    rounded
-                };
-                self.phase_step = self.phase_step.wrapping_add(change as u32);
-            }
-            self.pitch_moving = self.phase_step != self.target_step;
         }
     }
     #[inline(always)]
@@ -1207,32 +959,231 @@ pub fn playback_work_counts() -> (usize, usize) {
     tests::playback_work_counts()
 }
 
+// Playback banks stay on the audio side; all rebuild scratch belongs to the
+// queued/running worker job.
+pub const PLAYBACK_BLOCK_COUNT: usize = DEFAULT_TABLES + 1;
+#[derive(Clone, Copy)]
+pub struct BuildJob {
+    wave: Wave,
+    completed: bool,
+    initialized: bool,
+    result: [[f32; SIZE]; DEFAULT_TABLES + 1],
+    spectrum: [Complex; SIZE],
+    scratch: [Complex; SIZE],
+    twiddles: [Complex; SIZE],
+}
+impl BuildJob {
+    pub fn initialize(
+        p: &mut distingnt_api::api::plugin::RegionInitializer<'_, Self>,
+        count: usize,
+    ) -> Option<()> {
+        distingnt_api::initialize_region!(
+            p,
+            BuildJob {
+                wave: Wave::blank(count),
+                completed: false,
+                initialized: false,
+            },
+            arrays {},
+            regions {
+                result: |field| field.initialize_each(|row, _| row.fill(0.0)),
+                spectrum: |field| field.initialize_each(|value, _| Complex::initialize(value)),
+                scratch: |field| field.initialize_each(|value, _| Complex::initialize(value)),
+                twiddles: |field| field.initialize_each(|value, _| Complex::initialize(value)),
+            }
+        );
+        Some(())
+    }
+    /// Rebuild the complete table set on the background worker.
+    /// Two audio tables are packed into each inverse complex transform.
+    pub fn build(&mut self) {
+        self.completed = false;
+        if !self.initialized {
+            for (i, value) in self.twiddles.iter_mut().take(SIZE / 2).enumerate() {
+                let angle = core::f32::consts::TAU * i as f32 / SIZE as f32;
+                *value = Complex {
+                    re: sine(angle + core::f32::consts::FRAC_PI_2),
+                    im: -sine(angle),
+                };
+            }
+            for harmonic in 0..=SIZE / 2 {
+                let ratio = harmonic as f32 / 4.0;
+                let gain = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
+                let slot = &mut self.twiddles[SIZE / 2 + harmonic / 2];
+                if harmonic & 1 == 0 {
+                    slot.re = gain;
+                } else {
+                    slot.im = gain;
+                }
+            }
+            self.initialized = true;
+        }
+        if self.wave.warp_amount != 0 {
+            prepare_geometry(&self.wave, &mut self.twiddles);
+        }
+        let mut cursor = 0;
+        for (i, value) in self.spectrum.iter_mut().enumerate() {
+            let phase = i as f32 / SIZE as f32;
+            let sample = if self.wave.smoothing > 0 || self.wave.warp_amount == 0 {
+                self.wave.sample_unwarped(phase)
+            } else {
+                let (segment, t) =
+                    cached_segment_at(&self.wave, &self.twiddles, phase, &mut cursor);
+                self.wave.segment_sample(segment, t)
+            };
+            *value = Complex {
+                re: sample,
+                im: 0.0,
+            };
+            self.result[DEFAULT_TABLES][i] = sample;
+        }
+        fft(&mut self.spectrum, &self.twiddles, false);
+        if self.wave.smoothing > 0 {
+            let smoothing = self.wave.smoothing as f32 * 0.01;
+            for (k, value) in self.scratch.iter_mut().enumerate() {
+                let harmonic = k.min(SIZE - k);
+                let slot = self.twiddles[(SIZE / 2 + harmonic / 2).min(SIZE - 1)];
+                let filtered = if harmonic & 1 == 0 { slot.re } else { slot.im };
+                let gain = 1.0 + smoothing * (filtered - 1.0);
+                *value = Complex {
+                    re: self.spectrum[k].re * gain,
+                    im: self.spectrum[k].im * gain,
+                };
+            }
+            fft(&mut self.scratch, &self.twiddles, true);
+            for _ in 0..2 {
+                self.anchor_boundaries();
+            }
+            self.scratch[0].re = self.wave.boundary_level(0);
+            for (to, from) in self.result[DEFAULT_TABLES].iter_mut().zip(&self.scratch) {
+                *to = from.re;
+            }
+            if self.wave.warp_amount != 0 {
+                let preview = &self.result[DEFAULT_TABLES];
+                let mut cursor = 0;
+                for (i, value) in self.scratch.iter_mut().enumerate() {
+                    let (segment, t) = cached_segment_at(
+                        &self.wave,
+                        &self.twiddles,
+                        i as f32 / SIZE as f32,
+                        &mut cursor,
+                    );
+                    let phase = (segment as f32 + t) / self.wave.count as f32;
+                    let fixed = (phase * 4_294_967_296.0) as u32;
+                    let index = (fixed >> 24) as usize;
+                    let fraction = (fixed & 0x00ff_ffff) as f32 / 16_777_216.0;
+                    *value = Complex {
+                        re: preview[index]
+                            + (preview[(index + 1) & (SIZE - 1)] - preview[index]) * fraction,
+                        im: 0.0,
+                    };
+                }
+            }
+            fft(&mut self.scratch, &self.twiddles, false);
+            self.spectrum.copy_from_slice(&self.scratch);
+        }
+        let layout = TableLayout::new(DEFAULT_TABLES);
+        for level in (0..DEFAULT_TABLES).step_by(2) {
+            let cutoff = layout.cutoff(level);
+            let second_cutoff = layout.cutoff(level + 1);
+            let has_second = level + 1 < DEFAULT_TABLES;
+            for (k, value) in self.scratch.iter_mut().enumerate() {
+                let harmonic = k.min(SIZE - k);
+                let first = if harmonic <= cutoff && harmonic < SIZE / 2 {
+                    self.spectrum[k]
+                } else {
+                    Complex::default()
+                };
+                let second = if has_second && harmonic <= second_cutoff && harmonic < SIZE / 2 {
+                    self.spectrum[k]
+                } else {
+                    Complex::default()
+                };
+                *value = Complex {
+                    re: first.re - second.im,
+                    im: first.im + second.re,
+                };
+            }
+            fft(&mut self.scratch, &self.twiddles, true);
+            let Some(first) = self.result.get_mut(level) else {
+                return;
+            };
+            for (to, from) in first.iter_mut().zip(&self.scratch) {
+                *to = from.re;
+            }
+            if has_second {
+                let Some(second) = self.result.get_mut(level + 1) else {
+                    return;
+                };
+                for (to, from) in second.iter_mut().zip(&self.scratch) {
+                    *to = from.im;
+                }
+            }
+        }
+        self.completed = true;
+    }
+    fn anchor_boundaries(&mut self) {
+        let n = self.wave.count.clamp(2, MAX_SEGMENTS);
+        for (i, error) in self.spectrum.iter_mut().take(n).enumerate() {
+            let position = i as f32 * SIZE as f32 / n as f32;
+            let index = position as usize & (SIZE - 1);
+            let fraction = position - index as f32;
+            let actual = self.scratch[index].re
+                + (self.scratch[(index + 1) & (SIZE - 1)].re - self.scratch[index].re) * fraction;
+            error.re = self.wave.boundary_level(i) - actual;
+        }
+        let dc = self
+            .spectrum
+            .iter()
+            .take(n)
+            .map(|error| error.re)
+            .sum::<f32>()
+            / n as f32;
+        for value in &mut self.scratch {
+            value.re += dc;
+        }
+        for k in 1..=n / 2 {
+            // Evaluate the boundary analysis weights in the worker, avoiding
+            // a separate persistent cache for every segment/harmonic pair.
+            let angle = core::f32::consts::TAU * k as f32 / n as f32;
+            let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
+            let (mut cosine, mut sinusoid) = (1.0, 0.0);
+            let (mut a, mut b) = (0.0, 0.0);
+            for error in self.spectrum.iter().take(n) {
+                a += error.re * cosine;
+                b += error.re * sinusoid;
+                let next = cosine * wc - sinusoid * ws;
+                sinusoid = sinusoid * wc + cosine * ws;
+                cosine = next;
+            }
+            let scale = if n % 2 == 0 && k == n / 2 { 1.0 } else { 2.0 } / n as f32;
+            let (a, b) = (a * scale, b * scale);
+            let mut phase = 0;
+            for value in &mut self.scratch {
+                let basis = self.twiddles[phase & (SIZE / 2 - 1)];
+                let correction = a * basis.re - b * basis.im;
+                value.re += if phase < SIZE / 2 {
+                    correction
+                } else {
+                    -correction
+                };
+                phase = (phase + k) & (SIZE - 1);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Engine {
     layout: TableLayout,
     requested: Wave,
-    building: Wave,
     waves: [Wave; 2],
     active: usize,
-    stage: usize,
     dirty: bool,
-    initialized: bool,
-    basis_count: usize,
-    sample_segment: usize,
     fade: usize,
     fade_length: usize,
-    #[cfg(test)]
-    phase: u32,
-    #[cfg(test)]
-    level: f32,
-    #[cfg(test)]
-    increment: f32,
     ready: [bool; 2],
-    #[cfg(test)]
-    playback_level: usize,
-    #[cfg(test)]
-    playback_blend: f32,
 }
 
 impl Engine {
@@ -1243,66 +1194,19 @@ impl Engine {
         sample_rate: u32,
     ) {
         let wave = Wave::new(count);
-        // Keep test-only oscillator fields out of the production layout while
-        // sharing the actual field initialization across both configurations.
-        macro_rules! initialize {
-            ($($field:ident: $value:expr),* $(,)?) => {
-                distingnt_api::initialize_region!(destination, Engine {
-                    layout: TableLayout::new(DEFAULT_TABLES),
-                    requested: wave,
-                    building: wave,
-                    active: 0,
-                    stage: 0,
-                    dirty: true,
-                    initialized: false,
-                    basis_count: 0,
-                    sample_segment: 0,
-                    fade: 0,
-                    fade_length: (sample_rate as usize / 200).max(1),
-                    ready: [false; 2],
-                    $($field: $value,)*
-                }, arrays { waves: |_| wave });
-            };
-        }
-        #[cfg(not(test))]
-        initialize!();
-        #[cfg(test)]
-        initialize!(phase: 0, level: 0.0, increment: 0.0, playback_level: 0, playback_blend: 0.0);
-    }
-
-    #[cfg(test)]
-    pub fn new(count: usize, sample_rate: u32) -> Self {
-        Self::with_tables(count, sample_rate, DEFAULT_TABLES)
-    }
-
-    #[cfg(test)]
-    fn with_tables(count: usize, sample_rate: u32, tables: usize) -> Self {
-        let wave = Wave::new(count);
-        Self {
-            layout: TableLayout::new(tables),
-            requested: wave,
-            building: wave,
-            waves: [wave; 2],
-            active: 0,
-            stage: 0,
-            dirty: true,
-            initialized: false,
-            basis_count: 0,
-            sample_segment: 0,
-            fade: 0,
-            fade_length: (sample_rate as usize / 200).max(1),
-            #[cfg(test)]
-            phase: 0,
-            #[cfg(test)]
-            level: 0.0,
-            #[cfg(test)]
-            increment: 0.0,
-            ready: [false; 2],
-            #[cfg(test)]
-            playback_level: 0,
-            #[cfg(test)]
-            playback_blend: 0.0,
-        }
+        distingnt_api::initialize_region!(
+            destination,
+            Engine {
+                layout: TableLayout::new(DEFAULT_TABLES),
+                requested: wave,
+                active: 0,
+                dirty: true,
+                fade: 0,
+                fade_length: (sample_rate as usize / 200).max(1),
+                ready: [false; 2],
+            },
+            arrays { waves: |_| wave }
+        );
     }
 
     /// Update the preallocated requested shape without a callback-local snapshot.
@@ -1318,292 +1222,43 @@ impl Engine {
         self.dirty = !self.ready[latest & 1] || self.requested != self.waves[latest & 1];
     }
 
-    // Preserve the prior value-taking path as an independent test reference.
-    #[cfg(test)]
-    pub fn request(&mut self, wave: Wave) {
-        self.requested = wave;
-        let latest = if self.fade > 0 {
-            1 - self.active
-        } else {
-            self.active
-        };
-        self.dirty = !self.ready[latest & 1] || self.requested != self.waves[latest & 1];
-    }
-
-    #[cfg(test)]
-    pub fn advance(&mut self, memory: &mut Memory) {
-        let count = blocks(self.layout.count);
-        if memory.len() != count + 2 {
-            return;
+    /// Poll a completed result and snapshot the latest request for a new job.
+    /// Called only while the shared job slot is exclusively reserved by audio.
+    pub fn service_job(&mut self, job: &mut BuildJob, memory: &mut Memory) -> bool {
+        if self.fade != 0 {
+            return false;
         }
-        let (memory, packed) = memory.split_at_mut(count);
-        let mut basis = [Complex::default(); MAX_SEGMENTS * (MAX_SEGMENTS / 2)];
-        for (to, block) in basis.chunks_mut(SIZE).zip(packed.iter()) {
-            to.copy_from_slice(&block.data);
-        }
-        self.advance_with_basis(memory, &mut basis);
-        for (from, block) in basis.chunks(SIZE).zip(packed.iter_mut()) {
-            block.data.copy_from_slice(from);
-        }
-    }
-
-    pub fn advance_with_basis(&mut self, memory: &mut Memory, basis: &mut [Complex]) {
-        if self.fade > 0 {
-            return;
-        }
-        if self.stage == 0 {
-            if !self.dirty {
-                return;
+        if job.completed {
+            if memory.len() < PLAYBACK_BLOCK_COUNT {
+                return false;
             }
-            self.building = self.requested;
-        }
-        let tables_per_bank = self.layout.count + 1;
-        if memory.len() != blocks(self.layout.count)
-            || basis.len() < basis_entries(self.building.count)
-        {
-            return;
-        }
-        let (banks, workspace) = memory.split_at_mut(tables_per_bank);
-        let [spectrum, scratch, twiddles] = workspace else {
-            return;
-        };
-        if !self.initialized {
-            for (i, twiddle) in twiddles.data.iter_mut().take(SIZE / 2).enumerate() {
-                let angle = core::f32::consts::TAU * i as f32 / SIZE as f32;
-                *twiddle = Complex {
-                    re: sine(angle + core::f32::consts::FRAC_PI_2),
-                    im: -sine(angle),
+            let base = (1 - self.active) * (DEFAULT_TABLES + 1);
+            for (level, source) in job.result.iter().enumerate() {
+                let index = base + level;
+                let Some(block) = memory.get_mut(index / 2) else {
+                    return false;
                 };
-            }
-            // The unused half of the twiddle buffer holds the fixed smoothing
-            // response for harmonics 0..=128, packed into real/imaginary lanes.
-            for harmonic in 0..=SIZE / 2 {
-                let ratio = harmonic as f32 / 4.0;
-                let gain = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
-                let slot = &mut twiddles.data[SIZE / 2 + harmonic / 2];
-                if harmonic & 1 == 0 {
-                    slot.re = gain;
-                } else {
-                    slot.im = gain;
-                }
-            }
-            self.initialized = true;
-        }
-        if self.basis_count != self.building.count {
-            prepare_boundary_basis(self.building.count, basis);
-            self.basis_count = self.building.count;
-        }
-        if self.stage == 0 {
-            if self.building.warp_amount != 0 {
-                prepare_geometry(&self.building, &mut twiddles.data);
-            }
-            self.sample_segment = 0;
-            self.stage = 1;
-            return;
-        }
-        if self.stage < SOURCE_STEPS {
-            if self.stage < SOURCE_FFT_STAGE {
-                // Smooth and anchor in equal-width segment coordinates, then
-                // stretch that completed shape before final anti-alias filtering.
-                let source = &self.building;
-                let first = (self.stage - 1) * SAMPLES_PER_STEP;
-                #[cfg(test)]
-                tests::count_generated_samples(SAMPLES_PER_STEP);
-                for (i, value) in spectrum
-                    .data
-                    .iter_mut()
-                    .enumerate()
-                    .skip(first)
-                    .take(SAMPLES_PER_STEP)
-                {
-                    let phase = i as f32 / SIZE as f32;
-                    let sample = if source.smoothing > 0 || source.warp_amount == 0 {
-                        source.sample_unwarped(phase)
+                for (destination, &sample) in block.data.iter_mut().zip(source) {
+                    if index & 1 == 0 {
+                        destination.re = sample;
                     } else {
-                        let (segment, t) = cached_segment_at(
-                            source,
-                            &twiddles.data,
-                            phase,
-                            &mut self.sample_segment,
-                        );
-                        source.segment_sample(segment, t)
-                    };
-                    *value = Complex {
-                        re: sample,
-                        im: 0.0,
-                    };
-                }
-            } else {
-                fft_half(
-                    &mut spectrum.data,
-                    &twiddles.data,
-                    false,
-                    self.stage == SOURCE_FFT_STAGE + 1,
-                );
-            }
-            self.stage += 1;
-            return;
-        }
-        let audio_stage = audio_table_stage(&self.building);
-        if self.stage < audio_stage {
-            let correction_start = SOURCE_STEPS + 3;
-            let correction_end = correction_start + 2 * correction_steps(self.building.count);
-            match self.stage {
-                SOURCE_STEPS => {
-                    let smoothing = self.building.smoothing as f32 * 0.01;
-                    for (k, value) in scratch.data.iter_mut().enumerate() {
-                        let harmonic = k.min(SIZE - k);
-                        let slot = twiddles.data[SIZE / 2 + harmonic / 2];
-                        let filtered_gain = if harmonic & 1 == 0 { slot.re } else { slot.im };
-                        let gain = 1.0 + smoothing * (filtered_gain - 1.0);
-                        *value = Complex {
-                            re: spectrum.data[k].re * gain,
-                            im: spectrum.data[k].im * gain,
-                        };
+                        destination.im = sample;
                     }
-                }
-                stage if stage == SOURCE_STEPS + 1 || stage == SOURCE_STEPS + 2 => fft_half(
-                    &mut scratch.data,
-                    &twiddles.data,
-                    true,
-                    stage == SOURCE_STEPS + 2,
-                ),
-                stage if stage < correction_end => {
-                    let step = (stage - correction_start) % correction_steps(self.building.count);
-                    anchor_boundary_step(
-                        &self.building,
-                        &mut scratch.data,
-                        &twiddles.data,
-                        basis,
-                        &mut spectrum.data,
-                        step,
-                    );
-                    if stage + 1 == correction_end {
-                        scratch.data[0].re = self.building.boundary_level(0);
-                    }
-                }
-                stage if stage == correction_end => {
-                    // Save the preview before transforming its buffer.
-                    if store_table(
-                        banks,
-                        (1 - self.active) * tables_per_bank + self.layout.count,
-                        &scratch.data,
-                        false,
-                    )
-                    .is_none()
-                    {
-                        return;
-                    }
-                }
-                stage
-                    if self.building.warp_amount != 0 && stage <= correction_end + SAMPLE_STEPS =>
-                {
-                    let preview = (1 - self.active) * tables_per_bank + self.layout.count;
-                    let first = (stage - correction_end - 1) * SAMPLES_PER_STEP;
-                    if first == 0 {
-                        self.sample_segment = 0;
-                    }
-                    #[cfg(test)]
-                    tests::count_generated_samples(SAMPLES_PER_STEP);
-                    for (i, value) in scratch
-                        .data
-                        .iter_mut()
-                        .enumerate()
-                        .skip(first)
-                        .take(SAMPLES_PER_STEP)
-                    {
-                        let (segment, t) = cached_segment_at(
-                            &self.building,
-                            &twiddles.data,
-                            i as f32 / SIZE as f32,
-                            &mut self.sample_segment,
-                        );
-                        let phase = (segment as f32 + t) / self.building.count as f32;
-                        *value = Complex {
-                            re: self.lookup(banks, preview, (phase * 4_294_967_296.0) as u32),
-                            im: 0.0,
-                        };
-                    }
-                }
-                stage if stage <= audio_stage - 2 => {
-                    fft_half(
-                        &mut scratch.data,
-                        &twiddles.data,
-                        false,
-                        stage == audio_stage - 2,
-                    );
-                }
-                _ => spectrum.data.copy_from_slice(&scratch.data),
-            }
-            self.stage += 1;
-            return;
-        }
-        // Each pair gets four dedicated calls: prepare, FFT half 1, FFT half 2,
-        // store. Never expose an unfinished pair to playback or the display.
-        let pair_step = (self.stage - audio_stage) % TABLE_PAIR_STEPS;
-        let level = (self.stage - audio_stage) / TABLE_PAIR_STEPS * TABLES_PER_STEP;
-        let has_second = level + 1 < self.layout.count;
-        match pair_step {
-            0 => {
-                let cutoff = self.layout.cutoff(level);
-                let second_cutoff = self.layout.cutoff(level + 1);
-                for (k, value) in scratch.data.iter_mut().enumerate() {
-                    let harmonic = k.min(SIZE - k);
-                    let first =
-                        if self.layout.count == 1 || (harmonic <= cutoff && harmonic < SIZE / 2) {
-                            spectrum.data[k]
-                        } else {
-                            Complex::default()
-                        };
-                    let second = if has_second && harmonic <= second_cutoff && harmonic < SIZE / 2 {
-                        spectrum.data[k]
-                    } else {
-                        Complex::default()
-                    };
-                    // IFFT(A + iB) = a + ib for two real time-domain signals.
-                    *value = Complex {
-                        re: first.re - second.im,
-                        im: first.im + second.re,
-                    };
                 }
             }
-            1 | 2 => fft_half(&mut scratch.data, &twiddles.data, true, pair_step == 2),
-            _ => {
-                if store_table(
-                    banks,
-                    (1 - self.active) * tables_per_bank + level,
-                    &scratch.data,
-                    false,
-                )
-                .is_none()
-                {
-                    return;
-                }
-                if has_second
-                    && store_table(
-                        banks,
-                        (1 - self.active) * tables_per_bank + level + 1,
-                        &scratch.data,
-                        true,
-                    )
-                    .is_none()
-                {
-                    return;
-                }
-            }
+            let inactive = (1 - self.active) & 1;
+            self.waves[inactive] = job.wave;
+            self.ready[inactive] = true;
+            self.fade = self.fade_length;
+            self.dirty = self.requested != job.wave;
+            job.completed = false;
+            return false;
         }
-        self.stage += 1;
-        if pair_step == 3 && level + TABLES_PER_STEP >= self.layout.count {
-            self.publish();
+        if !self.dirty {
+            return false;
         }
-    }
-
-    fn publish(&mut self) {
-        self.stage = 0;
-        self.waves[(1 - self.active) & 1] = self.building;
-        self.ready[(1 - self.active) & 1] = true;
-        self.dirty = self.requested != self.building;
-        self.fade = self.fade_length;
+        job.wave = self.requested;
+        true
     }
 
     fn lookup(&self, memory: &Memory, table_index: usize, phase: u32) -> f32 {
@@ -1617,17 +1272,6 @@ impl Engine {
             index,
             (index + 1) & (SIZE - 1),
             fraction,
-        )
-    }
-
-    #[cfg(test)]
-    fn wave_sample(&self, memory: &Memory, bank: usize, phase: u32) -> f32 {
-        self.voice_sample(
-            memory,
-            bank,
-            phase,
-            self.playback_level,
-            self.playback_blend,
         )
     }
 
@@ -1649,12 +1293,6 @@ impl Engine {
         }
         rich + (self.lookup(memory, index + 1, phase) - rich) * playback_blend
     }
-    #[cfg(test)]
-    pub fn show_voice(&mut self, voice: &Oscillator) {
-        self.playback_level = voice.playback_level;
-        self.playback_blend = voice.playback_blend;
-    }
-
     pub fn advance_time(&mut self, frames: usize) {
         if self.fade > 0 {
             if frames >= self.fade {
@@ -1664,81 +1302,6 @@ impl Engine {
                 self.fade -= frames;
             }
         }
-    }
-
-    #[cfg(test)]
-    pub fn tick(&mut self, memory: &Memory, frequency: f32, sample_rate: f32, level: f32) -> f32 {
-        // Slew tuning and gain over about one millisecond; phase never resets.
-        let slew = (1000.0 / sample_rate).min(1.0);
-        // Avoid a dynamic f32::clamp assertion: its panic formatting pulls
-        // non-PIC float-formatting code into the ARM relocatable object.
-        let target = frequency.max(0.01).min(sample_rate * 0.45) / sample_rate;
-        self.increment += slew * (target - self.increment);
-        (self.playback_level, self.playback_blend) = self.layout.playback_levels(self.increment);
-        self.level += slew * (level - self.level);
-        let old = self.wave_sample(memory, self.active, self.phase);
-        let sample = if self.fade > 0 {
-            let blend = 1.0 - self.fade as f32 / self.fade_length as f32;
-            let new = self.wave_sample(memory, 1 - self.active, self.phase);
-            self.fade -= 1;
-            if self.fade == 0 {
-                self.active = 1 - self.active;
-            }
-            old + (new - old) * blend
-        } else {
-            old
-        };
-        self.phase = self
-            .phase
-            .wrapping_add((self.increment * 4_294_967_296.0) as u32);
-        sample * self.level * 5.0
-    }
-
-    /// Draw the defined shape plus creative smoothing, independent of pitch.
-    /// The short edit crossfade remains shared with audio to keep edits stable.
-    #[cfg(test)]
-    pub fn display_segment_sample(&self, memory: &Memory, segment: usize, t: f32) -> f32 {
-        let sample = |bank: usize| {
-            let wave = &self.waves[bank & 1];
-            if wave.smoothing == 0 {
-                wave.segment_sample(segment, t)
-            } else if segment + 1 == wave.count && t == 1.0 {
-                self.lookup(
-                    memory,
-                    (bank & 1) * (self.layout.count + 1) + self.layout.count,
-                    0,
-                )
-            } else {
-                // Preview is retained in equal-width coordinates so even
-                // sub-sample compressed segments keep their intended anchors.
-                let phase = (segment as f32 + t) / wave.count as f32;
-                self.lookup(
-                    memory,
-                    (bank & 1) * (self.layout.count + 1) + self.layout.count,
-                    (phase * 4_294_967_296.0) as u32,
-                )
-            }
-        };
-        let old = sample(self.active);
-        if self.fade > 0 {
-            old + (sample(1 - self.active) - old)
-                * (1.0 - self.fade as f32 / self.fade_length as f32)
-        } else {
-            old
-        }
-    }
-
-    /// Audio-path shape before output Level, including pitch filtering and edit fades.
-    #[cfg(test)]
-    pub fn audio_segment_sample(&self, memory: &Memory, segment: usize, t: f32) -> f32 {
-        let wave = &self.waves[self.active & 1];
-        let n = wave.count.max(2);
-        let phase = if segment + 1 == n && t == 1.0 {
-            0
-        } else {
-            (wave.segment_phase(segment, t) * 4_294_967_296.0) as u32
-        };
-        self.display_sample(memory, phase)
     }
 
     /// Both banks are evaluated at the same horizontal phase during a fade,
@@ -1767,17 +1330,6 @@ impl Engine {
                 * (1.0 - self.fade as f32 / self.fade_length as f32)
         } else {
             old
-        }
-    }
-
-    #[cfg(test)]
-    pub fn display_sample(&self, memory: &Memory, phase: u32) -> f32 {
-        if self.fade > 0 {
-            let blend = 1.0 - self.fade as f32 / self.fade_length as f32;
-            let a = self.wave_sample(memory, self.active, phase);
-            a + (self.wave_sample(memory, 1 - self.active, phase) - a) * blend
-        } else {
-            self.wave_sample(memory, self.active, phase)
         }
     }
 }

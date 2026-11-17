@@ -410,7 +410,7 @@ impl Voice {
 #[derive(Clone, Copy)]
 struct State {
     engine: dsp::Engine,
-    tables: [dsp::Block; dsp::BLOCK_COUNT],
+    tables: [dsp::Block; dsp::PLAYBACK_BLOCK_COUNT],
     midi: midi::MidiState,
     // Only ramping groups write/read these shared gates; steady gates use unity.
     group_gates: [[f32; levels::CHUNK]; midi::GROUP_COUNT],
@@ -542,8 +542,14 @@ impl State {
     }
 }
 
-type Callback<'a, Mode> =
-    Context<'a, State, Voice, Mode, Sram, distingnt_api::api::plugin::ExtraRegions<dsp::Complex>>;
+type Callback<'a, Mode> = Context<
+    'a,
+    State,
+    Voice,
+    Mode,
+    Sram,
+    distingnt_api::api::plugin::SharedResources<dsp::BuildJob>,
+>;
 struct Wavesmith;
 
 fn sync_segment_graying(context: &mut Callback<'_, Audio>) {
@@ -701,17 +707,16 @@ impl Plugin for Wavesmith {
     type State = State;
     type Region = Voice;
     type StateMemory = Sram;
-    type ExtraRegions = distingnt_api::api::plugin::ExtraRegions<dsp::Complex>;
-    fn extra_region_count(specs: &[i32]) -> usize {
-        segment_count(specs).map(dsp::basis_entries).unwrap_or(0)
-    }
-    fn initialize_extra_region(
-        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, dsp::Complex>,
-        _: &[i32],
-        _: usize,
+    type ExtraRegions = distingnt_api::api::plugin::SharedResources<dsp::BuildJob>;
+    const AUDIO_WORKER_STACK_SIZE: u32 = 4096;
+    fn initialize_shared_resources(
+        destination: &mut distingnt_api::api::plugin::RegionInitializer<'_, dsp::BuildJob>,
+        specs: &[i32],
     ) -> Option<()> {
-        dsp::Complex::initialize(destination);
-        Some(())
+        dsp::BuildJob::initialize(destination, segment_count(specs)?)
+    }
+    fn audio_worker(job: &mut dsp::BuildJob, _: u32) {
+        job.build();
     }
     const GUID: u32 = multichar(b'A', b'T', b'w', b's');
     const NAME: &'static CStr = c"Wavesmith";
@@ -1168,7 +1173,23 @@ impl Plugin for Wavesmith {
         #[cfg(feature = "profiling")]
         let callback_start = distingnt_api::api::cpu_cycle_count();
         sync_parameter_graying(context);
-        let n = context.state().count.clamp(2, 32);
+        {
+            let processing = context.processing();
+            let n = processing.state.count;
+            processing.state.engine.update_request(|requested| {
+                read_wave_into(requested, n, |index| processing.parameters.value(index));
+            });
+        }
+        #[cfg(feature = "profiling")]
+        let build_start = distingnt_api::api::cpu_cycle_count();
+        let queue = context
+            .with_shared_state(|state, job| state.engine.service_job(job, &mut state.tables))
+            .unwrap_or(false);
+        if queue {
+            let _ = context.submit_audio_worker(0);
+        }
+        #[cfg(feature = "profiling")]
+        let build_cycles = distingnt_api::api::cpu_cycle_count().wrapping_sub(build_start);
         let voices = context.state().voices;
         let p = context.read_parameters();
         let note = p.value(PITCH).unwrap_or(48).clamp(0, 127) as f32;
@@ -1253,9 +1274,6 @@ impl Plugin for Wavesmith {
                 data.tuning_octaves = (note - 69.0) / 12.0 + fine + voice_fine + transpose;
             }
         }
-        state.engine.update_request(|requested| {
-            read_wave_into(requested, n, |index| processing.parameters.value(index));
-        });
         state.ui.advance(frames);
         state.midi.set_envelope(attack_ms, release_ms);
         let level = state.level.amplitude(level_db);
@@ -1361,11 +1379,6 @@ impl Plugin for Wavesmith {
         }
         #[cfg(feature = "profiling")]
         let setup_end = distingnt_api::api::cpu_cycle_count();
-        state
-            .engine
-            .advance_with_basis(memory, processing.extra_regions);
-        #[cfg(feature = "profiling")]
-        let build_end = distingnt_api::api::cpu_cycle_count();
         #[cfg(feature = "profiling")]
         let mut render_cycles = 0u32;
         #[cfg(feature = "profiling")]
@@ -1591,8 +1604,10 @@ impl Plugin for Wavesmith {
                 routing.stereo(),
                 [
                     callback_end.wrapping_sub(callback_start),
-                    setup_end.wrapping_sub(callback_start),
-                    build_end.wrapping_sub(setup_end),
+                    setup_end
+                        .wrapping_sub(callback_start)
+                        .wrapping_sub(build_cycles),
+                    build_cycles,
                     level_cycles,
                     output_cycles,
                 ],

@@ -4,9 +4,6 @@ use std::cell::Cell;
 
 std::thread_local! {
     static FFT_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    static FFT_HALVES: Cell<usize> = const { Cell::new(0) };
-    static GENERATED_SAMPLES: Cell<usize> = const { Cell::new(0) };
-    static BOUNDARY_POSITIONS: Cell<usize> = const { Cell::new(0) };
     static OSCILLATOR_TICKS: Cell<usize> = const { Cell::new(0) };
     static MOVING_PITCH_TICKS: Cell<usize> = const { Cell::new(0) };
     static STEADY_TICKS: Cell<usize> = const { Cell::new(0) };
@@ -34,22 +31,6 @@ pub(super) fn playback_work_counts() -> (usize, usize) {
     )
 }
 
-pub(super) fn count_generated_samples(count: usize) {
-    GENERATED_SAMPLES.with(|counter| counter.set(counter.get() + count));
-}
-
-pub(super) fn count_boundary_position() {
-    BOUNDARY_POSITIONS.with(|counter| counter.set(counter.get() + 1));
-}
-
-pub(super) fn count_fft_half() {
-    FFT_HALVES.with(|counter| counter.set(counter.get() + 1));
-}
-
-fn build_calls(wave: &Wave, tables: usize) -> usize {
-    audio_table_stage(wave) + tables.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS
-}
-
 pub(super) fn count_fft(inverse: bool) {
     FFT_COUNTS.with(|counter| {
         let (forward, backward) = counter.get();
@@ -60,139 +41,45 @@ pub(super) fn count_fft(inverse: bool) {
     });
 }
 
-fn read_table(engine: &Engine, memory: &Memory, index: usize) -> [Complex; SIZE] {
-    let mut table = [Complex::default(); SIZE];
-    for (i, sample) in table.iter_mut().enumerate() {
-        sample.re = engine.lookup(memory, index, (i as u32) << 24);
-    }
-    table
+pub(super) fn count_moving_pitch_tick() {
+    count_oscillator_tick();
+    MOVING_PITCH_TICKS.with(|counter| counter.set(counter.get() + 1));
 }
 
-// Independent reference retaining the original per-rebuild recurrences.
-fn reference_anchor(wave: &Wave, data: &mut [Complex; SIZE], twiddles: &[Complex; SIZE]) {
-    let n = wave.count;
-    for _ in 0..2 {
-        let mut errors = [0.0; MAX_SEGMENTS];
-        for (i, error) in errors.iter_mut().take(n).enumerate() {
-            let position = i as f32 * SIZE as f32 / n as f32;
-            let index = position as usize & (SIZE - 1);
-            let fraction = position - index as f32;
-            let actual =
-                data[index].re + (data[(index + 1) & (SIZE - 1)].re - data[index].re) * fraction;
-            *error = wave.boundary_level(i) - actual;
-        }
-        let dc = errors.iter().take(n).sum::<f32>() / n as f32;
-        for value in data.iter_mut() {
-            value.re += dc;
-        }
-        for k in 1..=n / 2 {
-            let angle = core::f32::consts::TAU * k as f32 / n as f32;
-            let (wc, ws) = (sine(angle + core::f32::consts::FRAC_PI_2), sine(angle));
-            let (mut cosine, mut sinusoid) = (1.0, 0.0);
-            let (mut a, mut b) = (0.0, 0.0);
-            for &error in errors.iter().take(n) {
-                a += error * cosine;
-                b += error * sinusoid;
-                let next = cosine * wc - sinusoid * ws;
-                sinusoid = sinusoid * wc + cosine * ws;
-                cosine = next;
-            }
-            let scale = if n % 2 == 0 && k == n / 2 { 1.0 } else { 2.0 } / n as f32;
-            let step = twiddles[k];
-            let (mut cosine, mut sinusoid) = (1.0, 0.0);
-            for value in data.iter_mut() {
-                value.re += (a * scale) * cosine + (b * scale) * sinusoid;
-                let next = cosine * step.re + sinusoid * step.im;
-                sinusoid = sinusoid * step.re - cosine * step.im;
-                cosine = next;
-            }
-        }
-    }
-    data[0].re = wave.boundary_level(0);
-}
-
-#[test]
-fn cached_smoothing_matches_original_for_every_segment_count() {
-    for n in 2..=MAX_SEGMENTS {
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut engine = Engine::new(n, 48000);
-        finish_build(&mut engine, &mut memory, Wave::new(n), 440.0);
-        let cached = [memory[BANK_BLOCKS + 3], memory[BANK_BLOCKS + 4]];
-        for seed in 0..8 {
-            let mut wave = Wave::new(n);
-            for i in 0..n {
-                wave.boundaries[i] = ((i * 73 + seed * 43) % 201) as i16 - 100;
-                wave.curves[i] = ((i * 31 + seed * 67) % 201) as i16 - 100;
-            }
-            for smoothing in [1, 25, 50, 100] {
-                wave.smoothing = smoothing;
-                let mut reference = [Complex::default(); SIZE];
-                for (i, value) in reference.iter_mut().enumerate() {
-                    value.re = wave.sample(i as f32 / SIZE as f32);
-                }
-                fft(&mut reference, &memory[TWIDDLES].data, false);
-                for (k, value) in reference.iter_mut().enumerate() {
-                    let harmonic = k.min(SIZE - k);
-                    let ratio = harmonic as f32 / 4.0;
-                    let filtered = 1.0 / (1.0 + ratio * ratio * ratio * ratio);
-                    let slot = memory[TWIDDLES].data[SIZE / 2 + harmonic / 2];
-                    assert_eq!(filtered, if harmonic & 1 == 0 { slot.re } else { slot.im });
-                    let gain = 1.0 + smoothing as f32 * 0.01 * (filtered - 1.0);
-                    value.re *= gain;
-                    value.im *= gain;
-                }
-                fft(&mut reference, &memory[TWIDDLES].data, true);
-                reference_anchor(&wave, &mut reference, &memory[TWIDDLES].data);
-                finish_build(&mut engine, &mut memory, wave, 440.0);
-                let preview =
-                    read_table(&engine, &memory, engine.active * TABLES_PER_BANK + LEVELS);
-                for (i, (actual, expected)) in preview.iter().zip(&reference).enumerate() {
-                    assert!(
-                        (actual.re - expected.re).abs() < 0.0001,
-                        "segments {n}, seed {seed}, smoothing {smoothing}, sample {i}: {} vs {}",
-                        actual.re,
-                        expected.re
-                    );
-                }
-                assert_eq!(engine.basis_count, n);
-                for (stored, initial) in memory[BANK_BLOCKS + 3..].iter().zip(&cached) {
-                    for (a, b) in stored.data.iter().zip(&initial.data) {
-                        assert_eq!(a.re, b.re);
-                        assert_eq!(a.im, b.im);
-                    }
-                }
-            }
+// Fixtures drive the actual worker and bank publication code.
+const BLOCKS: usize = PLAYBACK_BLOCK_COUNT;
+impl Engine {
+    pub fn new(count: usize, sample_rate: u32) -> Self {
+        let wave = Wave::new(count);
+        Self {
+            layout: TableLayout::new(DEFAULT_TABLES),
+            requested: wave,
+            waves: [wave; 2],
+            active: 0,
+            dirty: true,
+            fade: 0,
+            fade_length: (sample_rate as usize / 200).max(1),
+            ready: [false; 2],
         }
     }
 }
-
-fn rendered_harmonic_gain(increment: f32, harmonic: usize) -> f32 {
-    let (level, blend) = playback_levels(increment);
-    if harmonic > cutoff(level) {
-        0.0
-    } else if level + 1 == LEVELS || harmonic <= cutoff(level + 1) {
-        1.0
-    } else {
-        1.0 - blend
+fn build_pending(engine: &mut Engine, memory: &mut Memory) {
+    if !engine.dirty || engine.fade != 0 {
+        return;
     }
+    crate::tests::with_build_job(engine.requested.count, |job| {
+        assert!(engine.service_job(job, memory));
+        job.build();
+        assert!(!engine.service_job(job, memory));
+    });
 }
-
-fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave, frequency: f32) {
-    engine.request(wave);
-    // Allow an in-flight older shape, the requested build, and both fades.
-    let longest_build = SOURCE_STEPS
-        + 7
-        + SAMPLE_STEPS
-        + 2 * correction_steps(MAX_SEGMENTS)
-        + engine.layout.count.div_ceil(TABLES_PER_STEP) * TABLE_PAIR_STEPS;
-    for _ in 0..2 * longest_build + 12 {
-        engine.advance(memory);
-        for _ in 0..64 {
-            assert!(engine.tick(memory, frequency, 48000.0, 1.0).is_finite());
-        }
-    }
+fn finish_build(engine: &mut Engine, memory: &mut Memory, wave: Wave) {
+    engine.advance_time(engine.fade_length);
+    engine.update_request(|request| *request = wave);
+    build_pending(engine, memory);
+    engine.advance_time(engine.fade_length);
     assert_eq!(engine.waves[engine.active], wave);
-    assert_eq!(engine.fade, 0);
+    assert!(!engine.dirty);
 }
 
 #[test]
@@ -229,37 +116,6 @@ fn waveform_boundary_presets_approximate_one_cycle_at_every_segment_count() {
                 assert!(value.is_finite() && (-1.0..=1.0).contains(&value));
             }
             assert_eq!(wave.sample(0.0), wave.sample(1.0));
-        }
-    }
-}
-
-#[test]
-fn cached_geometry_matches_reference_and_does_not_overlap_fft_or_smoothing_values() {
-    for n in 2..=MAX_SEGMENTS {
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut engine = Engine::new(n, 48000);
-        engine.advance(&mut memory);
-        let fixed = memory[TWIDDLES].data;
-        let mut wave = Wave::new(n);
-        for warp_position in [0, 1, 94, 128, 254, 255] {
-            wave.warp_position = warp_position;
-            for warp_amount in [-100, -50, 50, 100] {
-                wave.warp_amount = warp_amount;
-                prepare_geometry(&wave, &mut memory[TWIDDLES].data);
-                for (a, b) in memory[TWIDDLES].data[..POSITION_CACHE].iter().zip(&fixed) {
-                    assert_eq!(a.re, b.re);
-                    assert_eq!(a.im, b.im);
-                }
-                let mut cursor = 0;
-                for i in 0..SIZE {
-                    let phase = i as f32 / SIZE as f32;
-                    let expected = wave.segment_at(phase);
-                    let actual =
-                        cached_segment_at(&wave, &memory[TWIDDLES].data, phase, &mut cursor);
-                    assert_eq!(actual.0, expected.0);
-                    assert!((actual.1 - expected.1).abs() < 0.000001);
-                }
-            }
         }
     }
 }
@@ -302,290 +158,6 @@ fn warp_position_mapping_preserves_edges_order_and_segment_shapes_at_all_setting
                 assert_eq!(wave.sample(0.0), wave.sample(1.0));
             }
         }
-    }
-}
-
-#[test]
-fn redistributed_shape_drives_editor_and_final_audio_spectrum_with_smoothing() {
-    for n in [8, 32] {
-        let mut engine = Engine::new(n, 48000);
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut wave = Wave::new(n);
-        for i in 0..n {
-            wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
-            wave.curves[i] = (i * 31 % 201) as i16 - 100;
-        }
-        for warp_position in [0, 94, 128, 255] {
-            wave.warp_position = warp_position;
-            for warp_amount in [-100, -50, 50, 100] {
-                wave.warp_amount = warp_amount;
-                for smoothing in [0, 50, 100] {
-                    wave.smoothing = smoothing;
-                    finish_build(&mut engine, &mut memory, wave, 220.0);
-                    let mut expected = [Complex::default(); SIZE];
-                    for (i, value) in expected.iter_mut().enumerate() {
-                        let phase = i as f32 / SIZE as f32;
-                        value.re = engine.editor_phase_sample(&memory, phase);
-                        if smoothing == 0 {
-                            assert_eq!(value.re, wave.sample(phase));
-                        }
-                    }
-                    fft(&mut expected, &memory[TWIDDLES].data, false);
-                    // The spectrum used for all audio tables is the stretched
-                    // shape, with pitch filtering still applied afterwards.
-                    for (a, b) in memory[BANK_BLOCKS].data.iter().zip(&expected) {
-                        assert!((a.re - b.re).abs() < 0.0001);
-                        assert!((a.im - b.im).abs() < 0.0001);
-                    }
-                    for boundary in 0..n {
-                        let phase = wave.boundary_position(boundary);
-                        assert!(
-                            (engine.editor_phase_sample(&memory, phase)
-                                - wave.boundary_level(boundary))
-                            .abs()
-                                < 0.0005
-                        );
-                    }
-                    let saved = engine.waves[engine.active];
-                    engine.request(wave);
-                    engine.advance(&mut memory);
-                    assert_eq!(engine.stage, 0);
-                    assert_eq!(engine.waves[engine.active], saved);
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn split_fft_matches_unsplit_transform_exactly_in_both_directions() {
-    let mut engine = Engine::new(32, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    engine.advance(&mut memory);
-    let twiddles = &memory[TWIDDLES].data;
-    for inverse in [false, true] {
-        for seed in 0..8 {
-            let mut expected = [Complex::default(); SIZE];
-            for (i, value) in expected.iter_mut().enumerate() {
-                *value = Complex {
-                    re: ((i * 73 + seed * 43) % 257) as f32 / 128.0 - 1.0,
-                    im: ((i * 31 + seed * 67) % 257) as f32 / 128.0 - 1.0,
-                };
-            }
-            let mut actual = expected;
-            fft(&mut expected, twiddles, inverse);
-            fft_half(&mut actual, twiddles, inverse, false);
-            assert!(actual
-                .iter()
-                .zip(&expected)
-                .any(|(a, b)| a.re != b.re || a.im != b.im));
-            fft_half(&mut actual, twiddles, inverse, true);
-            for (a, b) in actual.iter().zip(&expected) {
-                assert_eq!(a.re.to_bits(), b.re.to_bits());
-                assert_eq!(a.im.to_bits(), b.im.to_bits());
-            }
-        }
-    }
-}
-
-#[test]
-fn paired_table_builds_match_separate_transforms_and_use_half_the_inverse_ffts() {
-    for tables in 1..=MAX_TABLES {
-        for n in [2, 7, 32] {
-            for smoothing in [0, 50, 100] {
-                let mut storage = [Block::ZERO; reference_blocks(MAX_TABLES)];
-                let memory = &mut storage[..reference_blocks(tables)];
-                let mut engine = Engine::with_tables(n, 48000, tables);
-                let mut wave = Wave::new(n);
-                wave.smoothing = smoothing;
-                for i in 0..n {
-                    wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
-                    wave.curves[i] = (i * 31 % 201) as i16 - 100;
-                }
-                // Exercise both physical bank alignments. With an even table
-                // count, the second bank begins in an imaginary storage lane.
-                for generation in 0..2 {
-                    wave.boundaries[1] += generation;
-                    let old = read_table(&engine, memory, engine.active * (tables + 1));
-                    engine.request(wave);
-                    FFT_COUNTS.with(|counter| counter.set((0, 0)));
-                    let audio_stage = audio_table_stage(&wave);
-                    for callback in 0..build_calls(&wave, tables) {
-                        let before = FFT_COUNTS.with(|counter| counter.get());
-                        let halves_before = FFT_HALVES.with(|counter| counter.get());
-                        engine.advance(memory);
-                        let after = FFT_COUNTS.with(|counter| counter.get());
-                        let halves = FFT_HALVES.with(|counter| counter.get()) - halves_before;
-                        let fft_callback = callback == SOURCE_FFT_STAGE
-                            || callback == SOURCE_FFT_STAGE + 1
-                            || (smoothing > 0
-                                && (callback == SOURCE_STEPS + 1
-                                    || callback == SOURCE_STEPS + 2
-                                    || callback == audio_stage - 3
-                                    || callback == audio_stage - 2))
-                            || (callback >= audio_stage
-                                && matches!((callback - audio_stage) % TABLE_PAIR_STEPS, 1 | 2));
-                        assert_eq!(halves, usize::from(fft_callback));
-                        assert!((after.0 - before.0) + (after.1 - before.1) <= 1);
-                        let inverses = FFT_COUNTS.with(|counter| counter.get().1);
-                        let before_smoothing =
-                            usize::from(smoothing > 0 && callback >= SOURCE_STEPS + 2);
-                        let audio_inverses =
-                            (callback + 2).saturating_sub(audio_stage) / TABLE_PAIR_STEPS;
-                        assert_eq!(inverses, before_smoothing + audio_inverses);
-                    }
-                    assert_eq!(engine.fade, engine.fade_length);
-                    assert_eq!(engine.waves[1 - engine.active], wave);
-                    let old_after_build = read_table(&engine, memory, engine.active * (tables + 1));
-                    for (before, after) in old.iter().zip(&old_after_build) {
-                        assert_eq!(before.re, after.re);
-                    }
-                    let (forward, inverse) = FFT_COUNTS.with(|counter| counter.get());
-                    assert_eq!(forward, 1 + usize::from(smoothing > 0));
-                    assert_eq!(inverse, tables.div_ceil(2) + usize::from(smoothing > 0));
-                    // Independently reproduce the previous one-IFFT-per-table
-                    // path from the same source spectrum, then compare samples.
-                    let source = memory[tables + 1].data;
-                    for level in 0..tables {
-                        let mut reference = [Complex::default(); SIZE];
-                        let limit = engine.layout.cutoff(level);
-                        for (k, sample) in reference.iter_mut().enumerate() {
-                            if tables == 1 || (k.min(SIZE - k) <= limit && k != SIZE / 2) {
-                                *sample = source[k];
-                            }
-                        }
-                        fft(&mut reference, &memory[tables + 3].data, true);
-                        let actual =
-                            read_table(&engine, memory, (1 - engine.active) * (tables + 1) + level);
-                        for (i, (actual, expected)) in actual.iter().zip(&reference).enumerate() {
-                            assert!((actual.re - expected.re).abs() < 0.00001,
-                                "tables {tables}, segments {n}, smoothing {smoothing}, generation {generation}, level {level}, sample {i}");
-                        }
-                    }
-                    for _ in 0..240 {
-                        engine.tick(memory, 220.0, 48000.0, 1.0);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn split_smoothing_keeps_old_bank_and_coalesces_edits_until_publication() {
-    for n in [2, 8, 31, 32] {
-        for smoothing in [0, 1, 100] {
-            let mut engine = Engine::new(n, 48000);
-            let mut memory = [Block::ZERO; BLOCKS];
-            let mut wave = Wave::new(n);
-            wave.smoothing = smoothing;
-            wave.warp_position = 37;
-            wave.warp_amount = -70;
-            finish_build(&mut engine, &mut memory, wave, 440.0);
-            let old_bank = engine.active;
-            let old = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
-            wave.boundaries[0] = 70;
-            wave.curves[0] = -80;
-            let snapshot = wave;
-            engine.request(snapshot);
-            let callbacks = build_calls(&snapshot, LEVELS);
-            for callback in 0..callbacks {
-                GENERATED_SAMPLES.with(|counter| counter.set(0));
-                BOUNDARY_POSITIONS.with(|counter| counter.set(0));
-                engine.advance(&mut memory);
-                GENERATED_SAMPLES.with(|counter| assert!(counter.get() <= SAMPLES_PER_STEP));
-                BOUNDARY_POSITIONS.with(|counter| {
-                    assert_eq!(counter.get(), if callback == 0 { n + 1 } else { 0 })
-                });
-                assert_eq!(engine.active, old_bank);
-                assert_eq!(engine.building, snapshot);
-                assert_eq!(engine.fade > 0, callback + 1 == callbacks);
-                let current = read_table(&engine, &memory, old_bank * TABLES_PER_BANK);
-                for (a, b) in current.iter().zip(&old) {
-                    assert_eq!(a.re, b.re);
-                }
-                // Latest requests must not overwrite partial smoothing scratch
-                // or restart the build; they belong to the following build.
-                wave.boundaries[0] = -(callback as i16);
-                wave.smoothing = if callback & 1 == 0 { 0 } else { 50 };
-                engine.request(wave);
-                if callback + 1 < callbacks {
-                    for _ in 0..64 {
-                        engine.tick(&memory, 440.0, 48000.0, 1.0);
-                    }
-                }
-            }
-            assert_eq!(engine.waves[1 - old_bank], snapshot);
-            assert!(engine.dirty);
-            finish_build(&mut engine, &mut memory, wave, 440.0);
-            assert_eq!(engine.waves[engine.active], wave);
-        }
-    }
-}
-
-#[test]
-fn cached_playback_preserves_pitch_gain_and_edit_fades_against_previous_mono_path() {
-    let mut shared = Engine::new(32, 48000);
-    let mut reference = shared;
-    let mut memory = [Block::ZERO; BLOCKS];
-    let mut reference_memory = memory;
-    let mut oscillator = Oscillator::new();
-    let mut wave = Wave::new(32);
-    let mut pitch_error_bound = 0.0f64;
-    for block in 0..160 {
-        if block == 40 {
-            wave.curves[2] = 75;
-            wave.smoothing = 40;
-        }
-        if block == 100 {
-            wave.warp_amount = -70;
-            wave.fold_limit = 1;
-        }
-        shared.request(wave);
-        reference.request(wave);
-        shared.advance(&mut memory);
-        reference.advance(&mut reference_memory);
-        let frequency = if block < 80 { 220.0 } else { 8800.0 };
-        for frame in 0..64 {
-            reference.phase = oscillator.phase;
-            let old_increment = reference.increment as f64;
-            let actual = oscillator.tick(&shared, &memory, frequency, 48000.0, 0.5, frame);
-            let expected = reference.tick(&reference_memory, frequency, 48000.0, 0.5);
-            // Compare audio at the same phase; validate pitch separately with
-            // a recurrence error budget including old f32 rounding and one
-            // integer phase unit per fixed-point update.
-            let alpha = (1000.0f32 / 48000.0) as f64;
-            let target = (frequency / 48000.0) as f64;
-            let exact = old_increment + alpha * (target - old_increment);
-            let float_round = ((reference.increment as f64 - exact) * PHASE_SCALE as f64).abs();
-            pitch_error_bound = (1.0 - alpha) * pitch_error_bound + float_round + 1.0 + alpha;
-            let error = (oscillator.phase_step as f64
-                - reference.increment as f64 * PHASE_SCALE as f64)
-                .abs();
-            assert!(
-                error
-                    <= pitch_error_bound
-                        + 1.0
-                        + if oscillator.pair_pending {
-                            0.5 * alpha
-                                * alpha
-                                * (target - old_increment).abs()
-                                * PHASE_SCALE as f64
-                        } else {
-                            0.0
-                        },
-                "pitch error {error} > {pitch_error_bound}"
-            );
-            assert_eq!(oscillator.level, reference.level);
-            assert!(
-                (actual - expected).abs() < 0.15,
-                "block {block}, frame {frame}: {actual} vs {expected}"
-            );
-        }
-        shared.advance_time(64);
-        shared.show_voice(&oscillator);
-        assert_eq!(shared.fade, reference.fade);
-        assert_eq!(shared.active, reference.active);
     }
 }
 
@@ -690,8 +262,8 @@ fn block_playback_preserves_samples_and_state_through_pitch_level_changes_and_ba
                 wave.smoothing = 40;
                 wave.warp_amount = -50;
             }
-            engine.request(wave);
-            engine.advance(&mut memory);
+            engine.update_request(|request| *request = wave);
+            build_pending(&mut engine, &mut memory);
             optimized.prepare(frequency, rate as f32, level);
             let mut actual = [1.25; 24];
             if !optimized.render_open_gate(&engine, &memory, &mut actual) {
@@ -735,55 +307,6 @@ fn frequency_conversion_cache_persists_and_exact_cv_changes_invalidate_it() {
     assert_eq!(playback_work_counts().1 - before, 2);
     assert_eq!(voice.frequency(-1.0), 220.0);
     assert_eq!(playback_work_counts().1 - before, 3);
-}
-
-#[test]
-fn shared_rebuilds_and_crossfade_time_do_not_depend_on_enabled_voice_count() {
-    for enabled in [0, 1, 4, 8] {
-        let mut engine = Engine::new(32, 48000);
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut voices = [Oscillator::new(); super::super::MAX_VOICES];
-        let mut wave = Wave::new(32);
-        wave.curves.fill(73);
-        wave.smoothing = 50;
-        wave.warp_amount = -70;
-        let callbacks = build_calls(&wave, LEVELS);
-        FFT_COUNTS.with(|counter| counter.set((0, 0)));
-        for callback in 0..callbacks + 5 {
-            engine.request(wave);
-            engine.advance(&mut memory);
-            for (index, voice) in voices.iter_mut().take(enabled).enumerate() {
-                for frame in 0..64 {
-                    assert!(voice
-                        .tick(
-                            &engine,
-                            &memory,
-                            220.0 * (index + 1) as f32,
-                            48000.0,
-                            0.5,
-                            frame
-                        )
-                        .is_finite());
-                }
-            }
-            if callback + 1 == callbacks {
-                assert_eq!(engine.fade, engine.fade_length);
-            }
-            engine.advance_time(64);
-        }
-        assert_eq!(engine.waves[engine.active], wave);
-        assert_eq!(engine.fade, 0);
-        assert_eq!(
-            FFT_COUNTS.with(|counter| counter.get()),
-            (2, LEVELS.div_ceil(2) + 1)
-        );
-        for voice in voices.iter().skip(enabled) {
-            assert_eq!(*voice, Oscillator::new());
-        }
-        if enabled > 1 {
-            assert_ne!(voices[0].phase, voices[1].phase);
-        }
-    }
 }
 
 #[test]
@@ -832,17 +355,6 @@ fn fold_limit_controls_excursion_and_preserves_bounded_curves_and_anchors() {
                             value
                         };
                         assert!((actual - expected).abs() < 0.000002);
-                        if limit == DEFAULT_FOLD_LIMIT {
-                            let mut legacy = a + (b - a) * t + 16.0 * bend * t * (1.0 - t);
-                            for _ in 0..2 {
-                                if legacy > 1.0 {
-                                    legacy = 2.0 - legacy;
-                                } else if legacy < -1.0 {
-                                    legacy = -2.0 - legacy;
-                                }
-                            }
-                            assert_eq!(actual.to_bits(), legacy.to_bits());
-                        }
                     }
                 }
             }
@@ -862,36 +374,6 @@ fn fold_limit_controls_excursion_and_preserves_bounded_curves_and_anchors() {
     wave.boundaries[2] = 0;
     wave.curves[1] = 100;
     assert_eq!(wave.segment_sample(1, 0.5), 0.5);
-}
-
-#[test]
-fn changing_fold_limit_rebuilds_the_audio_and_editor_without_changing_other_shape_values() {
-    let mut engine = Engine::with_tables(8, 48000, 1);
-    let mut storage = [Block::ZERO; reference_blocks(1)];
-    let mut wave = Wave::new(8);
-    wave.curves.fill(73);
-    let mut previous = None;
-    for limit in [0, 1, 2, 0] {
-        wave.fold_limit = limit;
-        finish_build(&mut engine, &mut storage, wave, 220.0);
-        let actual = read_table(&engine, &storage, engine.active * 2);
-        for (i, value) in actual.iter().enumerate() {
-            let phase = i as f32 / SIZE as f32;
-            assert!((value.re - wave.sample(phase)).abs() < 0.00001);
-            assert_eq!(
-                engine.editor_phase_sample(&storage, phase),
-                wave.sample(phase)
-            );
-        }
-        if let Some(before) = previous {
-            assert!(actual
-                .iter()
-                .zip(&before)
-                .any(|(a, b): (&Complex, &Complex)| (a.re - b.re).abs() > 0.01));
-        }
-        previous = Some(actual);
-        assert_eq!(engine.waves[engine.active], wave);
-    }
 }
 
 #[test]
@@ -963,496 +445,6 @@ fn folded_curves_preserve_endpoints_range_and_continuity() {
 }
 
 #[test]
-fn source_boundaries_stay_editable_and_playback_seam_stays_continuous() {
-    for n in 2..=MAX_SEGMENTS {
-        let mut wave = Wave::new(n);
-        wave.boundaries[0] = -37;
-        for i in 1..n {
-            wave.boundaries[i] = (i * 37 % 201) as i16 - 100;
-        }
-        wave.curves.fill(99);
-        for smoothing in [0, 100] {
-            wave.smoothing = smoothing;
-            for frequency in [20.0, 2800.0, 12500.0] {
-                let mut engine = Engine::new(n, 48000);
-                let mut memory = [Block::ZERO; BLOCKS];
-                finish_build(&mut engine, &mut memory, wave, frequency);
-                assert_eq!(wave.sample(0.0), -0.37);
-                assert_eq!(wave.sample(1.0), -0.37);
-                assert_eq!(
-                    engine.display_segment_sample(&memory, 0, 0.0),
-                    engine.display_segment_sample(&memory, n - 1, 1.0)
-                );
-                for boundary in 1..n {
-                    assert_eq!(
-                        wave.segment_sample(boundary - 1, 1.0),
-                        wave.segment_sample(boundary, 0.0)
-                    );
-                    assert_eq!(
-                        engine.display_segment_sample(&memory, boundary - 1, 1.0),
-                        engine.display_segment_sample(&memory, boundary, 0.0)
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn smoothing_fft_round_trip() {
-    let mut engine = Engine::new(4, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, Wave::new(4), 220.0);
-    let mut signal = [Complex::default(); SIZE];
-    for (i, value) in signal.iter_mut().enumerate() {
-        value.re = sine(core::f32::consts::TAU * i as f32 / SIZE as f32);
-    }
-    let original = signal;
-    fft(&mut signal, &memory[TWIDDLES].data, false);
-    fft(&mut signal, &memory[TWIDDLES].data, true);
-    for (a, b) in signal.iter().zip(original) {
-        assert!((a.re - b.re).abs() < 0.00001);
-    }
-}
-
-#[test]
-fn every_table_removes_harmonics_above_its_limit_after_creative_smoothing() {
-    for smoothing in [0, 50, 100] {
-        let mut wave = Wave::new(32);
-        wave.smoothing = smoothing;
-        for i in 0..32 {
-            wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
-            wave.curves[i] = if i % 2 == 0 { 100 } else { -100 };
-        }
-        let mut engine = Engine::new(32, 48000);
-        let mut memory = [Block::ZERO; BLOCKS];
-        finish_build(&mut engine, &mut memory, wave, 2800.0);
-        for level in 0..LEVELS {
-            let mut spectrum =
-                read_table(&engine, &memory, engine.active * TABLES_PER_BANK + level);
-            fft(&mut spectrum, &memory[TWIDDLES].data, false);
-            let cutoff = cutoff(level);
-            let mut pass = 0.0;
-            let mut stop = 0.0;
-            for (k, value) in spectrum.iter().enumerate() {
-                let energy = value.re * value.re + value.im * value.im;
-                if k.min(SIZE - k) > cutoff || k == SIZE / 2 {
-                    stop += energy;
-                } else {
-                    pass += energy;
-                }
-            }
-            assert!(pass > 0.001);
-            assert!(
-                stop < pass * 0.00000001,
-                "level {level}: stop {stop}, pass {pass}"
-            );
-        }
-    }
-}
-
-#[test]
-fn table_selection_is_continuous_and_never_plays_an_unsafe_harmonic() {
-    for i in 1..=45000 {
-        let increment = i as f32 / 100000.0;
-        let (level, blend) = playback_levels(increment);
-        assert!(level < LEVELS);
-        assert!((0.0..=1.0).contains(&blend));
-        assert!(cutoff(level) as f32 * increment <= 0.490001);
-        for harmonic in 1..SIZE / 2 {
-            let frequency = increment * harmonic as f32;
-            let gain = rendered_harmonic_gain(increment, harmonic);
-            // All harmonics below 12% of the sample rate stay fully passed,
-            // even across the wider gaps in the six-table bank.
-            if frequency <= 0.12 {
-                assert!(gain > 0.99999);
-            }
-            if frequency >= 0.49 {
-                assert_eq!(gain, 0.0);
-            }
-        }
-    }
-    let mut engine = Engine::new(8, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    let mut wave = Wave::new(8);
-    wave.curves.fill(100);
-    finish_build(&mut engine, &mut memory, wave, 100.0);
-    for level in 0..LEVELS - 1 {
-        let threshold = 0.49 / cutoff(level) as f32;
-        let mut previous = [0.0; SIZE];
-        engine.increment = threshold - 0.0000001;
-        (engine.playback_level, engine.playback_blend) = playback_levels(engine.increment);
-        for (i, sample) in previous.iter_mut().enumerate() {
-            *sample = engine.display_sample(&memory, (i as u32) << 24);
-        }
-        engine.increment = threshold + 0.0000001;
-        (engine.playback_level, engine.playback_blend) = playback_levels(engine.increment);
-        for (i, &sample) in previous.iter().enumerate() {
-            assert!((engine.display_sample(&memory, (i as u32) << 24) - sample).abs() < 0.001);
-        }
-    }
-}
-
-#[test]
-fn dense_tables_preserve_safe_harmonics_and_only_fade_the_top_band() {
-    let mut wave = Wave::new(32);
-    for i in 0..32 {
-        wave.boundaries[i] = (i * 73 % 201) as i16 - 100;
-        wave.curves[i] = if i % 2 == 0 { 100 } else { -100 };
-    }
-    let mut engine = Engine::new(32, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, wave, 220.0);
-    let mut source_spectrum = read_table(&engine, &memory, engine.active * TABLES_PER_BANK);
-    fft(&mut source_spectrum, &memory[TWIDDLES].data, false);
-    for frequency in [220.0, 1800.0, 2793.826, 10000.0] {
-        for _ in 0..1000 {
-            engine.tick(&memory, frequency, 48000.0, 1.0);
-        }
-        let mut spectrum = [Complex::default(); SIZE];
-        for (i, sample) in spectrum.iter_mut().enumerate() {
-            sample.re = engine.display_sample(&memory, (i as u32) << 24);
-        }
-        fft(&mut spectrum, &memory[TWIDDLES].data, false);
-        for harmonic in 1..SIZE / 2 {
-            let gain = rendered_harmonic_gain(engine.increment, harmonic);
-            let source = source_spectrum[harmonic];
-            let actual = spectrum[harmonic];
-            assert!(
-                ((actual.re - source.re * gain) * (2.0 / SIZE as f32)).abs() < 0.00002,
-                "cosine partial {harmonic}, frequency {frequency}"
-            );
-            assert!(
-                ((actual.im - source.im * gain) * (2.0 / SIZE as f32)).abs() < 0.00002,
-                "sine partial {harmonic}, frequency {frequency}"
-            );
-        }
-    }
-    // The six-table bank uses the eight-harmonic table at 1800 Hz.
-    assert_eq!(rendered_harmonic_gain(1800.0 / 48000.0, 8), 1.0);
-    assert_eq!(rendered_harmonic_gain(1800.0 / 48000.0, 12), 0.0);
-    // Around F7 the eighth harmonic is still largely retained, rather than
-    // dropping to a four-harmonic table as the original octave blend did.
-    assert_eq!(rendered_harmonic_gain(2793.826 / 48000.0, 8), 1.0);
-    assert_eq!(rendered_harmonic_gain(220.0 / 48000.0, 30), 1.0);
-    assert_eq!(rendered_harmonic_gain(220.0 / 48000.0, 60), 0.0);
-}
-
-#[test]
-fn every_specification_has_distinct_nested_limits_and_safe_selection() {
-    let mut previous = TableLayout::new(1);
-    for tables in 1..=MAX_TABLES {
-        let layout = TableLayout::new(tables);
-        assert_eq!(layout.count, tables);
-        assert_eq!(layout.cutoff(0), 127);
-        if tables > 1 {
-            assert_eq!(layout.cutoff(tables - 1), 1);
-            for i in 1..tables {
-                assert!(layout.cutoff(i - 1) > layout.cutoff(i));
-            }
-            for i in 0..previous.count {
-                assert!((0..tables).any(|j| previous.cutoff(i) == layout.cutoff(j)));
-            }
-        }
-        for i in 1..=4500 {
-            let increment = i as f32 / 10000.0;
-            let (level, blend) = layout.playback_levels(increment);
-            if tables == 1 {
-                assert_eq!((level, blend), (0, 0.0));
-            } else {
-                assert!(layout.cutoff(level) as f32 * increment <= 0.490001);
-                assert!((0.0..=1.0).contains(&blend));
-            }
-        }
-        previous = layout;
-    }
-    let six = TableLayout::new(6);
-    assert_eq!(&six.cutoffs[..6], &[127, 32, 8, 4, 2, 1]);
-}
-
-#[test]
-fn all_table_counts_build_complete_banks_and_single_table_bypasses_filtering() {
-    for tables in 1..=MAX_TABLES {
-        let mut storage = [Block::ZERO; reference_blocks(MAX_TABLES)];
-        let memory = &mut storage[..reference_blocks(tables)];
-        let mut engine = Engine::with_tables(32, 48000, tables);
-        let mut wave = Wave::new(32);
-        for i in 0..32 {
-            wave.boundaries[i] = if i % 2 == 0 { -75 } else { 100 };
-            wave.curves[i] = 90;
-        }
-        for smoothing in [0, 100] {
-            wave.smoothing = smoothing;
-            engine.request(wave);
-            for _ in 0..build_calls(&wave, tables) + 8 {
-                engine.advance(memory);
-                for _ in 0..64 {
-                    assert!(engine.tick(memory, 2800.0, 48000.0, 1.0).is_finite());
-                }
-            }
-            assert_eq!(engine.waves[engine.active], wave);
-            assert_eq!(engine.fade, 0);
-            let mut actual = [Complex::default(); SIZE];
-            for (i, sample) in actual.iter_mut().enumerate() {
-                sample.re = engine.display_sample(memory, (i as u32) << 24);
-                if tables == 1 {
-                    let segment_position = i as f32 * wave.count as f32 / SIZE as f32;
-                    let segment = segment_position as usize;
-                    let defined = engine.display_segment_sample(
-                        memory,
-                        segment,
-                        segment_position - segment as f32,
-                    );
-                    assert!((sample.re - defined).abs() < 0.00001);
-                }
-            }
-            if tables > 1 {
-                fft(&mut actual, &memory[tables + 3].data, false);
-                let cap = engine.layout.cutoff(engine.playback_level);
-                let energy: f32 = actual.iter().map(|v| v.re * v.re + v.im * v.im).sum();
-                let stop: f32 = actual
-                    .iter()
-                    .enumerate()
-                    .filter(|(k, _)| (*k).min(SIZE - *k) > cap)
-                    .map(|(_, v)| v.re * v.re + v.im * v.im)
-                    .sum();
-                assert!(stop < energy * 0.00000001);
-            }
-        }
-    }
-}
-
-#[test]
-fn high_pitch_folded_tone_is_suppressed_relative_to_direct_playback() {
-    // Coherent capture near F7: the 16th harmonic folds to FFT bin 272.
-    // Analyze that actual audio spur, rather than only the stored table bins.
-    const FRAMES: usize = 4096;
-    const FUNDAMENTAL: usize = 239;
-    const ALIAS: usize = FRAMES - 16 * FUNDAMENTAL;
-    let frequency = FUNDAMENTAL as f32 * 48000.0 / FRAMES as f32;
-    let mut wave = Wave::new(32);
-    for i in 0..32 {
-        let fundamental = 25.0 * sine(core::f32::consts::TAU * i as f32 / 32.0);
-        wave.boundaries[i] = (fundamental + if i % 2 == 0 { -70.0 } else { 70.0 }) as i16;
-    }
-    let mut engine = Engine::new(32, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, wave, frequency);
-    engine.phase = 0;
-    engine.increment = frequency / 48000.0;
-    engine.level = 1.0;
-    let (mut raw_cos, mut raw_sin, mut clean_cos, mut clean_sin) = (0.0, 0.0, 0.0, 0.0);
-    let (mut fundamental_cos, mut fundamental_sin) = (0.0, 0.0);
-    for i in 0..FRAMES {
-        let raw = wave.sample(engine.phase as f32 / 4_294_967_296.0);
-        let clean = engine.tick(&memory, frequency, 48000.0, 1.0) / 5.0;
-        let angle = core::f32::consts::TAU * ((i * ALIAS) % FRAMES) as f32 / FRAMES as f32;
-        let cosine = sine(angle + core::f32::consts::FRAC_PI_2);
-        let sinusoid = sine(angle);
-        raw_cos += raw * cosine;
-        raw_sin += raw * sinusoid;
-        clean_cos += clean * cosine;
-        clean_sin += clean * sinusoid;
-        let fundamental_angle =
-            core::f32::consts::TAU * ((i * FUNDAMENTAL) % FRAMES) as f32 / FRAMES as f32;
-        fundamental_cos += clean * sine(fundamental_angle + core::f32::consts::FRAC_PI_2);
-        fundamental_sin += clean * sine(fundamental_angle);
-    }
-    let raw_power = raw_cos * raw_cos + raw_sin * raw_sin;
-    let clean_power = clean_cos * clean_cos + clean_sin * clean_sin;
-    assert!(raw_power > 100.0);
-    let amplitude_squared = 4.0
-        * (fundamental_cos * fundamental_cos + fundamental_sin * fundamental_sin)
-        / (FRAMES * FRAMES) as f32;
-    assert!(
-        (0.23 * 0.23..0.27 * 0.27).contains(&amplitude_squared),
-        "fundamental squared amplitude {amplitude_squared}"
-    );
-    assert!(
-        clean_power < raw_power * 0.0001,
-        "raw {raw_power}, filtered {clean_power}"
-    );
-}
-
-#[test]
-fn smoothing_keeps_changing_the_shape_through_the_upper_control_range() {
-    for n in [2, 8, 32] {
-        let mut wave = Wave::new(n);
-        for i in 0..n {
-            wave.boundaries[i] = if i % 2 == 0 { -75 } else { 100 };
-            wave.curves[i] = if i % 2 == 0 { -100 } else { 100 };
-        }
-        let mut previous = [0.0; SIZE];
-        for smoothing in [30, 40, 50, 60, 70, 80, 90, 100] {
-            wave.smoothing = smoothing;
-            let mut engine = Engine::new(n, 48000);
-            let mut memory = [Block::ZERO; BLOCKS];
-            finish_build(&mut engine, &mut memory, wave, 20.0);
-            let mut difference = 0.0;
-            for (i, old) in previous.iter_mut().enumerate() {
-                let sample = engine.display_sample(&memory, (i as u32) << 24);
-                difference += (sample - *old) * (sample - *old);
-                *old = sample;
-            }
-            if smoothing > 30 {
-                assert!(difference / SIZE as f32 > 0.000001);
-            }
-        }
-    }
-}
-
-#[test]
-fn pitch_changes_reuse_tables_while_the_editor_shape_stays_unchanged() {
-    let mut wave = Wave::new(32);
-    wave.curves.fill(100);
-    let mut engine = Engine::new(32, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, wave, 20.0);
-    let old_shape = engine.display_segment_sample(&memory, 0, 0.5);
-    let old_audio = engine.display_sample(&memory, 1 << 28);
-    let original_tables = memory;
-    for frequency in [20.0, 2800.0, 12500.0] {
-        for _ in 0..1000 {
-            engine.tick(&memory, frequency, 48000.0, 1.0);
-        }
-        for _ in 0..512 {
-            // Compare after the slew settles so preview and tick use the same pitch.
-            let expected = engine.display_sample(&memory, engine.phase);
-            let actual = engine.tick(&memory, frequency, 48000.0, 1.0);
-            assert!((actual - expected * 5.0).abs() < 0.00001);
-        }
-        for segment in 0..wave.count {
-            for point in 0..=16 {
-                let t = point as f32 / 16.0;
-                let phase = if segment + 1 == wave.count && point == 16 {
-                    0
-                } else {
-                    (((segment as f32 + t) / wave.count as f32) * 4_294_967_296.0) as u32
-                };
-                assert_eq!(
-                    engine.audio_segment_sample(&memory, segment, t),
-                    engine.display_sample(&memory, phase)
-                );
-            }
-        }
-    }
-    assert_eq!(engine.display_segment_sample(&memory, 0, 0.5), old_shape);
-    assert!((engine.display_sample(&memory, 1 << 28) - old_audio).abs() > 0.001);
-    for (old, new) in original_tables.iter().zip(&memory) {
-        for (a, b) in old.data.iter().zip(&new.data) {
-            assert_eq!((a.re, a.im), (b.re, b.im));
-        }
-    }
-}
-
-#[test]
-fn editor_shows_exact_source_or_creative_smoothing_at_every_pitch() {
-    for n in [2, 7, 32] {
-        let mut wave = Wave::new(n);
-        wave.boundaries[0] = 63;
-        for i in 1..n {
-            wave.boundaries[i] = if i % 2 == 0 { 100 } else { -75 };
-        }
-        wave.curves.fill(100);
-        let mut engine = Engine::new(n, 48000);
-        let mut memory = [Block::ZERO; BLOCKS];
-        for smoothing in [0, 50, 100, 0] {
-            wave.smoothing = smoothing;
-            finish_build(&mut engine, &mut memory, wave, 20.0);
-            let mut reference = [0.0; MAX_SEGMENTS * 33];
-            for segment in 0..n {
-                for point in 0..=32 {
-                    let t = point as f32 / 32.0;
-                    let value = engine.display_segment_sample(&memory, segment, t);
-                    reference[segment * 33 + point] = value;
-                    if smoothing == 0 {
-                        assert_eq!(value, wave.segment_sample(segment, t));
-                    }
-                }
-                assert!(
-                    (engine.display_segment_sample(&memory, segment, 0.0)
-                        - wave.boundary_level(segment))
-                    .abs()
-                        < 0.001
-                );
-            }
-            for frequency in [2800.0, 12500.0] {
-                for _ in 0..1000 {
-                    engine.tick(&memory, frequency, 48000.0, 1.0);
-                }
-                for segment in 0..n {
-                    for point in 0..=32 {
-                        assert_eq!(
-                            engine.display_segment_sample(&memory, segment, point as f32 / 32.0),
-                            reference[segment * 33 + point]
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn rebuild_crossfade_starts_at_old_wave_and_continuous_edits_do_not_starve() {
-    let mut engine = Engine::new(32, 48000);
-    let mut memory = [Block::ZERO; BLOCKS];
-    let mut wave = Wave::new(32);
-    finish_build(&mut engine, &mut memory, wave, 2800.0);
-    wave.boundaries[4] = -100;
-    engine.request(wave);
-    for _ in 0..BUILD_STEPS {
-        engine.advance(&mut memory);
-    }
-    assert_eq!(engine.fade, engine.fade_length);
-    let phase = engine.phase;
-    assert_eq!(
-        engine.display_sample(&memory, phase),
-        engine.wave_sample(&memory, engine.active, phase)
-    );
-    for block in 0..200 {
-        wave.boundaries[4] = block as i16 - 100;
-        engine.request(wave);
-        engine.advance(&mut memory);
-        for _ in 0..64 {
-            assert!(engine.tick(&memory, 2800.0, 48000.0, 1.0).is_finite());
-        }
-    }
-    // The audible bank may be one completed generation behind the pending
-    // generation. Bound the lag by two build/fade cycles, rather than the old
-    // fixed threshold that assumed a much shorter callback schedule.
-    let max_lag = 2 * (BUILD_STEPS + engine.fade_length.div_ceil(64));
-    assert!(engine.waves[engine.active].boundaries[4] >= wave.boundaries[4] - max_lag as i16);
-    assert_ne!(engine.phase, phase);
-    finish_build(&mut engine, &mut memory, wave, 2800.0);
-}
-
-#[test]
-fn startup_builds_default_wave_without_an_edit_and_stays_finite_at_supported_rates() {
-    for rate in [32000, 44100, 48000, 88200, 96000] {
-        let mut engine = Engine::new(8, rate);
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut energy = 0.0;
-        for _ in 0..BUILD_STEPS + 20 {
-            engine.request(Wave::new(8));
-            engine.advance(&mut memory);
-            for _ in 0..64 {
-                let sample = engine.tick(&memory, 2800.0, rate as f32, 1.0);
-                assert!(sample.is_finite());
-                energy += sample * sample;
-            }
-        }
-        assert!(energy > 1.0);
-        assert!(engine.ready[engine.active]);
-    }
-}
-
-pub(super) fn count_moving_pitch_tick() {
-    count_oscillator_tick();
-    MOVING_PITCH_TICKS.with(|counter| counter.set(counter.get() + 1));
-}
-
-#[test]
 fn moving_pitch_renderer_preserves_state_and_bounded_samples_across_pitch_changes() {
     for rate in [32000, 48000, 96000] {
         let mut engine = Engine::new(32, rate);
@@ -1460,7 +452,7 @@ fn moving_pitch_renderer_preserves_state_and_bounded_samples_across_pitch_change
         let mut wave = Wave::new(32);
         wave.smoothing = 17;
         wave.curves[3] = 85;
-        finish_build(&mut engine, &mut memory, wave, 440.0);
+        finish_build(&mut engine, &mut memory, wave);
         let mut optimized = Oscillator::new();
         let mut reference = optimized;
         // Settle level and pitch before exercising the moving-pitch-only path.
@@ -1494,7 +486,7 @@ fn moving_pitch_renderer_preserves_state_and_bounded_samples_across_pitch_change
 }
 
 #[test]
-fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
+fn block_gain_matches_production_scalar_playback_with_bounded_rounding_error() {
     let mut max_error = 0.0f32;
     for rate in [32000, 48000, 96000] {
         let mut engine = Engine::new(32, rate);
@@ -1503,7 +495,7 @@ fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
         wave.smoothing = 40;
         wave.warp_amount = -60;
         wave.curves[3] = 90;
-        finish_build(&mut engine, &mut memory, wave, 440.0);
+        finish_build(&mut engine, &mut memory, wave);
         for db in -60..=0 {
             let level = if db == -60 {
                 0.0
@@ -1538,33 +530,6 @@ fn precomputed_gain_tracks_original_scaling_with_bounded_rounding_error() {
 }
 
 #[test]
-fn fixed_pitch_tracks_exponential_reference_without_overshoot_and_settles_exactly() {
-    for rate in [32000, 44100, 48000, 96000] {
-        let mut voice = Oscillator::new();
-        for frequency in [20.0, 440.0, 12000.0, 20.0, 20.0001, 19.9999] {
-            voice.prepare(frequency, rate as f32, 1.0);
-            let mut exact = voice.phase_step as f64;
-            let alpha = voice.pitch_slew as f64 / PITCH_SLEW_SCALE as f64;
-            for _ in 0..5000 {
-                let before = voice.phase_step;
-                exact += alpha * (voice.target_step as f64 - exact);
-                voice.advance_pitch_step_exact();
-                assert!((voice.phase_step as f64 - exact).abs() <= 1.0 / alpha + 2.0);
-                assert!(
-                    (before.min(voice.target_step)..=before.max(voice.target_step))
-                        .contains(&voice.phase_step)
-                );
-            }
-            assert_eq!(voice.phase_step, voice.target_step);
-            assert!(!voice.pitch_moving);
-            let actual_hz = voice.phase_step as f64 * rate as f64 / PHASE_SCALE as f64;
-            let cents = 1200.0 * (actual_hz / frequency as f64).log2().abs();
-            assert!(cents < 0.002, "{rate} Hz, {frequency} Hz: {cents} cents");
-        }
-    }
-}
-
-#[test]
 fn fixed_pitch_follows_sub_millivolt_ramps_and_reprepares_after_rate_changes() {
     let mut voice = Oscillator::new();
     for rate in [32000, 48000, 96000, 44100] {
@@ -1590,41 +555,6 @@ fn fixed_pitch_follows_sub_millivolt_ramps_and_reprepares_after_rate_changes() {
 }
 
 #[test]
-fn shared_cv_factor_preserves_tuning_clamps_and_reuses_conversion_across_detuned_voices() {
-    let mut cache = CvPitchCache::new();
-    let mut entries = [CvFactor::new(); 10];
-    let mut voices = [Oscillator::new(); 10];
-    let mut max_cents = 0.0f64;
-    for bus in [1, 64, 0, 3] {
-        for voltage in [-10.0, -3.14159, -0.00001, 0.0, 0.00001, 2.71828, 10.0] {
-            cache.begin_block();
-            let before = playback_work_counts().1;
-            for (i, voice) in voices.iter_mut().enumerate() {
-                let tuning = i as f32 * 2.1 - 9.1;
-                let factor = cache.factor(bus, voltage, entries.iter_mut());
-                let actual = voice.cv_frequency(tuning, factor);
-                let expected = 440.0 * 2.0f64.powf(((tuning + voltage).clamp(-16.0, 16.0)) as f64);
-                max_cents = max_cents.max(1200.0 * (actual as f64 / expected).log2().abs());
-            }
-            // Ten fixed detune factors plus one CV factor at first, only one
-            // conversion for later CV changes (or zero for exact zero volts).
-            assert!(playback_work_counts().1 - before <= if voltage == 0.0 { 10 } else { 11 });
-            cache.begin_block();
-            let before = playback_work_counts().1;
-            for (i, voice) in voices.iter_mut().enumerate() {
-                voice.cv_frequency(
-                    i as f32 * 2.1 - 9.1,
-                    cache.factor(bus, voltage, entries.iter_mut()),
-                );
-            }
-            assert_eq!(playback_work_counts().1, before);
-        }
-    }
-    assert!(max_cents < 0.002, "{max_cents} cents");
-    std::println!("Maximum factored tuning difference: {max_cents} cents");
-}
-
-#[test]
 fn fixed_selection_proof_is_strict_and_tracks_identically_to_scalar_on_both_sides() {
     let engine = Engine::new(8, 48000);
     let mut voice = Oscillator::new();
@@ -1643,7 +573,7 @@ fn fixed_selection_proof_is_strict_and_tracks_identically_to_scalar_on_both_side
     for frequency in [100.0, 440.0, 3000.0, 9000.0, 19000.0] {
         let mut engine = engine;
         let mut memory = [Block::ZERO; BLOCKS];
-        finish_build(&mut engine, &mut memory, Wave::new(8), frequency);
+        finish_build(&mut engine, &mut memory, Wave::new(8));
         for direction in [-1.0, 1.0] {
             let mut fast = Oscillator::new();
             fast.tune_when_silent(frequency, 48000.0);
@@ -1676,7 +606,7 @@ fn direct_cv_targets_match_frequency_path_with_bounded_rounding_across_rates_and
                 let cv = -10.0 + i as f32 * 0.005;
                 let factor = 2.0f32.powf(cv);
                 direct.prepare_cv(tuning, factor, rate, 0.5);
-                let frequency = original.cv_frequency(tuning, factor);
+                let frequency = 440.0 * 2.0f32.powf(tuning) * factor;
                 original.prepare(frequency, rate, 0.5);
                 let expected = original.target_step;
                 let error = direct.target_step.abs_diff(expected) as f64;
@@ -1689,7 +619,6 @@ fn direct_cv_targets_match_frequency_path_with_bounded_rounding_across_rates_and
                 }
                 assert_eq!(direct.target_level, original.target_level);
                 assert_eq!(direct.slew, original.slew);
-                assert_eq!(direct.pitch_slew, original.pitch_slew);
             }
         }
     }
@@ -1719,49 +648,6 @@ fn direct_cv_scale_rebuilds_for_tuning_rate_and_path_changes_without_a_deadband(
 }
 
 #[test]
-fn paired_pitch_endpoints_track_exact_reference_monotonically_with_bounded_phase_error() {
-    for rate in [32000.0, 44100.0, 48000.0, 96000.0] {
-        for (start, target) in [
-            (20.0, 20000.0),
-            (20000.0, 20.0),
-            (440.0, 441.0),
-            (440.0, 440.0001),
-        ] {
-            let mut paired = Oscillator::new();
-            paired.tune_when_silent(start, rate);
-            paired.prepare(target, rate, 0.5);
-            let mut exact = paired;
-            let alpha = paired.pitch_slew as f64 / PITCH_SLEW_SCALE as f64;
-            let distance = paired.target_step.abs_diff(paired.phase_step) as f64;
-            let mut sum = 0i64;
-            for _ in 0..5000 {
-                let before = paired.phase_step;
-                paired.advance_pitch_step();
-                exact.advance_pitch_step_exact();
-                assert!(
-                    (before.min(paired.target_step)..=before.max(paired.target_step))
-                        .contains(&paired.phase_step)
-                );
-                let tolerance = 3.0 / alpha
-                    + 8.0
-                    + if paired.pair_pending {
-                        0.5 * alpha * alpha * distance
-                    } else {
-                        0.0
-                    };
-                assert!((paired.phase_step as f64 - exact.phase_step as f64).abs() <= tolerance);
-                sum += paired.phase_step as i64 - exact.phase_step as i64;
-            }
-            assert_eq!(paired.phase_step, paired.target_step);
-            assert!(!paired.pitch_moving);
-            assert!(!paired.pair_pending);
-            let theoretical = distance * alpha / (2.0 * (2.0 - alpha));
-            assert!((sum as f64).abs() <= theoretical + 0.001 * PHASE_SCALE as f64);
-        }
-    }
-}
-
-#[test]
 fn new_pitch_target_and_silent_retune_discard_pending_interpolation_endpoint() {
     let mut voice = Oscillator::new();
     voice.prepare(440.0, 48000.0, 0.5);
@@ -1785,7 +671,7 @@ fn batched_envelope_playback_matches_scalar_samples_phase_and_gate_energy() {
     wave.curves.fill(87);
     let mut engine = Engine::new(32, 48000);
     let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, wave, 440.0);
+    finish_build(&mut engine, &mut memory, wave);
     for frequency in [20.0, 440.0, 2800.0, 12500.0] {
         let mut initial = Oscillator::new();
         for _ in 0..5000 {
@@ -1835,7 +721,7 @@ fn batched_envelope_playback_matches_scalar_samples_phase_and_gate_energy() {
 fn batched_envelope_rejection_does_not_advance_or_modify_output() {
     let mut engine = Engine::new(8, 48000);
     let mut memory = [Block::ZERO; BLOCKS];
-    finish_build(&mut engine, &mut memory, Wave::new(8), 440.0);
+    finish_build(&mut engine, &mut memory, Wave::new(8));
     let mut voice = Oscillator::new();
     voice.prepare(440.0, 48000.0, 0.5);
     let before = voice;
@@ -1865,55 +751,6 @@ fn batched_envelope_rejection_does_not_advance_or_modify_output() {
 }
 
 #[test]
-fn in_place_requests_match_snapshot_requests_during_rebuilds_and_crossfades() {
-    for count in [2, 8, 31, 32] {
-        let mut actual = Engine::new(count, 48000);
-        let mut reference = actual;
-        let mut memory = [Block::ZERO; BLOCKS];
-        let mut reference_memory = memory;
-        let mut desired = Wave::new(count);
-        let target = core::ptr::from_ref(&actual.requested);
-        for block in 0..220 {
-            if block % 3 == 0 && block < 150 {
-                desired.boundaries[0] = ((block * 7) % 201) as i16 - 100;
-                desired.curves[(block / 3) % count] = ((block * 11) % 201) as i16 - 100;
-                desired.smoothing = (block % 101) as i16;
-                desired.warp_position = (block % 256) as i16;
-                desired.warp_amount = (block % 151) as i16 - 75;
-            }
-            let building = actual.building;
-            let banks = actual.waves;
-            actual.update_request(|requested| {
-                assert_eq!(core::ptr::from_mut(requested).cast_const(), target);
-                // Populate fields, rather than assigning another whole Wave.
-                requested.boundaries.copy_from_slice(&desired.boundaries);
-                requested.curves.copy_from_slice(&desired.curves);
-                requested.count = desired.count;
-                requested.smoothing = desired.smoothing;
-                requested.warp_position = desired.warp_position;
-                requested.warp_amount = desired.warp_amount;
-                requested.fold_limit = desired.fold_limit;
-            });
-            assert_eq!(actual.building, building);
-            assert_eq!(actual.waves, banks);
-            reference.request(desired);
-            assert_eq!(actual, reference);
-            actual.advance(&mut memory);
-            reference.advance(&mut reference_memory);
-            for _ in 0..24 {
-                assert_eq!(
-                    actual.tick(&memory, 440.0, 48000.0, 0.5),
-                    reference.tick(&reference_memory, 440.0, 48000.0, 0.5)
-                );
-            }
-            assert_eq!(actual, reference);
-        }
-        assert_eq!(actual.requested, desired);
-        assert_eq!(actual.waves[actual.active], desired);
-    }
-}
-
-#[test]
 fn unwarped_sampling_matches_zero_warp_copy_without_changing_source() {
     for count in 2..=MAX_SEGMENTS {
         let mut wave = Wave::new(count);
@@ -1938,50 +775,402 @@ fn unwarped_sampling_matches_zero_warp_copy_without_changing_source() {
     }
 }
 
+// Direct DFT is a small mathematical oracle, not another playback/build path.
 #[test]
-fn exact_sized_boundary_cache_matches_packed_fixture_and_preserves_guards() {
-    for n in 2..=MAX_SEGMENTS {
-        let mut actual = Engine::new(n, 48000);
-        let mut reference = Engine::new(n, 48000);
-        let mut memory = [Block::ZERO; BLOCK_COUNT];
-        let mut reference_memory = [Block::ZERO; BLOCKS];
-        let length = basis_entries(n);
-        let sentinel = Complex {
-            re: 12345.25,
-            im: -6789.5,
-        };
-        let mut cache = std::vec![sentinel; length + 2];
-        for &(smooth, warp) in &[(0, 0), (1, -100), (63, 100), (100, 47)] {
-            let mut wave = Wave::new(n);
-            wave.smoothing = smooth;
-            wave.warp_amount = warp;
-            for i in 0..n {
-                wave.boundaries[i] = ((i * 73 + n * 17) % 201) as i16 - 100;
-                wave.curves[i] = ((i * 31 + n * 19) % 201) as i16 - 100;
-            }
-            actual.request(wave);
-            reference.request(wave);
-            for _ in 0..200 {
-                actual.advance_with_basis(&mut memory, &mut cache[1..length + 1]);
-                reference.advance(&mut reference_memory);
-                for _ in 0..64 {
-                    assert_eq!(
-                        actual.tick(&memory, 440.0, 48000.0, 1.0),
-                        reference.tick(&reference_memory, 440.0, 48000.0, 1.0)
-                    );
+fn complex_fft_matches_direct_dft_and_round_trips_real_and_imaginary_data() {
+    crate::tests::with_build_job(8, |job| {
+        job.build();
+        let mut signal = [Complex::default(); SIZE];
+        for (i, value) in signal.iter_mut().enumerate() {
+            value.re = ((i * 73 % 201) as f32 - 100.0) * 0.01;
+            value.im = ((i * 31 % 113) as f32 - 56.0) * 0.01;
+        }
+        for inverse in [false, true] {
+            let mut actual = signal;
+            fft(&mut actual, &job.twiddles, inverse);
+            for (k, value) in actual.iter().enumerate() {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, input) in signal.iter().enumerate() {
+                    let angle = std::f64::consts::TAU * (i * k) as f64 / SIZE as f64
+                        * if inverse { 1.0 } else { -1.0 };
+                    let (sin, cos) = angle.sin_cos();
+                    re += input.re as f64 * cos - input.im as f64 * sin;
+                    im += input.re as f64 * sin + input.im as f64 * cos;
                 }
+                let scale = if inverse { 1.0 / SIZE as f64 } else { 1.0 };
+                assert!((value.re as f64 - re * scale).abs() < 0.0001);
+                assert!((value.im as f64 - im * scale).abs() < 0.0001);
             }
-            assert_eq!(actual.waves[actual.active], wave);
-            for (a, b) in memory.iter().zip(&reference_memory) {
-                for (x, y) in a.data.iter().zip(&b.data) {
-                    assert_eq!(x.re, y.re);
-                    assert_eq!(x.im, y.im);
-                }
-            }
-            for guard in [cache[0], cache[length + 1]] {
-                assert_eq!(guard.re, sentinel.re);
-                assert_eq!(guard.im, sentinel.im);
+            fft(&mut actual, &job.twiddles, !inverse);
+            for (actual, expected) in actual.iter().zip(signal) {
+                assert!((actual.re - expected.re).abs() < 0.00001);
+                assert!((actual.im - expected.im).abs() < 0.00001);
             }
         }
+    });
+}
+
+fn varied_wave(count: usize, smoothing: i16, warp: i16) -> Wave {
+    let mut wave = Wave::new(count);
+    wave.smoothing = smoothing;
+    wave.warp_amount = warp;
+    wave.warp_position = 73;
+    for i in 0..count {
+        wave.boundaries[i] = ((i * 47 + count * 19) % 201) as i16 - 100;
+        wave.curves[i] = ((i * 61 + count * 13) % 201) as i16 - 100;
+    }
+    wave
+}
+
+#[test]
+fn worker_packed_tables_match_independent_spectral_masks_for_every_segment_count() {
+    for count in 2..=MAX_SEGMENTS {
+        crate::tests::with_build_job(count, |job| {
+            for smoothing in [0, 1, 57, 100] {
+                for warp in [-89, 0, 93] {
+                    job.wave = varied_wave(count, smoothing, warp);
+                    let before = FFT_COUNTS.with(Cell::get);
+                    job.build();
+                    let after = FFT_COUNTS.with(Cell::get);
+                    assert_eq!(
+                        (after.0 - before.0, after.1 - before.1),
+                        if smoothing == 0 { (1, 3) } else { (2, 4) }
+                    );
+                    assert!(job.completed);
+                    // Independently reconstruct the real source from the creative
+                    // preview; each inverse below handles just one real table.
+                    let mut spectrum = [Complex::default(); SIZE];
+                    for (i, value) in spectrum.iter_mut().enumerate() {
+                        let phase = i as f32 / SIZE as f32;
+                        value.re = if smoothing == 0 {
+                            job.wave.sample(phase)
+                        } else {
+                            let position = job.wave.unwarped_phase(phase) * SIZE as f32;
+                            let index = position as usize & (SIZE - 1);
+                            let fraction = position - position.floor();
+                            let preview = &job.result[DEFAULT_TABLES];
+                            preview[index]
+                                + (preview[(index + 1) & (SIZE - 1)] - preview[index]) * fraction
+                        };
+                    }
+                    fft(&mut spectrum, &job.twiddles, false);
+                    for level in 0..DEFAULT_TABLES {
+                        let mut expected = spectrum;
+                        for (k, value) in expected.iter_mut().enumerate() {
+                            if k.min(SIZE - k) > cutoff(level) || k == SIZE / 2 {
+                                *value = Complex::default();
+                            }
+                        }
+                        fft(&mut expected, &job.twiddles, true);
+                        for (i, (actual, expected)) in
+                            job.result[level].iter().zip(expected).enumerate()
+                        {
+                            assert!((actual - expected.re).abs() < 0.00002,
+                                "count {count}, smoothing {smoothing}, warp {warp}, table {level}, sample {i}");
+                            assert!(expected.im.abs() < 0.00001);
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn worker_tables_remove_unsafe_harmonics_after_smoothing_and_warp() {
+    crate::tests::with_build_job(32, |job| {
+        for smoothing in [0, 50, 100] {
+            for warp in [-100, 0, 100] {
+                job.wave = varied_wave(32, smoothing, warp);
+                job.build();
+                for level in 0..DEFAULT_TABLES {
+                    let mut spectrum = [Complex::default(); SIZE];
+                    for (value, sample) in spectrum.iter_mut().zip(job.result[level]) {
+                        value.re = sample;
+                    }
+                    fft(&mut spectrum, &job.twiddles, false);
+                    let (mut pass, mut stop) = (0.0, 0.0);
+                    for (k, value) in spectrum.iter().enumerate() {
+                        let energy = value.re * value.re + value.im * value.im;
+                        if k.min(SIZE - k) > cutoff(level) || k == SIZE / 2 {
+                            stop += energy;
+                        } else {
+                            pass += energy;
+                        }
+                    }
+                    assert!(pass > 0.001);
+                    assert!(stop < pass * 0.00000001);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn geometry_cache_preserves_twiddles_and_smoothing_gains_and_matches_wave_mapping() {
+    crate::tests::with_build_job(8, |job| {
+        job.build();
+        let fixed = job.twiddles;
+        for count in 2..=MAX_SEGMENTS {
+            for position in [0, 1, 94, 128, 254, 255] {
+                for amount in [-100, -50, 50, 100] {
+                    let mut wave = Wave::new(count);
+                    wave.warp_position = position;
+                    wave.warp_amount = amount;
+                    prepare_geometry(&wave, &mut job.twiddles);
+                    for (a, b) in job.twiddles[..POSITION_CACHE].iter().zip(fixed) {
+                        assert_eq!((a.re, a.im), (b.re, b.im));
+                    }
+                    let mut cursor = 0;
+                    for i in 0..SIZE {
+                        let phase = i as f32 / SIZE as f32;
+                        let expected = wave.segment_at(phase);
+                        let actual = cached_segment_at(&wave, &job.twiddles, phase, &mut cursor);
+                        assert_eq!(actual.0, expected.0);
+                        assert!((actual.1 - expected.1).abs() < 0.000001);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn published_editor_preserves_boundaries_seam_and_pitch_independence() {
+    for count in 2..=MAX_SEGMENTS {
+        let mut engine = Engine::new(count, 48000);
+        let mut memory = [Block::ZERO; BLOCKS];
+        for smoothing in [0, 1, 50, 100] {
+            for warp in [-89, 0, 93] {
+                let wave = varied_wave(count, smoothing, warp);
+                finish_build(&mut engine, &mut memory, wave);
+                for boundary in 0..=count {
+                    let sample =
+                        engine.editor_phase_sample(&memory, wave.boundary_position(boundary));
+                    assert!((sample - wave.boundary_level(boundary)).abs() < 0.0005);
+                }
+                assert_eq!(
+                    engine.editor_phase_sample(&memory, 0.0),
+                    engine.editor_phase_sample(&memory, 1.0)
+                );
+                let before = memory;
+                let mut voice = Oscillator::new();
+                for frequency in [20.0, 440.0, 2800.0, 19000.0] {
+                    voice.prepare(frequency, 48000.0, 0.5);
+                    for frame in 0..64 {
+                        assert!(voice.tick_prepared(&engine, &memory, frame).is_finite());
+                    }
+                    for i in 0..SIZE {
+                        let phase = i as f32 / SIZE as f32;
+                        if smoothing == 0 {
+                            assert_eq!(
+                                engine.editor_phase_sample(&memory, phase),
+                                wave.sample(phase)
+                            );
+                        }
+                    }
+                }
+                for (a, b) in memory.iter().zip(before) {
+                    for (a, b) in a.data.iter().zip(b.data) {
+                        assert_eq!((a.re, a.im), (b.re, b.im));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn smoothing_keeps_changing_through_the_upper_control_range() {
+    for count in [2, 8, 32] {
+        crate::tests::with_build_job(count, |job| {
+            let mut previous = [0.0; SIZE];
+            for smoothing in [30, 40, 50, 60, 70, 80, 90, 100] {
+                job.wave = varied_wave(count, smoothing, 0);
+                job.build();
+                let difference: f32 = previous
+                    .iter()
+                    .zip(job.result[DEFAULT_TABLES])
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                if smoothing > 30 {
+                    assert!(difference / SIZE as f32 > 0.000001);
+                }
+                previous = job.result[DEFAULT_TABLES];
+            }
+        });
+    }
+}
+
+#[test]
+fn six_table_selection_preserves_safe_partials_and_is_continuous_at_transitions() {
+    let layout = TableLayout::new(DEFAULT_TABLES);
+    assert_eq!(&layout.cutoffs[..DEFAULT_TABLES], &[127, 32, 8, 4, 2, 1]);
+    let gain = |increment, harmonic| {
+        let (level, blend) = playback_levels(increment);
+        if harmonic > cutoff(level) {
+            0.0
+        } else if level + 1 == DEFAULT_TABLES || harmonic <= cutoff(level + 1) {
+            1.0
+        } else {
+            1.0 - blend
+        }
+    };
+    for i in 1..=45000 {
+        let increment = i as f32 / 100000.0;
+        let (level, blend) = playback_levels(increment);
+        assert!(level < DEFAULT_TABLES && (0.0..=1.0).contains(&blend));
+        assert!(cutoff(level) as f32 * increment <= 0.490001);
+        for harmonic in 1..SIZE / 2 {
+            let frequency = increment * harmonic as f32;
+            if frequency <= 0.12 {
+                assert!(gain(increment, harmonic) > 0.99999);
+            }
+            if frequency >= 0.49 {
+                assert_eq!(gain(increment, harmonic), 0.0);
+            }
+        }
+    }
+    let mut engine = Engine::new(8, 48000);
+    let mut memory = [Block::ZERO; BLOCKS];
+    finish_build(&mut engine, &mut memory, varied_wave(8, 50, 20));
+    for level in 0..DEFAULT_TABLES - 1 {
+        let threshold = 0.49 / cutoff(level) as f32;
+        let (lo, lb) = playback_levels(threshold - 0.0000001);
+        let (hi, hb) = playback_levels(threshold + 0.0000001);
+        for i in 0..SIZE {
+            let phase = (i as u32) << 24;
+            let before = engine.voice_sample(&memory, engine.active, phase, lo, lb);
+            let after = engine.voice_sample(&memory, engine.active, phase, hi, hb);
+            assert!((before - after).abs() < 0.001);
+        }
+    }
+}
+
+#[test]
+fn pitch_slew_follows_exponential_model_monotonically_and_settles_exactly() {
+    for rate in [32000.0, 44100.0, 48000.0, 96000.0] {
+        for (start, target) in [
+            (20.0, 20000.0),
+            (20000.0, 20.0),
+            (440.0, 441.0),
+            (440.0, 440.0001),
+        ] {
+            let mut voice = Oscillator::new();
+            voice.tune_when_silent(start, rate);
+            voice.prepare(target, rate, 0.5);
+            let alpha = voice.slew as f64;
+            let distance = voice.target_step.abs_diff(voice.phase_step) as f64;
+            let mut expected = voice.phase_step as f64;
+            let mut sum = 0.0;
+            for _ in 0..5000 {
+                let before = voice.phase_step;
+                expected += alpha * (voice.target_step as f64 - expected);
+                voice.advance_pitch_step();
+                assert!(
+                    (before.min(voice.target_step)..=before.max(voice.target_step))
+                        .contains(&voice.phase_step)
+                );
+                let tolerance = 3.0 / alpha
+                    + 8.0
+                    + if voice.pair_pending {
+                        0.5 * alpha * alpha * distance
+                    } else {
+                        0.0
+                    };
+                assert!((voice.phase_step as f64 - expected).abs() <= tolerance);
+                sum += voice.phase_step as f64 - expected;
+            }
+            assert_eq!(voice.phase_step, voice.target_step);
+            assert!(!voice.pitch_moving && !voice.pair_pending);
+            assert!(
+                sum.abs() <= distance * alpha / (2.0 * (2.0 - alpha)) + 0.001 * PHASE_SCALE as f64
+            );
+            let hz = voice.phase_step as f64 * rate as f64 / PHASE_SCALE as f64;
+            assert!(1200.0 * (hz / (target.min(rate * 0.45)) as f64).log2().abs() < 0.002);
+        }
+    }
+}
+
+#[test]
+fn high_pitch_folded_tone_is_suppressed_relative_to_direct_playback() {
+    // Coherent capture near F7: the 16th harmonic folds to FFT bin 272.
+    // Analyze that actual audio spur, rather than only the stored table bins.
+    const FRAMES: usize = 4096;
+    const FUNDAMENTAL: usize = 239;
+    const ALIAS: usize = FRAMES - 16 * FUNDAMENTAL;
+    let frequency = FUNDAMENTAL as f32 * 48000.0 / FRAMES as f32;
+    let mut wave = Wave::new(32);
+    for i in 0..32 {
+        let fundamental = 25.0 * sine(core::f32::consts::TAU * i as f32 / 32.0);
+        wave.boundaries[i] = (fundamental + if i % 2 == 0 { -70.0 } else { 70.0 }) as i16;
+    }
+    let mut engine = Engine::new(32, 48000);
+    let mut memory = [Block::ZERO; BLOCKS];
+    finish_build(&mut engine, &mut memory, wave);
+    let mut voice = Oscillator::new();
+    voice.tune_when_silent(frequency, 48000.0);
+    voice.level = 1.0;
+    voice.prepare(frequency, 48000.0, 1.0);
+    let (mut raw_cos, mut raw_sin, mut clean_cos, mut clean_sin) = (0.0, 0.0, 0.0, 0.0);
+    let (mut fundamental_cos, mut fundamental_sin) = (0.0, 0.0);
+    for i in 0..FRAMES {
+        let raw = wave.sample(voice.phase as f32 / 4_294_967_296.0);
+        let clean = voice.tick_prepared(&engine, &memory, 0) / 5.0;
+        let angle = core::f32::consts::TAU * ((i * ALIAS) % FRAMES) as f32 / FRAMES as f32;
+        let cosine = sine(angle + core::f32::consts::FRAC_PI_2);
+        let sinusoid = sine(angle);
+        raw_cos += raw * cosine;
+        raw_sin += raw * sinusoid;
+        clean_cos += clean * cosine;
+        clean_sin += clean * sinusoid;
+        let fundamental_angle =
+            core::f32::consts::TAU * ((i * FUNDAMENTAL) % FRAMES) as f32 / FRAMES as f32;
+        fundamental_cos += clean * sine(fundamental_angle + core::f32::consts::FRAC_PI_2);
+        fundamental_sin += clean * sine(fundamental_angle);
+    }
+    let raw_power = raw_cos * raw_cos + raw_sin * raw_sin;
+    let clean_power = clean_cos * clean_cos + clean_sin * clean_sin;
+    assert!(raw_power > 100.0);
+    let amplitude_squared = 4.0
+        * (fundamental_cos * fundamental_cos + fundamental_sin * fundamental_sin)
+        / (FRAMES * FRAMES) as f32;
+    assert!(
+        (0.23 * 0.23..0.27 * 0.27).contains(&amplitude_squared),
+        "fundamental squared amplitude {amplitude_squared}"
+    );
+    assert!(
+        clean_power < raw_power * 0.0001,
+        "raw {raw_power}, filtered {clean_power}"
+    );
+}
+
+#[test]
+fn smoothing_gains_remain_fixed_and_preview_varies_linearly_with_amount() {
+    for count in 2..=MAX_SEGMENTS {
+        crate::tests::with_build_job(count, |job| {
+            job.wave = varied_wave(count, 1, 0);
+            job.build();
+            let first = job.result[DEFAULT_TABLES];
+            let constants = job.twiddles;
+            for harmonic in 0..=SIZE / 2 {
+                let ratio = harmonic as f32 / 4.0;
+                let expected = 1.0 / (1.0 + ratio.powi(4));
+                let slot = constants[SIZE / 2 + harmonic / 2];
+                assert_eq!(expected, if harmonic & 1 == 0 { slot.re } else { slot.im });
+            }
+            job.wave.smoothing = 100;
+            job.build();
+            let last = job.result[DEFAULT_TABLES];
+            job.wave.smoothing = 50;
+            job.build();
+            for (i, actual) in job.result[DEFAULT_TABLES].iter().enumerate() {
+                let expected = first[i] + (last[i] - first[i]) * (49.0 / 99.0);
+                assert!((actual - expected).abs() < 0.00001);
+            }
+            for (a, b) in constants[..POSITION_CACHE].iter().zip(job.twiddles) {
+                assert_eq!((a.re, a.im), (b.re, b.im));
+            }
+        });
     }
 }

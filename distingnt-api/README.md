@@ -253,5 +253,6 @@ are allowed; lengths that exceed the ABI's u32 terminate with an empty chunk.
 The optional reservation uses acquire/release atomics and never spins or masks
 interrupts. Normal callbacks can keep using previously published results when
 Busy. Safe plugin code never handles raw callback pointers, casts or locks.
-These wrappers do not automatically move background computation into Wavesmith;
-its DSP remains unchanged until a separate integration.
+`Context::with_shared_state` also admits the disjoint ordinary state and the
+reserved shared object into one closure for bounded publication/copying. Neither
+reference can escape, and no host/context capability is passed to that closure.

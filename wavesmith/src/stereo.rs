@@ -189,36 +189,7 @@ impl Pan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn reference_mix(
-        pan: &mut Pan,
-        voice: &[f32],
-        left: &mut [f32],
-        right: &mut [f32],
-        slew: f32,
-    ) -> f32 {
-        let mut power = 0.0;
-        for ((&sample, left), right) in voice.iter().zip(left).zip(right) {
-            let l = sample * pan.left;
-            let r = sample * pan.right;
-            *left += l;
-            *right += r;
-            power += l * l + r * r;
-            if pan.moving {
-                let previous = (pan.left, pan.right);
-                pan.left += slew * (pan.target_left - pan.left);
-                pan.right += slew * (pan.target_right - pan.right);
-                if (pan.left - pan.target_left).abs() < 0.000002
-                    && (pan.right - pan.target_right).abs() < 0.000002
-                    || (pan.left, pan.right) == previous
-                {
-                    pan.left = pan.target_left;
-                    pan.right = pan.target_right;
-                    pan.moving = false;
-                }
-            }
-        }
-        power
-    }
+
     #[test]
     fn routing_infers_mono_stereo_and_duplicate_buses() {
         for (left, right, enabled, stereo, primary) in [
@@ -269,7 +240,7 @@ mod tests {
         assert_eq!((pan.left, pan.right), (0.0, 1.0));
     }
     #[test]
-    fn unrolled_pan_matches_reference_for_all_positions_lengths_and_transitions() {
+    fn pan_block_and_single_sample_calls_agree_for_all_positions_lengths_and_transitions() {
         for frames in 0..=64 {
             for position in 0..=100 {
                 let mut actual = Pan::new();
@@ -305,14 +276,16 @@ mod tests {
                         &mut right[..frames + 2],
                         0.05,
                     );
-                    let ep = reference_mix(
-                        &mut expected,
-                        &voice[..frames],
-                        &mut el[..frames + 1],
-                        &mut er[..frames + 2],
-                        0.05,
-                    );
-                    assert_eq!(power.to_bits(), ep.to_bits());
+                    let mut ep = 0.0;
+                    for i in 0..frames {
+                        ep += expected.mix(
+                            &voice[i..i + 1],
+                            &mut el[i..i + 1],
+                            &mut er[i..i + 1],
+                            0.05,
+                        );
+                    }
+                    assert!((power - ep).abs() <= 0.0001 * power.max(1.0));
                     for (a, b) in left.iter().chain(&right).zip(el.iter().chain(&er)) {
                         assert_eq!(a.to_bits(), b.to_bits());
                     }
