@@ -2845,12 +2845,23 @@ fn render_cycle_meter_averages_complete_windows_without_overflow() {
 fn cycle_overlay_covers_preserved_help_and_sums_chunks_across_counter_wrap() {
     for (voices, frames) in [(1, 24), (10, 24), (10, 64)] {
         let mut instance = Instance::with_voices(8, voices);
-        CYCLE_COUNTER.with(|counter| counter.set(u32::MAX - 50));
         let mut samples = std::vec![0.0; LAST_BUS * frames];
+        // Settle initial table publication, pitch and level so renderer attempts
+        // have deterministic counter-read counts during the measured window.
+        for _ in 0..512 {
+            instance.render(&mut samples);
+        }
+        unsafe { Callback::<Audio>::from_raw(instance.base) }
+            .state_mut()
+            .profiling
+            .render_cycles = RenderCycles::new();
+        CYCLE_COUNTER.with(|counter| counter.set(u32::MAX - 50));
         for _ in 0..256 {
             instance.render(&mut samples);
         }
-        let expected = frames.div_ceil(levels::CHUNK) as u32 * 100;
+        // Each chunk has one group-gate timestamp, two reads for each
+        // open renderer and mixer, and the final render timestamp.
+        let expected = frames.div_ceil(levels::CHUNK) as u32 * (2 + 4 * voices as u32) * 100;
         let context = unsafe { Callback::<ReadOnly>::from_raw(instance.base) };
         assert_eq!(context.state().profiling.render_cycles.average, expected);
         instance.draw();
@@ -2911,6 +2922,22 @@ fn profiling_stream_is_opt_in_usb_only_and_preserves_instance_identity() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].len(), telemetry::PACKET_LEN);
         assert_eq!(&messages[0][6..11], &[0, 0, 0, 0, 0]);
+        assert_eq!(messages[0][5], 6);
+        let decode = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .enumerate()
+                .fold(0u64, |value, (i, &byte)| value | ((byte as u64) << (7 * i)))
+        };
+        // Two chunks per 24-frame callback; every chunk visits the gate and
+        // mixer scope once for the default single CV voice.
+        assert_eq!(decode(&messages[0][179..184]), 4000);
+        let pan = 169 + telemetry::PAN_MIX * 25;
+        assert_eq!(decode(&messages[0][pan + 10..pan + 15]), 4000);
+        let open = 169 + telemetry::OPEN_PLAYBACK * 25;
+        assert!(decode(&messages[0][open + 10..open + 15]) > 0);
+        let scalar = 169 + telemetry::SCALAR_PLAYBACK * 25;
+        assert!(decode(&messages[0][scalar + 10..scalar + 15]) > 0);
     });
     for _ in 0..2000 {
         instance.render(&mut samples);

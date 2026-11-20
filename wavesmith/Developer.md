@@ -822,8 +822,11 @@ Use `--output path.csv` for named results, `--compare baseline.json` for a
 percentage comparison, `--instance 0` when several Wavesmith instances exist,
 and `--stop` to disable a stream after an interrupted monitor. Always stop and
 close the monitor before deploying with the existing push script. The monitor
-fails rather than comparing runs with different voice counts, modes, routing,
-sample rates or block sizes. It also reports missing telemetry sequence numbers.
+requires matching telemetry revisions, voice counts, modes, routing, sample
+rates and block sizes. It also reports missing telemetry sequence numbers.
+The CSV and JSON record the telemetry revision. For older baseline JSON files,
+the monitor infers the revision from version-specific counters when possible.
+Capture a fresh baseline if those counters do not identify the revision.
 
 Report payloads use non-commercial manufacturer ID `7D`, ASCII `WS`, protocol
 version `1`; base report type `1` has the fields below. All integer fields are little-endian base-128:
@@ -952,3 +955,22 @@ off the audio callback and that only completed results are published.
 `cfg(test)` retains test fixtures, inspection helpers, and work counters. Retired
 staged rebuilders, alternative oscillators, and superseded controller versions
 are not kept as test-only implementations; Git preserves those experiments.
+
+
+### Detailed rendering telemetry (profiling builds)
+
+WS telemetry revision 6 appends one-second cycle totals, invocation counts,
+minimum and maximum durations for five audio-owned scopes: shared MIDI group
+slope generation, `render_open_gate` attempts, `render_enveloped` attempts,
+fallback scalar playback (including gate application), and pan/mix accumulation.
+Open/enveloped counts include rejected fast-path attempts. Group timing covers
+one chunk; playback and mixing cover one voice/chunk. No per-sample timestamps
+are added. Envelope playback includes its integrated envelope multiplication.
+
+These are nested inside the existing rendering total, so do not add them to that
+total or to whole-step time. Additional counter reads and aggregation contribute
+to the parent timings; results locate costs and are not a directly comparable
+performance benchmark against the lighter profiling build. All new storage and
+code are excluded from normal builds. The monitor's `--allow-workload-changes`
+option accepts live note/routing/mode changes while keeping one instance and
+clock; voice counts are end-of-window snapshots rather than interval averages.

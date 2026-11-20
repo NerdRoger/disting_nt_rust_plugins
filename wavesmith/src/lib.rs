@@ -1426,6 +1426,11 @@ impl Plugin for Wavesmith {
                         }
                     }
                 }
+                #[cfg(feature = "profiling")]
+                state.profiling.telemetry.record_render(
+                    telemetry::GROUP_GATES,
+                    distingnt_api::api::cpu_cycle_count().wrapping_sub(render_start),
+                );
                 for (((data, &desired), &render), &on) in voice_data
                     .iter_mut()
                     .zip(&desired_groups)
@@ -1456,12 +1461,33 @@ impl Plugin for Wavesmith {
                     };
                     let fast_power = if gate_on && *gain == 1.0 {
                         if shared_gate_steady {
-                            oscillator
-                                .render_open_gate(&state.engine, memory, voice_mix)
-                                .then_some(length as f32)
+                            #[cfg(feature = "profiling")]
+                            let playback_start = distingnt_api::api::cpu_cycle_count();
+                            let rendered =
+                                oscillator.render_open_gate(&state.engine, memory, voice_mix);
+                            #[cfg(feature = "profiling")]
+                            state.profiling.telemetry.record_render(
+                                telemetry::OPEN_PLAYBACK,
+                                distingnt_api::api::cpu_cycle_count().wrapping_sub(playback_start),
+                            );
+                            rendered.then_some(length as f32)
                         } else {
                             gates.and_then(|gates| {
-                                oscillator.render_enveloped(&state.engine, memory, voice_mix, gates)
+                                #[cfg(feature = "profiling")]
+                                let playback_start = distingnt_api::api::cpu_cycle_count();
+                                let rendered = oscillator.render_enveloped(
+                                    &state.engine,
+                                    memory,
+                                    voice_mix,
+                                    gates,
+                                );
+                                #[cfg(feature = "profiling")]
+                                state.profiling.telemetry.record_render(
+                                    telemetry::ENVELOPED_PLAYBACK,
+                                    distingnt_api::api::cpu_cycle_count()
+                                        .wrapping_sub(playback_start),
+                                );
+                                rendered
                             })
                         }
                     } else {
@@ -1470,6 +1496,8 @@ impl Plugin for Wavesmith {
                     if let Some(power) = fast_power {
                         gate_power += power;
                     } else {
+                        #[cfg(feature = "profiling")]
+                        let playback_start = distingnt_api::api::cpu_cycle_count();
                         for (frame, sample) in voice_mix.iter_mut().enumerate() {
                             *gain = if gate_on {
                                 (*gain + gate_step).min(1.0)
@@ -1496,7 +1524,14 @@ impl Plugin for Wavesmith {
                                     chunk_index * levels::CHUNK + frame,
                                 );
                         }
+                        #[cfg(feature = "profiling")]
+                        state.profiling.telemetry.record_render(
+                            telemetry::SCALAR_PLAYBACK,
+                            distingnt_api::api::cpu_cycle_count().wrapping_sub(playback_start),
+                        );
                     }
+                    #[cfg(feature = "profiling")]
+                    let pan_start = distingnt_api::api::cpu_cycle_count();
                     if routing.stereo() || pan.moving() {
                         voice_power += pan.mix(voice_mix, mix, right_mix, state.pan_slew);
                     } else {
@@ -1505,6 +1540,11 @@ impl Plugin for Wavesmith {
                             voice_power += sample * sample;
                         }
                     }
+                    #[cfg(feature = "profiling")]
+                    state.profiling.telemetry.record_render(
+                        telemetry::PAN_MIX,
+                        distingnt_api::api::cpu_cycle_count().wrapping_sub(pan_start),
+                    );
                 }
                 #[cfg(feature = "profiling")]
                 let render_end = distingnt_api::api::cpu_cycle_count();

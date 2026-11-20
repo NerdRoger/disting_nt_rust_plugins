@@ -14,6 +14,7 @@ import sys
 import time
 
 IDENTIFIER = (0x7D, ord("W"), ord("S"), 1)
+PACKET_LENGTHS = {1: 53, 2: 103, 3: 113, 4: 158, 5: 168, 6: 293}
 FIELDS = ("instance", "sequence", "display_cycles", "total_cycles", "callbacks",
           "frames", "sample_rate", "block_frames", "voices", "midi", "stereo")
 WIDTHS = (5, 5, 5, 10, 5, 5, 5, 5, 1, 1, 1)
@@ -22,18 +23,22 @@ DRAW_FIELDS = ("draw_cycles_total", "draw_calls_total")
 UI_FIELDS = tuple(f"{kind}_{metric}" for kind in ("ui_idle", "ui_edit", "ui_setup")
                   for metric in ("cycles_total", "calls_total", "max_cycles"))
 LABEL_FIELDS = ("parameter_string_calls_total", "prefix_calls_total")
-CSV_FIELDS = FIELDS + STAGE_FIELDS + DRAW_FIELDS + UI_FIELDS + LABEL_FIELDS
+RENDER_KINDS = ("group_gates", "open_playback", "enveloped_playback", "scalar_playback", "pan_mix")
+RENDER_FIELDS = tuple(f"render_{kind}_{metric}" for kind in RENDER_KINDS
+                      for metric in ("cycles", "calls", "min", "max"))
+CSV_FIELDS = FIELDS + STAGE_FIELDS + DRAW_FIELDS + UI_FIELDS + LABEL_FIELDS + RENDER_FIELDS + ("telemetry_revision",)
 WORKLOAD = ("instance", "sample_rate", "block_frames", "voices", "midi", "stereo")
 
 
 def decode(data):
     """mido SysEx data excludes F0 and F7; ignore unrelated vendor messages."""
     data = tuple(data)
-    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in (1, 2, 3, 4, 5):
+    if data[:4] != IDENTIFIER or len(data) < 5 or data[4] not in PACKET_LENGTHS:
         return None
-    if len(data) != ({1: 53, 2: 103, 3: 113, 4: 158, 5: 168}[data[4]]) or any(not 0 <= byte < 128 for byte in data):
+    revision = data[4]
+    if len(data) != PACKET_LENGTHS[revision] or any(not 0 <= byte < 128 for byte in data):
         raise ValueError("Malformed Wavesmith telemetry")
-    result, offset = {}, 5
+    result, offset = {"telemetry_revision": revision}, 5
     for field, width in zip(FIELDS, WIDTHS):
         result[field] = sum(byte << (7 * i) for i, byte in enumerate(data[offset:offset + width]))
         offset += width
@@ -45,35 +50,50 @@ def decode(data):
             or not result["block_frames"] or result["voices"] > 24
             or result["midi"] > 1 or result["stereo"] > 1):
         raise ValueError("Invalid profiling window or workload")
-    if data[4] >= 2:
+    if revision >= 2:
         for field in STAGE_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+10]))
             offset += 10
     if any(result.get(field, 0) > 0xFFFFFFFFFFFFFFFF for field in STAGE_FIELDS):
         raise ValueError("Stage counter overflow")
-    if data[4] >= 3:
+    if revision >= 3:
         for field in DRAW_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
             offset += 5
-    if data[4] >= 4:
+    if revision >= 4:
         for field in UI_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
             offset += 5
-    if data[4] == 5:
+    if revision >= 5:
         for field in LABEL_FIELDS:
             result[field] = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+5]))
             offset += 5
+    if revision >= 6:
+        for kind in RENDER_KINDS:
+            values = []
+            for metric, width in zip(("cycles", "calls", "min", "max"), (10, 5, 5, 5)):
+                value = sum(byte << (7*i) for i, byte in enumerate(data[offset:offset+width]))
+                if value > (0xffffffffffffffff if metric == "cycles" else 0xffffffff):
+                    raise ValueError("Render counter overflow")
+                result[f"render_{kind}_{metric}"] = value
+                values.append(value)
+                offset += width
+            cycles, calls, minimum, maximum = values
+            if (not calls and (cycles or minimum or maximum)) or minimum > maximum or not minimum*calls <= cycles <= maximum*calls:
+                raise ValueError("Invalid render profiling counters")
     result["cycles_per_callback"] = result["total_cycles"] / result["callbacks"]
     return result
 
 
-def summarize(rows, label):
+def summarize(rows, label, allow_workload_changes=False):
     if not rows:
         raise ValueError("No Wavesmith telemetry received")
-    if any(("callback_cycles" in row) != ("callback_cycles" in rows[0]) for row in rows):
-        raise ValueError("Mixed telemetry versions")
+    revision = rows[0]["telemetry_revision"]
+    if any(row["telemetry_revision"] != revision for row in rows):
+        raise ValueError("Mixed telemetry revisions")
     workload = {key: rows[0][key] for key in WORKLOAD}
-    if any(any(row[key] != value for key, value in workload.items()) for row in rows):
+    fixed = ("instance", "sample_rate", "block_frames") if allow_workload_changes else WORKLOAD
+    if any(any(row[key] != workload[key] for key in fixed) for row in rows):
         raise ValueError("Workload changed during measurement")
     values = [row["cycles_per_callback"] for row in rows]
     missed = 0
@@ -82,13 +102,24 @@ def summarize(rows, label):
         if delta == 0 or delta > 1000:
             raise ValueError("Duplicate/restarted telemetry stream")
         missed += delta - 1
-    summary = dict(label=label, reports=len(rows), missed_reports=missed, workload=workload,
+    summary = dict(label=label, telemetry_revision=revision, reports=len(rows), missed_reports=missed, workload=workload,
                 mean_cycles_per_callback=sum(row["total_cycles"] for row in rows) / sum(row["callbacks"] for row in rows),
                 median_cycles_per_callback=statistics.median(values),
                 min_cycles_per_callback=min(values), max_cycles_per_callback=max(values),
                 stdev_cycles_per_callback=statistics.stdev(values) if len(values) > 1 else 0.0,
                 standard_error=statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else 0.0)
 
+    summary["device_seconds"] = sum(row["frames"] / row["sample_rate"] for row in rows)
+    summary["mixed_workload"] = allow_workload_changes
+    if allow_workload_changes:
+        summary["workload"] = {key: workload[key] for key in fixed}
+        summary["end_of_window_workload_snapshots"] = [
+            {key: row[key] for key in ("sequence", "voices", "midi", "stereo")} for row in rows
+        ]
+        summary["workload_note"] = (
+            "Voice count, MIDI mode and stereo are end-of-window snapshots; "
+            "cycle totals cover the complete window and cannot be attributed to that snapshot alone."
+        )
     for field in STAGE_FIELDS:
         if field in rows[0]:
             if any(field not in row for row in rows):
@@ -96,6 +127,20 @@ def summarize(rows, label):
             values = [row[field]/row["callbacks"] for row in rows]
             summary["mean_"+field] = sum(row[field] for row in rows)/sum(row["callbacks"] for row in rows)
             summary["stderr_"+field] = statistics.stdev(values)/math.sqrt(len(values)) if len(values)>1 else 0.0
+    if "render_group_gates_cycles" in rows[0]:
+        summary["render_breakdown"] = {}
+        for kind in RENDER_KINDS:
+            name = "render_" + kind
+            cycles = sum(row[name+"_cycles"] for row in rows)
+            calls = sum(row[name+"_calls"] for row in rows)
+            minima = [row[name+"_min"] for row in rows if row[name+"_calls"]]
+            summary["render_breakdown"][kind] = dict(
+                total_cycles=cycles, calls=calls, device_seconds=summary["device_seconds"],
+                calls_per_second=calls/summary["device_seconds"],
+                mean_cycles_per_call=cycles/calls if calls else None,
+                min_cycles=min(minima) if minima else 0,
+                max_cycles=max(row[name+"_max"] for row in rows),
+                mean_cycles_per_callback=cycles/sum(row["callbacks"] for row in rows))
     if "draw_calls_total" in rows[0] and len(rows) > 1:
         cycles = sum((b["draw_cycles_total"]-a["draw_cycles_total"]) & 0xffffffff for a,b in zip(rows,rows[1:]))
         calls = sum((b["draw_calls_total"]-a["draw_calls_total"]) & 0xffffffff for a,b in zip(rows,rows[1:]))
@@ -118,6 +163,35 @@ def summarize(rows, label):
             summary[name+"_per_second"] = calls/seconds
             summary[name+"_at_first_report"] = rows[0][field]
     return summary
+
+
+def baseline_revision(baseline):
+    if isinstance(baseline, dict):
+        if "telemetry_revision" in baseline:
+            revision = baseline["telemetry_revision"]
+            if type(revision) is int and revision in PACKET_LENGTHS:
+                return revision
+        elif "render_breakdown" in baseline:
+            return 6
+        elif "mean_cycles_per_callback" in baseline:
+            if "mean_callback_cycles" not in baseline:
+                return 1
+            # Legacy summaries only include cumulative counters after two reports.
+            if isinstance(baseline.get("reports"), int) and baseline["reports"] > 1:
+                if "parameter_string_calls_at_first_report" in baseline:
+                    return 5
+                if "ui_idle_calls" in baseline:
+                    return 4
+                if "draw_calls" in baseline:
+                    return 3
+                return 2
+    raise ValueError("Cannot identify the baseline telemetry revision. Capture a fresh baseline.")
+
+
+def check_comparison_revision(current, baseline):
+    if current != baseline:
+        raise ValueError(f"Cannot compare telemetry revision {current} with baseline revision {baseline}. "
+                         "Capture both runs with the same profiling revision.")
 
 
 def choose_port(names, requested):
@@ -143,12 +217,16 @@ def main(argv=None):
     parser.add_argument("--expect-voices", type=int)
     parser.add_argument("--expect-mode", choices=["cv", "midi"])
     parser.add_argument("--expect-stereo", action="store_true")
-    parser.add_argument("--compare", type=Path)
+    parser.add_argument("--compare", type=Path, help="Compare against a baseline from the same telemetry revision")
+    parser.add_argument("--allow-workload-changes", action="store_true",
+                        help="Allow changing notes, MIDI/CV mode and routing; retain one instance and clock")
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--stop", action="store_true", help="Disable diagnostic streaming and close the output port")
     args = parser.parse_args(argv)
     if args.seconds <= 0 or args.warmup < 0:
         parser.error("seconds must be positive and warmup nonnegative")
+    if args.allow_workload_changes and (args.compare or args.expect_voices is not None or args.expect_mode or args.expect_stereo):
+        parser.error("Mixed-workload capture cannot be used with comparisons or fixed-workload expectations")
     import mido
     if args.list_ports:
         print(json.dumps(dict(inputs=mido.get_input_names(), outputs=mido.get_output_names()), indent=2))
@@ -160,12 +238,14 @@ def main(argv=None):
             output.send(command(0x11))
             time.sleep(0.1)
         return 0
+    baseline = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
+    comparison_revision = baseline_revision(baseline) if args.compare else None
     input_name = choose_port(mido.get_input_names(), args.input)
     path = args.output or Path(__file__).resolve().parents[2] / "target" / "wavesmith-profiling" / (time.strftime("%Y%m%d-%H%M%S") + ".csv")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.with_suffix(".json").exists():
         raise ValueError(f"Refusing to overwrite existing results: {path}")
-    rows, workload = [], None
+    rows, workload, revision = [], None, None
     print(f"Listening on {input_name}; warmup {args.warmup:g}s, measurement {args.seconds:g}s", flush=True)
     with mido.open_output(output_name) as output, mido.open_input(input_name) as input_port, path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=["elapsed_seconds"] + list(CSV_FIELDS) + ["cycles_per_callback"])
@@ -185,6 +265,9 @@ def main(argv=None):
                         continue
                     current = {key: row[key] for key in WORKLOAD}
                     if workload is None:
+                        revision = row["telemetry_revision"]
+                        if comparison_revision is not None:
+                            check_comparison_revision(revision, comparison_revision)
                         workload = current
                         if args.expect_voices is not None and row["voices"] != args.expect_voices:
                             raise ValueError(f"Expected {args.expect_voices} sounding voices, received {row['voices']}")
@@ -193,7 +276,11 @@ def main(argv=None):
                         if args.expect_stereo and not row["stereo"]:
                             raise ValueError("Expected stereo routing")
                         print(f"Workload: {workload}", flush=True)
-                    elif current != workload:
+                    elif row["telemetry_revision"] != revision:
+                        raise ValueError("Mixed telemetry revisions")
+                    elif any(current[key] != workload[key] for key in (
+                        ("instance", "sample_rate", "block_frames") if args.allow_workload_changes else WORKLOAD
+                    )):
                         raise ValueError("Workload changed or multiple Wavesmith instances are streaming; use --instance")
                     last_report = now
                     # Discard the first partial second after warmup as well.
@@ -215,11 +302,10 @@ def main(argv=None):
             time.sleep(0.1)
     if len(rows) < max(1, int(args.seconds * 0.9)):
         raise RuntimeError(f"Incomplete measurement: {len(rows)} reports; raw data retained at {path}")
-    summary = summarize(rows, args.label)
+    summary = summarize(rows, args.label, args.allow_workload_changes)
     summary["requested_seconds"] = args.seconds
     if args.compare:
-        baseline = json.loads(args.compare.read_text(encoding="utf-8"))
-        if baseline["workload"] != summary["workload"]:
+        if baseline.get("mixed_workload") or baseline["workload"] != summary["workload"]:
             raise ValueError("Cannot compare different workloads")
         summary["baseline"] = str(args.compare)
         summary["change_percent"] = 100 * (summary["mean_cycles_per_callback"] / baseline["mean_cycles_per_callback"] - 1)
