@@ -3,7 +3,6 @@
 mod extra_models;
 #[path = "spectral.rs"]
 mod spectral;
-pub(crate) use spectral::spectral_workspace_frames;
 
 use core::f32::consts::{LOG2_E, PI, TAU};
 use distingnt_api::api::math::exp2;
@@ -12,7 +11,7 @@ use crate::lookup::{self, Lookup};
 use crate::profile::{GrainTiming, RenderTiming};
 use crate::{
     layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
-    PITCH_CLICK_MAX_DECAY_TENTHS_MS, SPECTRAL_WORK_SLOT,
+    PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
 #[cfg(feature = "profiling")]
 use distingnt_api::api::cpu_cycle_count;
@@ -129,9 +128,7 @@ pub fn render(
                     Model::DelayDrum => buffers.with(slot + 1, |layer_cache| {
                         extra_models::delay_drum(patch, rate, waveform, layer_cache, tables)
                     })??,
-                    Model::SpectralPulse => buffers.with(SPECTRAL_WORK_SLOT, |workspace| {
-                        spectral::spectral_pulse(patch, rate, waveform, workspace, tables)
-                    })??,
+                    Model::SpectralPulse => spectral::spectral_pulse(patch, rate, waveform, tables),
                 }
                 #[cfg(feature = "profiling")]
                 {

@@ -41,7 +41,6 @@ use playback::Player;
 
 const MAX_LAYERS: usize = 4;
 const BUFFERS: usize = 6;
-const SPECTRAL_WORK_SLOT: usize = BUFFERS;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
@@ -450,12 +449,12 @@ struct State {
 
 struct KickLab;
 static TABLE_DRAM: SharedStaticDram<KickLab> = SharedStaticDram::new();
-type WaveBuffers = DramBuffers<f32, { BUFFERS + 1 + 2 * MAX_LAYERS }>;
+type WaveBuffers = DramBuffers<f32, { BUFFERS + 2 * MAX_LAYERS }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
 
 fn layer_slot(layer: usize) -> usize {
-    BUFFERS + 1 + 2 * layer
+    BUFFERS + 2 * layer
 }
 
 fn layer_count(specs: &[i32]) -> Option<usize> {
@@ -789,9 +788,7 @@ impl Plugin for KickLab {
     }
 
     fn dram_buffer_len_at(specs: &[i32], rate: u32, slot: usize) -> usize {
-        if slot == SPECTRAL_WORK_SLOT {
-            render::spectral_workspace_frames(rate)
-        } else if slot >= layer_slot(0) && (slot - layer_slot(0)) % 2 == 1 {
+        if slot >= layer_slot(0) && (slot - layer_slot(0)) % 2 == 1 {
             render::layer_cache_frames(rate)
         } else {
             Self::dram_buffer_len(specs, rate)

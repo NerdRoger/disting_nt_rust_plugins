@@ -186,8 +186,7 @@ impl Host {
         assert_eq!(
             req.dram as usize,
             ((BUFFERS + layers as usize) * render::max_frames(48_000)
-                + layers as usize * render::layer_cache_frames(48_000)
-                + render::spectral_workspace_frames(48_000))
+                + layers as usize * render::layer_cache_frames(48_000))
                 * 4
         );
         let mut sram = vec![0; (req.sram as usize).div_ceil(8)];
