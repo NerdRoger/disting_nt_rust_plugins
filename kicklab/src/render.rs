@@ -383,18 +383,16 @@ fn render_layer(
     let shape = LayerShape::new(drive, rate, waveform.len(), tables);
     // Allow for the full 0.7 ms attack and round up the release span.
     let onset = milliseconds(rate, 1);
-    let steady = waveform
+    let steady_end = waveform
         .len()
-        .saturating_sub(onset + milliseconds(rate, RELEASE_FADE_MS) + 1);
-    let mut samples = waveform.iter_mut().enumerate();
-    for (frame, sample) in samples.by_ref().take(onset) {
-        *sample = shape.sample(frame, synth(frame));
-    }
-    for (frame, sample) in samples.by_ref().take(steady) {
-        *sample = shape.drive(synth(frame));
-    }
-    for (frame, sample) in samples {
-        *sample = shape.sample(frame, synth(frame));
+        .saturating_sub(milliseconds(rate, RELEASE_FADE_MS) + 1);
+    for (frame, sample) in waveform.iter_mut().enumerate() {
+        let raw = synth(frame);
+        *sample = if frame >= onset && frame < steady_end {
+            shape.drive(raw)
+        } else {
+            shape.sample(frame, raw)
+        };
     }
 }
 
