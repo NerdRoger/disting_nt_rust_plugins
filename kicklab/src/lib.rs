@@ -55,7 +55,13 @@ const MIX_START: usize = RANDOMIZE_START + MAX_LAYERS;
 const LAYER_PAGE_FIELDS: usize = LAYER_FIELDS + 3;
 const LAYER_NAMES: [&CStr; MAX_LAYERS] = [c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4"];
 const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [b"L1: ", b"L2: ", b"L3: ", b"L4: "];
-const MODEL_NAMES: [&CStr; 4] = [c"Off", c"Pitch Sweep", c"Modal Drum", c"Bit Logic"];
+const MODEL_NAMES: [&CStr; 5] = [
+    c"Off",
+    c"Pitch Sweep",
+    c"Modal Drum",
+    c"Bit Logic",
+    c"Grain Cloud",
+];
 static OPERATIONS: EnumStrings<4> = EnumStrings::new([c"XOR", c"AND", c"OR", c"Wrap Add"]);
 static OFF_ON: EnumStrings<2> = EnumStrings::new([c"Off", c"On"]);
 
@@ -65,6 +71,7 @@ enum Model {
     PitchSweep,
     ModalDrum,
     BitLogic,
+    GrainCloud,
 }
 
 impl Model {
@@ -73,6 +80,7 @@ impl Model {
             1 => Self::PitchSweep,
             2 => Self::ModalDrum,
             3 => Self::BitLogic,
+            4 => Self::GrainCloud,
             _ => Self::Off,
         }
     }
@@ -83,6 +91,7 @@ impl Model {
             Self::PitchSweep => &PITCH_SWEEP,
             Self::ModalDrum => &MODAL_DRUM,
             Self::BitLogic => &BIT_LOGIC,
+            Self::GrainCloud => &GRAIN_CLOUD,
         }
     }
 }
@@ -202,6 +211,26 @@ const BIT_LOGIC: [Control; 10] = [
     Control::new(c"Ramp Bits", 3, 12, 5, UNIT_NONE, SCALING_NONE),
     Control::new(c"Logic Operation", 0, 3, 0, UNIT_ENUM, SCALING_NONE),
     Control::new(c"Tone Cutoff", 160, 8500, 1600, UNIT_HZ, SCALING_NONE),
+];
+const GRAIN_SIZE_MAX_MS: i16 = 100;
+const GRAIN_CLOUD: [Control; 10] = [
+    tune(c"Tail Tune", 550),
+    decay(470),
+    depth(20),
+    time(70),
+    Control::new(
+        c"Grain Size",
+        5,
+        GRAIN_SIZE_MAX_MS,
+        29,
+        UNIT_MS,
+        SCALING_NONE,
+    ),
+    Control::new(c"Grain Rate", 18, 220, 107, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Density Envelope", -30, 30, 0, UNIT_NONE, SCALING_10),
+    Control::new(c"Pitch Spread", 0, 240, 48, UNIT_SEMITONES, SCALING_10),
+    percent(c"Timing Jitter", 35),
+    drive(40),
 ];
 const UNUSED: Definition = definition(c"Unused", 0, 0, 0, UNIT_NONE, SCALING_NONE);
 const LEVEL: Control = percent(c"Level", 100);
@@ -750,7 +779,14 @@ impl Plugin for KickLab {
             let default_model = if layer == 0 { 1 } else { 0 };
             metadata.set_parameter(
                 base,
-                definition(c"Model", 0, 3, default_model, UNIT_CONFIRM, SCALING_NONE),
+                definition(
+                    c"Model",
+                    0,
+                    (MODEL_NAMES.len() - 1) as i16,
+                    default_model,
+                    UNIT_CONFIRM,
+                    SCALING_NONE,
+                ),
             )?;
             metadata.set_parameter(base + 1, LEVEL.definition()?)?;
             let controls = Model::from_value(default_model).controls();

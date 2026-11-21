@@ -542,11 +542,58 @@ fn switching_models_reuses_the_layer_cache_and_regenerates_its_contents() {
     host.complete();
     assert_ne!(host.sample(layer_slot(0), 761), pitch[761]);
 
+    host.set(model, 4);
+    host.step([0.0; 4]);
+    host.complete();
+    assert_ne!(host.sample(layer_slot(0), 761), pitch[761]);
+
     host.set(model, 1);
     host.step([0.0; 4]);
     host.complete();
     for (frame, original) in pitch.into_iter().enumerate() {
         assert_eq!(host.sample(layer_slot(0), frame), original);
+    }
+}
+
+#[test]
+fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
+    let mut host = Host::uninitialized(4);
+    let layer = 3;
+    let model = model_index(layer);
+    let first_control = model + 2;
+    let density_envelope = first_control + 6;
+    assert_eq!(unsafe { (*(*host.base).parameters.add(model)).max }, 4);
+    host.values[model] = 4;
+    host.values[density_envelope] = -25;
+    host.notify(model);
+    assert_eq!(host.values[density_envelope], -25);
+    let mut name = [0; PARAMETER_STRING_SIZE];
+    unsafe {
+        factory().parameter_string.unwrap()(host.base, model as i32, 4, name.as_mut_ptr());
+    }
+    assert_eq!(unsafe { CStr::from_ptr(name.as_ptr()) }, c"Grain Cloud");
+    let (group, _, indices) = host.page(layer + 1);
+    assert_eq!(group, 1);
+    assert_eq!(
+        indices,
+        [model, model + 1, solo_index(layer), solo_index(layer) + 1]
+            .into_iter()
+            .chain(first_control..first_control + GRAIN_CLOUD.len())
+            .chain([RANDOMIZE_START + layer])
+            .map(|index| index as u8)
+            .collect::<Vec<_>>()
+    );
+    for (offset, control) in GRAIN_CLOUD.iter().enumerate() {
+        let parameter = unsafe { *(*host.base).parameters.add(first_control + offset) };
+        assert_eq!(unsafe { CStr::from_ptr(parameter.name) }, control.name);
+        assert_eq!([parameter.min, parameter.max], control.range);
+    }
+
+    host.set(model, 0);
+    assert_eq!(host.page(layer + 1), (1, 1, vec![model as u8]));
+    host.set(model, 4);
+    for (offset, control) in GRAIN_CLOUD.iter().enumerate() {
+        assert_eq!(host.values[first_control + offset], control.initial);
     }
 }
 

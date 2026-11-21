@@ -5,7 +5,8 @@ use distingnt_api::api::math::exp2;
 use crate::lookup::{self, Lookup};
 use crate::profile::RenderTiming;
 use crate::{
-    layer_slot, Job, LayerPatch, Model, WaveBuffers, MAX_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
+    layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
+    PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
 #[cfg(feature = "profiling")]
 use distingnt_api::api::cpu_cycle_count;
@@ -28,7 +29,8 @@ fn max_click_frames(rate: u32) -> usize {
 pub fn layer_cache_frames(rate: u32) -> usize {
     // Each model can use this space for its own caches. Reserve enough for
     // the largest layout so layers can switch models without reallocating.
-    2 * max_click_frames(rate).max(max_beater_frames(rate))
+    (2 * max_click_frames(rate).max(max_beater_frames(rate)))
+        .max(milliseconds(rate, GRAIN_SIZE_MAX_MS as usize))
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +44,7 @@ enum TransientShape {
     Empty,
     PitchSweep { tone: f32, decay: f32 },
     ModalDrum { hardness: f32 },
+    GrainCloud { size_ms: f32 },
 }
 
 impl CachedLayer {
@@ -101,6 +104,9 @@ pub fn render(
                         modal_drum(patch, cached, rate, waveform, layer_cache, tables)
                     })??,
                     Model::BitLogic => bit_logic(patch, rate, waveform, tables),
+                    Model::GrainCloud => buffers.with(slot + 1, |layer_cache| {
+                        grain_cloud(patch, cached, rate, waveform, layer_cache, tables)
+                    })??,
                 }
                 #[cfg(feature = "profiling")]
                 {
@@ -274,10 +280,19 @@ struct NoiseBand {
     high_coefficient: f32,
 }
 
+const NOISE_SEED: u32 = 0x56d62e11;
+
+fn next_noise_bits(seed: &mut u32) -> u32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    *seed
+}
+
 impl NoiseBand {
     fn new(low: f32, high: f32, rate: u32) -> Self {
         Self {
-            seed: 0x56d62e11,
+            seed: NOISE_SEED,
             low: 0.0,
             high: 0.0,
             low_coefficient: filter_coefficient(low, rate),
@@ -286,10 +301,7 @@ impl NoiseBand {
     }
 
     fn next(&mut self) -> f32 {
-        self.seed ^= self.seed << 13;
-        self.seed ^= self.seed >> 17;
-        self.seed ^= self.seed << 5;
-        let sample = self.seed as f32 / 2147483648.0 - 1.0;
+        let sample = next_noise_bits(&mut self.seed) as f32 / 2147483648.0 - 1.0;
         self.low += self.low_coefficient * (sample - self.low);
         self.high += self.high_coefficient * (sample - self.high);
         2.0 * (self.high - self.low)
@@ -860,6 +872,104 @@ fn render_modal_body<const N: usize>(
     Some(())
 }
 
+fn grain_schedule(layer: &LayerPatch, rate: u32) -> impl Iterator<Item = (usize, f32, f32)> {
+    let [tune, _, sweep, sweep_time, _, density, density_depth, spread, jitter, _] = layer.controls;
+    let sweep_decay = decay_rate(sweep_time, rate);
+    let rate_hz = f64::from(rate);
+    let mut next_time = 0.0f64;
+    let mut seed = NOISE_SEED;
+    let mut random = move || f64::from(next_noise_bits(&mut seed)) / 2147483648.0 - 1.0;
+    core::iter::from_fn(move || {
+        let frame = (next_time * rate_hz) as usize;
+        let frame = frame + usize::from((frame as f64 / rate_hz) < next_time);
+        let sweep_level = exp2(frame as f32 * sweep_decay);
+        let detune = random() as f32 * spread / 12.0;
+        let frequency = tune * exp2(sweep / 12.0 * sweep_level) * exp2(detune);
+        // The source phase is signed. Offset by one turn before calling sine.
+        let phase = 1.0 + random() as f32 * spread / 48.0;
+        let grain_rate = (density * exp2(density_depth * sweep_level))
+            .max(6.0)
+            .min(350.0);
+        let spacing = (1.0 + 0.4 * random() * f64::from(jitter) / 100.0) / f64::from(grain_rate);
+        // Preserve the fractional launch time. Rounding each gap would
+        // drift away from the web schedule over the course of the cloud.
+        next_time += spacing;
+        Some((frame, frequency / rate as f32, phase))
+    })
+}
+
+fn accumulate_grain(samples: &mut [f32], window: &[f32], step: f32, phase: f32) {
+    const ANCHOR: usize = 256;
+    let sin_step = sine(step);
+    let half_sine = sine(0.5 * step);
+    let cos_step = 1.0 - 2.0 * half_sine * half_sine;
+    for (span, (out, window)) in samples
+        .chunks_mut(ANCHOR)
+        .zip(window.chunks(ANCHOR))
+        .enumerate()
+    {
+        let phase = phase + (span * ANCHOR) as f32 * step;
+        let (mut sin, mut cos) = (sine(phase), sine(phase + 0.25));
+        for (out, &weight) in out.iter_mut().zip(window) {
+            *out += weight * sin;
+            (sin, cos) = (
+                sin * cos_step + cos * sin_step,
+                cos * cos_step - sin * sin_step,
+            );
+        }
+    }
+}
+
+fn grain_cloud(
+    layer: &LayerPatch,
+    cached: &mut CachedLayer,
+    rate: u32,
+    waveform: &mut [f32],
+    layer_cache: &mut [f32],
+    tables: Option<Lookup<'_>>,
+) -> Option<()> {
+    let [_, decay, _, _, size_ms, density, _, _, _, drive] = layer.controls;
+    let window = layer_cache.get_mut(..milliseconds(rate, size_ms as usize))?;
+    let grain_shape = TransientShape::GrainCloud { size_ms };
+    if cached.transient_shape != grain_shape {
+        let half_turn_per_frame = 500.0 / (rate as f32 * size_ms);
+        for (frame, weight) in window.iter_mut().enumerate() {
+            // sin(pi * progress)^2 is the Hann window.
+            let height = sine(frame as f32 * half_turn_per_frame);
+            *weight = height * height;
+        }
+        cached.transient_shape = grain_shape;
+    }
+    waveform.fill(0.0);
+    for (start, step, phase) in grain_schedule(layer, rate) {
+        let Some(samples) = waveform.get_mut(start..) else {
+            break;
+        };
+        if samples.is_empty() {
+            break;
+        }
+        accumulate_grain(samples, window, step, phase);
+    }
+
+    let mut envelope = DecayEnvelope::new(decay_rate(decay, rate));
+    let normalization = positive_pow((density * size_ms / 2000.0).max(1.0), -0.5);
+    let shape = LayerShape::new(drive, rate, waveform.len(), tables);
+    // The first grain's window supplies the attack in the original voice.
+    let steady = waveform
+        .len()
+        .saturating_sub(milliseconds(rate, RELEASE_FADE_MS) + 1);
+    let (body, release) = waveform.split_at_mut_checked(steady)?;
+    for (frame, sample) in body.iter_mut().enumerate() {
+        *sample = shape.drive(*sample * normalization * envelope.next::<256>(frame));
+    }
+    for (offset, sample) in release.iter_mut().enumerate() {
+        let frame = steady + offset;
+        let gain = ((shape.last - frame) as f32 * shape.fade).min(1.0);
+        *sample = shape.drive(*sample * normalization * envelope.next::<256>(frame)) * gain;
+    }
+    Some(())
+}
+
 fn bit_logic(layer: &LayerPatch, rate: u32, waveform: &mut [f32], tables: Option<Lookup<'_>>) {
     let [tune, decay, _, sweep, sweep_time, ratio, clock_hz, bits, operation, tone] =
         layer.controls;
@@ -910,6 +1020,115 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec;
+
+    #[test]
+    fn grain_cloud_matches_web_onsets_and_waveform_samples() {
+        // Generated by KickLab.html at 48 kHz, with the NT's one-second cap.
+        let fixtures = [
+            (
+                crate::GRAIN_CLOUD.map(|control| control.decode(control.initial)),
+                34_080,
+                76,
+                [
+                    0, 469, 920, 1405, 1832, 2222, 2700, 3099, 3501, 3994, 4485, 4943,
+                ],
+                [
+                    (1, 3.95997e-7),
+                    (239, 0.19716132),
+                    (463, 0.5914804),
+                    (1848, -0.8208714),
+                    (11_360, 0.05108446),
+                    (33_959, -0.00011483123),
+                ],
+            ),
+            (
+                [
+                    120.0, 1000.0, 60.0, 200.0, 100.0, 220.0, 3.0, 24.0, 100.0, 0.0,
+                ],
+                48_000,
+                236,
+                [0, 155, 294, 464, 582, 668, 830, 924, 1021, 1196, 1371, 1516],
+                [
+                    (1, 1.2202182e-7),
+                    (239, 0.0006868352),
+                    (463, -0.028539622),
+                    (1848, 0.05120612),
+                    (16_000, -0.0783687),
+                    (47_879, 0.004344283),
+                ],
+            ),
+        ];
+        let rate = 48_000;
+        let mut table_memory = [0.0; lookup::BYTES as usize / 4];
+        let tables = Some(lookup::test_tables(&mut table_memory));
+        for (controls, frames, grains, onsets, samples) in fixtures {
+            let patch = LayerPatch {
+                model: Model::GrainCloud,
+                controls,
+            };
+            let scheduled: std::vec::Vec<_> = grain_schedule(&patch, rate)
+                .map(|(start, _, _)| start)
+                .take_while(|&start| start < frames)
+                .collect();
+            assert_eq!(&scheduled[..onsets.len()], onsets);
+            assert_eq!(scheduled.len(), grains);
+            let mut waveform = vec![0.0; frames];
+            let mut cached = CachedLayer::EMPTY;
+            let mut buffer = vec![0.0; layer_cache_frames(rate)];
+            grain_cloud(
+                &patch,
+                &mut cached,
+                rate,
+                &mut waveform,
+                &mut buffer,
+                tables,
+            )
+            .unwrap();
+            for (frame, expected) in samples {
+                let error = (waveform[frame] - expected).abs();
+                assert!(
+                    error < 0.0002,
+                    "frame {frame}: sample {}, expected {expected}",
+                    waveform[frame]
+                );
+            }
+            assert_eq!(waveform[0], 0.0);
+            assert!(waveform[1].abs() > 0.0); // No additional attack ramp.
+            assert_eq!(waveform[frames - 1], 0.0);
+        }
+    }
+
+    #[test]
+    fn grain_cloud_window_cache_matches_cold_renders_at_supported_rates() {
+        let mut patch = LayerPatch {
+            model: Model::GrainCloud,
+            controls: crate::GRAIN_CLOUD.map(|control| control.decode(control.initial)),
+        };
+        for rate in [32_000, 44_100, 48_000, 96_000, 192_000] {
+            let mut cached = CachedLayer::EMPTY;
+            let mut buffer = vec![0.0; layer_cache_frames(rate)];
+            let mut fresh_buffer = buffer.clone();
+            let mut waveform = vec![f32::NAN; rate as usize / 10];
+            let mut fresh_waveform = waveform.clone();
+            for (size, density) in [(100.0, 220.0), (100.0, 18.0), (5.0, 105.0)] {
+                patch.controls[4] = size;
+                patch.controls[5] = density;
+                let mut fresh = CachedLayer::EMPTY;
+                grain_cloud(
+                    &patch,
+                    &mut fresh,
+                    rate,
+                    &mut fresh_waveform,
+                    &mut fresh_buffer,
+                    None,
+                )
+                .unwrap();
+                grain_cloud(&patch, &mut cached, rate, &mut waveform, &mut buffer, None).unwrap();
+                assert_eq!(waveform, fresh_waveform);
+                assert!(waveform.iter().all(|sample| sample.is_finite()));
+            }
+        }
+    }
 
     #[test]
     fn optimized_bit_logic_preserves_waveform() {
