@@ -89,9 +89,9 @@ pub fn render(
             .min(samples.len());
         let mix = samples.get_mut(..end)?;
         let overlap = length.min(end);
-        // Playback uses only slots below BUFFERS. The cache holds post-drive,
+        // Layer caches start after the output pool. The cache holds post-drive,
         // pre-level samples; the sample rate is fixed for this instance.
-        let slot = layer_slot(index);
+        let slot = layer_slot(usize::from(job.output_buffers), index);
         buffers.with(slot, |cache| {
             let waveform = cache.get_mut(..end)?;
             if cached.patch != *patch {

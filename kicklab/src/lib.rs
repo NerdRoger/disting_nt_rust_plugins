@@ -40,7 +40,9 @@ use distingnt_api::{
 use playback::Player;
 
 const MAX_LAYERS: usize = 4;
-const BUFFERS: usize = 6;
+const MIN_OUTPUT_BUFFERS: usize = 2;
+const DEFAULT_OUTPUT_BUFFERS: usize = 6;
+const MAX_OUTPUT_BUFFERS: usize = 10;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
@@ -392,6 +394,7 @@ struct Job {
     rate: u32,
     gain: f32,
     cutoff: i16,
+    output_buffers: u8,
 }
 impl Job {
     const EMPTY: Self = Self {
@@ -399,6 +402,7 @@ impl Job {
         rate: 0,
         gain: 0.0,
         cutoff: 0,
+        output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
     };
 
     fn initialize(destination: &mut RegionInitializer<'_, Self>) {
@@ -407,7 +411,8 @@ impl Job {
             Job {
                 rate: 0,
                 gain: 0.0,
-                cutoff: 0
+                cutoff: 0,
+                output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
             },
             arrays {
                 layers: |_| Layer::OFF
@@ -440,6 +445,7 @@ struct State {
     parameter_setup: ParameterSetup,
     dirty: bool,
     randomizing: u8,
+    output_buffers: u8,
     random_seed: u32,
     in_flight: Option<usize>,
     player: Player,
@@ -449,17 +455,24 @@ struct State {
 
 struct KickLab;
 static TABLE_DRAM: SharedStaticDram<KickLab> = SharedStaticDram::new();
-type WaveBuffers = DramBuffers<f32, { BUFFERS + 2 * MAX_LAYERS }>;
+type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + 2 * MAX_LAYERS }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
 
-fn layer_slot(layer: usize) -> usize {
-    BUFFERS + 2 * layer
+fn layer_slot(output_buffers: usize, layer: usize) -> usize {
+    output_buffers + 2 * layer
 }
 
 fn layer_count(specs: &[i32]) -> Option<usize> {
     let count = usize::try_from(*specs.first()?).ok()?;
     (1..=MAX_LAYERS).contains(&count).then_some(count)
+}
+
+fn output_buffer_count(specs: &[i32]) -> Option<usize> {
+    let count = usize::try_from(*specs.get(1)?).ok()?;
+    (MIN_OUTPUT_BUFFERS..=MAX_OUTPUT_BUFFERS)
+        .contains(&count)
+        .then_some(count)
 }
 
 fn model_index(layer: usize) -> usize {
@@ -677,7 +690,8 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
         context.state_mut().meter.wait_for_worker(_frames);
         return;
     }
-    let Some(slot) = context.state().player.free_buffer() else {
+    let state = context.state();
+    let Some(slot) = state.player.free_buffer(usize::from(state.output_buffers)) else {
         #[cfg(feature = "profiling")]
         context.state_mut().meter.wait_for_buffer(_frames);
         return;
@@ -685,7 +699,8 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     #[cfg(feature = "profiling")]
     let submit_started = cpu_cycle_count();
     let mut job = Job {
-        rate: context.state().rate,
+        rate: state.rate,
+        output_buffers: state.output_buffers,
         ..Job::EMPTY
     };
     let parameters = context.read_parameters();
@@ -757,16 +772,26 @@ impl Plugin for KickLab {
     const INITIALIZATION_IN_DRAM: bool = true;
     const STATIC_INITIALIZATION: bool = true;
     const SHARED_STATIC_DRAM: Option<&'static SharedStaticDram<Self>> = Some(&TABLE_DRAM);
-    const SPECIFICATIONS: &'static [Specification] = &[Specification {
-        name: c"Max Layers",
-        min: 1,
-        max: MAX_LAYERS as i32,
-        default: 2,
-        kind: TYPE_GENERIC,
-    }];
+    const SPECIFICATIONS: &'static [Specification] = &[
+        Specification {
+            name: c"Max Layers",
+            min: 1,
+            max: MAX_LAYERS as i32,
+            default: 2,
+            kind: TYPE_GENERIC,
+        },
+        Specification {
+            name: c"Output Buffers",
+            min: MIN_OUTPUT_BUFFERS as i32,
+            max: MAX_OUTPUT_BUFFERS as i32,
+            default: DEFAULT_OUTPUT_BUFFERS as i32,
+            kind: TYPE_GENERIC,
+        },
+    ];
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
         let layers = layer_count(specs)?;
+        output_buffer_count(specs)?;
         Some(Configuration {
             parameters: solo_index(layers),
             pages: layers + 1,
@@ -784,11 +809,17 @@ impl Plugin for KickLab {
     }
 
     fn dram_buffer_count(specs: &[i32]) -> usize {
-        layer_count(specs).map_or(0, layer_slot)
+        match (output_buffer_count(specs), layer_count(specs)) {
+            (Some(output_buffers), Some(layers)) => layer_slot(output_buffers, layers),
+            _ => 0,
+        }
     }
 
     fn dram_buffer_len_at(specs: &[i32], rate: u32, slot: usize) -> usize {
-        if slot >= layer_slot(0) && (slot - layer_slot(0)) % 2 == 1 {
+        let Some(output_buffers) = output_buffer_count(specs) else {
+            return 0;
+        };
+        if slot >= output_buffers && (slot - output_buffers) % 2 == 1 {
             render::layer_cache_frames(rate)
         } else {
             Self::dram_buffer_len(specs, rate)
@@ -811,6 +842,7 @@ impl Plugin for KickLab {
                 parameter_setup: ParameterSetup::New,
                 dirty: true,
                 randomizing: 0,
+                output_buffers: output_buffer_count(specs)? as u8,
                 random_seed: distingnt_api::api::cpu_cycle_count() | 1,
                 in_flight: None,
                 meter: profile::Meter::EMPTY,

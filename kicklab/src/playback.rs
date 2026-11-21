@@ -1,6 +1,6 @@
 use distingnt_api::api::plugin::RegionInitializer;
 
-use crate::{WaveBuffers, BUFFERS};
+use crate::WaveBuffers;
 
 const VOICES: usize = 8;
 pub const OUTPUT_VOLTS: f32 = 5.0;
@@ -90,8 +90,8 @@ impl Player {
         self.current.active()
     }
 
-    pub fn free_buffer(&self) -> Option<usize> {
-        (0..BUFFERS).find(|&slot| {
+    pub fn free_buffer(&self, output_buffers: usize) -> Option<usize> {
+        (0..output_buffers).find(|&slot| {
             !(self.current.active() && self.current.slot == slot
                 || self.fading.active() && self.fading.slot == slot
                 || self
@@ -229,6 +229,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_OUTPUT_BUFFERS;
 
     #[test]
     fn current_and_generations_of_tails_can_pin_every_buffer() {
@@ -242,23 +243,23 @@ mod tests {
         };
         player.publish(0, 100);
         player.trigger();
-        assert_eq!(player.free_buffer(), Some(1));
+        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(1));
         player.publish(1, 200);
         player.trigger();
         player.trigger();
-        assert_eq!(player.free_buffer(), Some(2));
+        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(2));
         player.publish(2, 300);
-        for next in 3..BUFFERS {
+        for next in 3..DEFAULT_OUTPUT_BUFFERS {
             player.trigger();
-            assert_eq!(player.free_buffer(), Some(next));
+            assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(next));
             player.publish(next, 300);
         }
-        assert_eq!(player.free_buffer(), None);
+        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), None);
         assert_eq!(player.voices[0].slot, 0);
         assert_eq!(player.voices[1].slot, 1);
         assert_eq!(player.voices[2].slot, 1);
         player.voices[0].position = 100;
-        assert_eq!(player.free_buffer(), Some(0));
+        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(0));
     }
 
     #[test]
@@ -293,7 +294,7 @@ mod tests {
                     edited += 1;
                 }
                 if edited != published && pending.is_none() {
-                    match player.free_buffer().filter(|&slot| slot < capacity) {
+                    match player.free_buffer(capacity) {
                         Some(slot) => pending = Some((slot, edited, tick + 3)),
                         None => blocked += 1,
                     }
@@ -307,6 +308,6 @@ mod tests {
         };
 
         assert_eq!(run(3), (1080, 22));
-        assert_eq!(run(BUFFERS), (0, 0));
+        assert_eq!(run(DEFAULT_OUTPUT_BUFFERS), (0, 0));
     }
 }

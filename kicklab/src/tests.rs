@@ -161,6 +161,7 @@ extern "C" fn NT_audioWorkerSubmit(
 struct Host {
     _sram: Vec<u64>,
     dram: Vec<f32>,
+    specs: [i32; 2],
     values: Vec<i16>,
     base: *mut NtAlgorithm,
 }
@@ -173,7 +174,12 @@ impl Host {
     }
 
     fn uninitialized(layers: i32) -> Self {
+        Self::with_specs([layers, DEFAULT_OUTPUT_BUFFERS as i32])
+    }
+
+    fn with_specs(specs: [i32; 2]) -> Self {
         initialize_factory();
+        let [layers, buffers] = specs;
         let mut req = NtAlgorithmRequirements {
             num_parameters: 0,
             sram: 0,
@@ -181,11 +187,11 @@ impl Host {
             dtc: 0,
             itc: 0,
         };
-        unsafe { factory().calculate_requirements.unwrap()(&mut req, &layers) };
+        unsafe { factory().calculate_requirements.unwrap()(&mut req, specs.as_ptr()) };
         assert_eq!(req.num_parameters as usize, solo_index(layers as usize));
         assert_eq!(
             req.dram as usize,
-            ((BUFFERS + layers as usize) * render::max_frames(48_000)
+            (((buffers + layers) as usize) * render::max_frames(48_000)
                 + layers as usize * render::layer_cache_frames(48_000))
                 * 4
         );
@@ -197,7 +203,7 @@ impl Host {
             dtc: ptr::null_mut(),
             itc: ptr::null_mut(),
         };
-        let base = unsafe { factory().construct.unwrap()(&mem, &req, &layers) };
+        let base = unsafe { factory().construct.unwrap()(&mem, &req, specs.as_ptr()) };
         assert!(!base.is_null());
         assert!(dram.iter().all(|&sample| sample == 0.0));
         let definitions =
@@ -209,6 +215,7 @@ impl Host {
         Self {
             _sram: sram,
             dram,
+            specs,
             values,
             base,
         }
@@ -257,9 +264,13 @@ impl Host {
 
     fn sample(&self, slot: usize, frame: usize) -> f32 {
         let start: usize = (0..slot)
-            .map(|index| KickLab::dram_buffer_len_at(&[], 48_000, index))
+            .map(|index| KickLab::dram_buffer_len_at(&self.specs, 48_000, index))
             .sum();
         self.dram[start + frame]
+    }
+
+    fn layer_slot(&self, layer: usize) -> usize {
+        layer_slot(output_buffer_count(&self.specs).unwrap(), layer)
     }
 }
 
@@ -270,6 +281,65 @@ impl Drop for Host {
         }
         ACTIVE.with(|active| active.set(ptr::null_mut()));
     }
+}
+
+#[test]
+fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages() {
+    assert_eq!(
+        KickLab::SPECIFICATIONS[1].default,
+        DEFAULT_OUTPUT_BUFFERS as i32
+    );
+    assert!(KickLab::configuration(&[4, 1]).is_none());
+    assert!(KickLab::configuration(&[4, 11]).is_none());
+
+    let mut reference_pages = None;
+    for count in [
+        MIN_OUTPUT_BUFFERS,
+        DEFAULT_OUTPUT_BUFFERS,
+        MAX_OUTPUT_BUFFERS,
+    ] {
+        let mut host = Host::with_specs([4, count as i32]);
+        host.notify(TRIGGER);
+        host.set(model_index(3), 1);
+        let pages: Vec<_> = (0..=4).map(|page| host.page(page)).collect();
+        if let Some(reference) = &reference_pages {
+            assert_eq!(&pages, reference);
+        } else {
+            reference_pages = Some(pages);
+        }
+        host.step([0.0; 4]);
+        assert_eq!(host.complete(), 0);
+        let cache = host.layer_slot(3);
+        assert!((1..128).any(|frame| host.sample(cache, frame).abs() > 0.001));
+    }
+}
+
+#[cfg(not(feature = "profiling-hold-playback"))]
+#[test]
+fn two_output_buffers_wait_for_a_playing_tail_before_reusing_its_slot() {
+    let mut host = Host::with_specs([1, 2]);
+    host.notify(TRIGGER);
+    let level = model_index(0) + 1;
+    host.set(model_index(0) + 3, 45);
+    host.step([0.0; 4]);
+    assert_eq!(host.complete(), 0);
+    host.step([5.0, 0.0, 0.0, 0.0]);
+
+    host.set(level, 70);
+    host.step([0.0; 4]);
+    assert_eq!(host.complete(), 1);
+    host.step([5.0, 0.0, 0.0, 0.0]);
+
+    host.set(level, 60);
+    host.step([0.0; 4]);
+    assert!(WORK.with(Cell::get).is_none());
+    for _ in 0..1000 {
+        host.step([0.0; 4]);
+        if WORK.with(Cell::get).is_some() {
+            break;
+        }
+    }
+    assert_eq!(host.complete(), 0);
 }
 
 #[test]
@@ -501,13 +571,13 @@ fn mix_applies_layer_levels_to_cached_waveforms() {
     host.step([0.0; 4]);
     let original_mix = host.complete();
     let frame = 761;
-    let cached: [f32; 3] = core::array::from_fn(|layer| host.sample(layer_slot(layer), frame));
+    let cached: [f32; 3] = core::array::from_fn(|layer| host.sample(host.layer_slot(layer), frame));
     assert!(cached.iter().all(|&sample| sample != 0.0));
     assert_eq!(
         host.sample(original_mix, frame),
         cached.iter().map(|sample| sample * 0.1).sum::<f32>()
     );
-    let modal_tail = host.sample(layer_slot(1), 7500) * 0.1;
+    let modal_tail = host.sample(host.layer_slot(1), 7500) * 0.1;
     assert_ne!(modal_tail, 0.0);
     assert_eq!(host.sample(original_mix, 7500), modal_tail);
 
@@ -534,24 +604,24 @@ fn switching_models_reuses_the_layer_cache_and_regenerates_its_contents() {
     host.complete();
     let prefix_frames = render::layer_cache_frames(48_000) / 2;
     let pitch: Vec<_> = (0..prefix_frames)
-        .map(|frame| host.sample(layer_slot(0), frame))
+        .map(|frame| host.sample(host.layer_slot(0), frame))
         .collect();
 
     host.set(model, 2);
     host.step([0.0; 4]);
     host.complete();
-    assert_ne!(host.sample(layer_slot(0), 761), pitch[761]);
+    assert_ne!(host.sample(host.layer_slot(0), 761), pitch[761]);
 
     host.set(model, 4);
     host.step([0.0; 4]);
     host.complete();
-    assert_ne!(host.sample(layer_slot(0), 761), pitch[761]);
+    assert_ne!(host.sample(host.layer_slot(0), 761), pitch[761]);
 
     host.set(model, 1);
     host.step([0.0; 4]);
     host.complete();
     for (frame, original) in pitch.into_iter().enumerate() {
-        assert_eq!(host.sample(layer_slot(0), frame), original);
+        assert_eq!(host.sample(host.layer_slot(0), frame), original);
     }
 }
 
@@ -701,8 +771,8 @@ fn solo_and_mute_select_which_cached_layers_are_mixed() {
     host.step([0.0; 4]);
     let initial = host.complete();
     let frame = 761;
-    let first = host.sample(layer_slot(0), frame) * 0.1;
-    let second = host.sample(layer_slot(1), frame) * 0.1;
+    let first = host.sample(host.layer_slot(0), frame) * 0.1;
+    let second = host.sample(host.layer_slot(1), frame) * 0.1;
     assert_ne!(first, 0.0);
     assert_ne!(second, 0.0);
     assert_eq!(host.sample(initial, frame), first + second);
@@ -721,8 +791,8 @@ fn solo_and_mute_select_which_cached_layers_are_mixed() {
         host.step([0.0; 4]);
         let mix = host.complete();
         assert_eq!(host.sample(mix, frame), expected);
-        assert_eq!(host.sample(layer_slot(0), frame) * 0.1, first);
-        assert_eq!(host.sample(layer_slot(1), frame) * 0.1, second);
+        assert_eq!(host.sample(host.layer_slot(0), frame) * 0.1, first);
+        assert_eq!(host.sample(host.layer_slot(1), frame) * 0.1, second);
     }
     assert_eq!(PAGE_UPDATES.with(Cell::get), page_updates);
 
