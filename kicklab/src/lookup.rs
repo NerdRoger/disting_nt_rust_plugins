@@ -64,7 +64,7 @@ fn drive_exact(value: f32) -> f32 {
     ((1.0 - edge) / (1.0 + edge)).copysign(value)
 }
 
-#[inline]
+#[inline(never)]
 pub fn drive(tables: Option<Lookup<'_>>, value: f32) -> f32 {
     if let Some(tables) = tables {
         let magnitude = value.abs();
@@ -79,7 +79,7 @@ pub fn drive(tables: Option<Lookup<'_>>, value: f32) -> f32 {
     }
 }
 
-#[inline]
+#[inline(never)]
 pub fn pitch_multiplier(tables: Option<Lookup<'_>>, octaves: f32) -> f32 {
     if let Some(tables) = tables {
         // KickLab's pitch sweep is specified in 0..60 semitones. Using a

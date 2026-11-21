@@ -265,6 +265,7 @@ fn wrap(turns: f32) -> f32 {
     turns - turns as u32 as f32
 }
 
+#[inline(never)]
 fn sine(turns: f32) -> f32 {
     // Reduce to +/-pi/2 before evaluating the odd polynomial.
     let angle = (4.0 * (wrap(turns + 0.25) - 0.5).abs() - 1.0) * (-PI * 0.5);
@@ -406,7 +407,7 @@ impl DecayEnvelope {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     fn next<const ANCHOR: usize>(&mut self, index: usize) -> f32 {
         // Re-anchor periodically so rounding in the ratio cannot drift over
         // a long render, especially at the highest supported sample rates.
