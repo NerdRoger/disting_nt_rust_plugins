@@ -37,6 +37,14 @@ impl Hit {
         length: 0,
     };
 
+    // Passing the fields in registers lets the compiler emit direct stores.
+    #[inline(never)]
+    fn set(&mut self, slot: usize, position: usize, length: usize) {
+        self.slot = slot;
+        self.position = position;
+        self.length = length;
+    }
+
     fn active(self) -> bool {
         self.position < self.length
     }
@@ -98,14 +106,22 @@ impl Player {
             return;
         }
         if let Some(voice) = self.voices.iter_mut().find(|voice| !voice.active()) {
-            *voice = self.current;
+            voice.set(
+                self.current.slot,
+                self.current.position,
+                self.current.length,
+            );
         } else if !self.fading.active() {
             let Some(oldest) = self.voices.iter_mut().max_by_key(|voice| voice.position) else {
                 return;
             };
-            self.fading = *oldest;
+            self.fading.set(oldest.slot, oldest.position, oldest.length);
             self.fade_remaining = self.fade_frames;
-            *oldest = self.current;
+            oldest.set(
+                self.current.slot,
+                self.current.position,
+                self.current.length,
+            );
         }
     }
 

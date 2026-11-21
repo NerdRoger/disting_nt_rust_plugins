@@ -137,7 +137,7 @@ pub fn render(
                         *timing = Some(elapsed);
                     }
                 }
-                cached.patch = *patch;
+                store_patch(&mut cached.patch, patch);
             }
             if fuse_mix {
                 if layer.level == 1.0 {
@@ -224,6 +224,12 @@ pub fn render(
     }
     Some(length)
 }
+}
+
+// The call boundary preserves the disjoint borrows for this small copy.
+#[inline(never)]
+fn store_patch(destination: &mut LayerPatch, source: &LayerPatch) {
+    *destination = *source;
 }
 
 fn lowpass(samples: &mut [f32], cycles: f32, gain: f32) -> f32 {
