@@ -15,6 +15,7 @@ mod profile {
         pub const EMPTY: Self = Self;
     }
     pub type RenderTiming = ();
+    pub type GrainTiming = ();
     pub const NO_RENDER_TIMING: RenderTiming = ();
 }
 
@@ -40,6 +41,7 @@ use playback::Player;
 
 const MAX_LAYERS: usize = 4;
 const BUFFERS: usize = 6;
+const SPECTRAL_WORK_SLOT: usize = BUFFERS;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
@@ -55,12 +57,20 @@ const MIX_START: usize = RANDOMIZE_START + MAX_LAYERS;
 const LAYER_PAGE_FIELDS: usize = LAYER_FIELDS + 3;
 const LAYER_NAMES: [&CStr; MAX_LAYERS] = [c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4"];
 const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [b"L1: ", b"L2: ", b"L3: ", b"L4: "];
-const MODEL_NAMES: [&CStr; 5] = [
+const MODEL_NAMES: [&CStr; 13] = [
     c"Off",
     c"Pitch Sweep",
     c"Modal Drum",
     c"Bit Logic",
     c"Grain Cloud",
+    c"Hard Sync",
+    c"Resonator",
+    c"Two-Operator FM",
+    c"Noise Sweep",
+    c"Ring Mod",
+    c"Wavefold",
+    c"Delay Drum",
+    c"Spectral Pulse",
 ];
 static OPERATIONS: EnumStrings<4> = EnumStrings::new([c"XOR", c"AND", c"OR", c"Wrap Add"]);
 static OFF_ON: EnumStrings<2> = EnumStrings::new([c"Off", c"On"]);
@@ -72,6 +82,14 @@ enum Model {
     ModalDrum,
     BitLogic,
     GrainCloud,
+    HardSync,
+    Resonator,
+    TwoOperatorFm,
+    NoiseSweep,
+    RingMod,
+    Wavefold,
+    DelayDrum,
+    SpectralPulse,
 }
 
 impl Model {
@@ -81,6 +99,14 @@ impl Model {
             2 => Self::ModalDrum,
             3 => Self::BitLogic,
             4 => Self::GrainCloud,
+            5 => Self::HardSync,
+            6 => Self::Resonator,
+            7 => Self::TwoOperatorFm,
+            8 => Self::NoiseSweep,
+            9 => Self::RingMod,
+            10 => Self::Wavefold,
+            11 => Self::DelayDrum,
+            12 => Self::SpectralPulse,
             _ => Self::Off,
         }
     }
@@ -92,6 +118,14 @@ impl Model {
             Self::ModalDrum => &MODAL_DRUM,
             Self::BitLogic => &BIT_LOGIC,
             Self::GrainCloud => &GRAIN_CLOUD,
+            Self::HardSync => &HARD_SYNC,
+            Self::Resonator => &RESONATOR,
+            Self::TwoOperatorFm => &TWO_OPERATOR_FM,
+            Self::NoiseSweep => &NOISE_SWEEP,
+            Self::RingMod => &RING_MOD,
+            Self::Wavefold => &WAVEFOLD,
+            Self::DelayDrum => &DELAY_DRUM,
+            Self::SpectralPulse => &SPECTRAL_PULSE,
         }
     }
 }
@@ -232,6 +266,88 @@ const GRAIN_CLOUD: [Control; 10] = [
     percent(c"Timing Jitter", 35),
     drive(40),
 ];
+const HARD_SYNC: [Control; 8] = [
+    tune(c"Tail Tune", 510),
+    decay(410),
+    depth(21),
+    time(34),
+    Control::new(c"Sync Bend", 0, 120, 55, UNIT_NONE, SCALING_10),
+    Control::new(c"Sync Decay", 5, 500, 110, UNIT_MS, SCALING_NONE),
+    Control::new(c"Tail Ratio", 100, 600, 100, UNIT_NONE, SCALING_100),
+    drive(50),
+];
+const RESONATOR: [Control; 9] = [
+    tune(c"Tail Tune", 530),
+    decay(820),
+    depth(13),
+    time(12),
+    Control::new(c"Tail Pitch Drift", 0, 60, 15, UNIT_SEMITONES, SCALING_10),
+    percent(c"Excitation", 65),
+    Control::new(c"Exciter Width", 20, 300, 50, UNIT_MS, SCALING_100),
+    Control::new(c"Tone Cutoff", 180, 8000, 2000, UNIT_HZ, SCALING_NONE),
+    drive(10),
+];
+const TWO_OPERATOR_FM: [Control; 9] = [
+    tune(c"Tail Tune", 490),
+    decay(420),
+    depth(24),
+    time(22),
+    Control::new(c"FM Amount", 0, 900, 320, UNIT_NONE, SCALING_100),
+    Control::new(c"Modulator Ratio", 50, 1600, 345, UNIT_NONE, SCALING_100),
+    Control::new(c"FM Decay", 2, 400, 78, UNIT_MS, SCALING_NONE),
+    Control::new(c"Modulator Sweep", -24, 36, 0, UNIT_SEMITONES, SCALING_NONE),
+    drive(30),
+];
+const NOISE_SWEEP: [Control; 8] = [
+    tune(c"Tail Center", 580),
+    decay(260),
+    depth(41),
+    time(27),
+    Control::new(c"Filter Q", 5, 120, 41, UNIT_NONE, SCALING_10),
+    Control::new(c"Q Sweep", -30, 30, 0, UNIT_NONE, SCALING_10),
+    percent(c"Grain", 12),
+    drive(40),
+];
+const RING_MOD: [Control; 9] = [
+    tune(c"Tail Tune", 520),
+    decay(420),
+    depth(17),
+    time(32),
+    Control::new(c"Lower Osc Ratio", 50, 900, 350, UNIT_NONE, SCALING_100),
+    percent(c"Clang Level", 65),
+    Control::new(c"Clang Decay", 2, 600, 102, UNIT_MS, SCALING_NONE),
+    Control::new(c"Clang Pitch Env", -24, 24, 0, UNIT_SEMITONES, SCALING_NONE),
+    drive(30),
+];
+const WAVEFOLD: [Control; 9] = [
+    tune(c"Tail Tune", 490),
+    decay(430),
+    depth(16),
+    time(28),
+    Control::new(c"Fold Amount", 0, 100, 42, UNIT_NONE, SCALING_10),
+    Control::new(c"Fold Decay", 2, 650, 158, UNIT_MS, SCALING_NONE),
+    Control::new(c"Fold Bias", -80, 80, 26, UNIT_PERCENT, SCALING_NONE),
+    percent(c"Clean Sub Blend", 0),
+    drive(10),
+];
+const DELAY_DRUM: [Control; 7] = [
+    tune(c"Tail Tune", 640),
+    decay(520),
+    Control::new(c"Loop Cutoff", 250, 8500, 1700, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Strike Mix", 0, 200, 100, UNIT_PERCENT, SCALING_NONE),
+    Control::new(c"Strike Width", 5, 200, 57, UNIT_MS, SCALING_10),
+    Control::new(c"Strike Tone", 200, 8500, 2600, UNIT_HZ, SCALING_NONE),
+    drive(50),
+];
+const SPECTRAL_PULSE: [Control; 7] = [
+    tune(c"Tail Tune", 540),
+    Control::new(c"Body Decay", 70, 850, 345, UNIT_MS, SCALING_NONE),
+    percent(c"Snap Level", 75),
+    Control::new(c"Snap Center", 180, 3800, 720, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Snap Bandwidth", 5, 100, 38, UNIT_PERCENT, SCALING_NONE),
+    Control::new(c"Dispersion", 0, 200, 12, UNIT_MS, SCALING_10),
+    drive(20),
+];
 const UNUSED: Definition = definition(c"Unused", 0, 0, 0, UNIT_NONE, SCALING_NONE);
 const LEVEL: Control = percent(c"Level", 100);
 const RANDOMIZE: Definition = definition(c"Randomize", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE);
@@ -334,12 +450,12 @@ struct State {
 
 struct KickLab;
 static TABLE_DRAM: SharedStaticDram<KickLab> = SharedStaticDram::new();
-type WaveBuffers = DramBuffers<f32, { BUFFERS + 2 * MAX_LAYERS }>;
+type WaveBuffers = DramBuffers<f32, { BUFFERS + 1 + 2 * MAX_LAYERS }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
 
 fn layer_slot(layer: usize) -> usize {
-    BUFFERS + 2 * layer
+    BUFFERS + 1 + 2 * layer
 }
 
 fn layer_count(specs: &[i32]) -> Option<usize> {
@@ -673,7 +789,9 @@ impl Plugin for KickLab {
     }
 
     fn dram_buffer_len_at(specs: &[i32], rate: u32, slot: usize) -> usize {
-        if slot >= BUFFERS && (slot - BUFFERS) % 2 == 1 {
+        if slot == SPECTRAL_WORK_SLOT {
+            render::spectral_workspace_frames(rate)
+        } else if slot >= layer_slot(0) && (slot - layer_slot(0)) % 2 == 1 {
             render::layer_cache_frames(rate)
         } else {
             Self::dram_buffer_len(specs, rate)

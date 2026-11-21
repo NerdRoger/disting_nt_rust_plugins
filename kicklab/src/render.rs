@@ -1,12 +1,18 @@
 //! Mono KickLab renderers. These run only on the background worker.
+#[path = "extra_models.rs"]
+mod extra_models;
+#[path = "spectral.rs"]
+mod spectral;
+pub(crate) use spectral::spectral_workspace_frames;
+
 use core::f32::consts::{LOG2_E, PI, TAU};
 use distingnt_api::api::math::exp2;
 
 use crate::lookup::{self, Lookup};
-use crate::profile::RenderTiming;
+use crate::profile::{GrainTiming, RenderTiming};
 use crate::{
     layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
-    PITCH_CLICK_MAX_DECAY_TENTHS_MS,
+    PITCH_CLICK_MAX_DECAY_TENTHS_MS, SPECTRAL_WORK_SLOT,
 };
 #[cfg(feature = "profiling")]
 use distingnt_api::api::cpu_cycle_count;
@@ -44,7 +50,7 @@ enum TransientShape {
     Empty,
     PitchSweep { tone: f32, decay: f32 },
     ModalDrum { hardness: f32 },
-    GrainCloud { size_ms: f32 },
+    GrainCloud { size_ms: f32, raw_frames: usize },
 }
 
 impl CachedLayer {
@@ -104,8 +110,27 @@ pub fn render(
                         modal_drum(patch, cached, rate, waveform, layer_cache, tables)
                     })??,
                     Model::BitLogic => bit_logic(patch, rate, waveform, tables),
-                    Model::GrainCloud => buffers.with(slot + 1, |layer_cache| {
-                        grain_cloud(patch, cached, rate, waveform, layer_cache, tables)
+                    Model::GrainCloud => {
+                        let mut timing = GrainTiming::default();
+                        buffers.with(slot + 1, |layer_cache| {
+                            grain_cloud(patch, cached, rate, waveform, layer_cache, tables, &mut timing)
+                        })??;
+                        #[cfg(feature = "profiling")]
+                        if let Some(result) = _timing.grains.get_mut(index) {
+                            *result = timing;
+                        }
+                    }
+                    Model::HardSync => hard_sync(patch, rate, waveform, tables),
+                    Model::Resonator => extra_models::resonator(patch, rate, waveform, tables),
+                    Model::TwoOperatorFm => extra_models::two_operator_fm(patch, rate, waveform, tables),
+                    Model::NoiseSweep => extra_models::noise_sweep(patch, rate, waveform, tables),
+                    Model::RingMod => extra_models::ring_mod(patch, rate, waveform, tables),
+                    Model::Wavefold => extra_models::wavefold(patch, rate, waveform, tables),
+                    Model::DelayDrum => buffers.with(slot + 1, |layer_cache| {
+                        extra_models::delay_drum(patch, rate, waveform, layer_cache, tables)
+                    })??,
+                    Model::SpectralPulse => buffers.with(SPECTRAL_WORK_SLOT, |workspace| {
+                        spectral::spectral_pulse(patch, rate, waveform, workspace, tables)
                     })??,
                 }
                 #[cfg(feature = "profiling")]
@@ -345,13 +370,13 @@ impl<'a> LayerShape<'a> {
 }
 
 fn render_layer(
-    layer: &LayerPatch,
+    drive: f32,
     rate: u32,
     waveform: &mut [f32],
     tables: Option<Lookup<'_>>,
     mut synth: impl FnMut(usize) -> f32,
 ) {
-    let shape = LayerShape::new(layer.controls[2], rate, waveform.len(), tables);
+    let shape = LayerShape::new(drive, rate, waveform.len(), tables);
     // Allow for the full 0.7 ms attack and round up the release span.
     let onset = milliseconds(rate, 1);
     let steady = waveform
@@ -927,51 +952,249 @@ fn grain_cloud(
     waveform: &mut [f32],
     layer_cache: &mut [f32],
     tables: Option<Lookup<'_>>,
+    _timing: &mut GrainTiming,
 ) -> Option<()> {
     let [_, decay, _, _, size_ms, density, _, _, _, drive] = layer.controls;
-    let window = layer_cache.get_mut(..milliseconds(rate, size_ms as usize))?;
-    let grain_shape = TransientShape::GrainCloud { size_ms };
-    if cached.transient_shape != grain_shape {
-        let half_turn_per_frame = 500.0 / (rate as f32 * size_ms);
-        for (frame, weight) in window.iter_mut().enumerate() {
-            // sin(pi * progress)^2 is the Hann window.
-            let height = sine(frame as f32 * half_turn_per_frame);
-            *weight = height * height;
+    let (window, storage) =
+        layer_cache.split_at_mut_checked(milliseconds(rate, size_ms as usize))?;
+    let cached_frames = match cached.transient_shape {
+        TransientShape::GrainCloud {
+            size_ms: saved,
+            raw_frames,
+        } if saved == size_ms => raw_frames,
+        _ => {
+            let half_turn_per_frame = 500.0 / (rate as f32 * size_ms);
+            for (frame, weight) in window.iter_mut().enumerate() {
+                // sin(pi * progress)^2 is the Hann window.
+                let height = sine(frame as f32 * half_turn_per_frame);
+                *weight = height * height;
+            }
+            0
         }
-        cached.transient_shape = grain_shape;
-    }
-    waveform.fill(0.0);
-    for (start, step, phase) in grain_schedule(layer, rate) {
-        let Some(samples) = waveform.get_mut(start..) else {
-            break;
-        };
-        if samples.is_empty() {
-            break;
+    };
+    // Body Decay and Drive are applied after the grain sum. A shorter
+    // render can use the prefix of an already cached sum.
+    let reuse = cached_frames >= waveform.len()
+        && cached.patch.model == Model::GrainCloud
+        && cached.patch.controls[0] == layer.controls[0]
+        && cached.patch.controls[2..9] == layer.controls[2..9];
+    let raw = storage.get_mut(..waveform.len());
+    let reused = match raw {
+        Some(raw) if reuse => Some(raw),
+        available => {
+            #[cfg(feature = "profiling")]
+            let start = cpu_cycle_count();
+            waveform.fill(0.0);
+            for (start, step, phase) in grain_schedule(layer, rate) {
+                let Some(samples) = waveform.get_mut(start..) else {
+                    break;
+                };
+                if samples.is_empty() {
+                    break;
+                }
+                accumulate_grain(samples, window, step, phase);
+            }
+            #[cfg(feature = "profiling")]
+            {
+                _timing.accumulation = Some(cpu_cycle_count().wrapping_sub(start));
+            }
+            let raw_frames = if let Some(raw) = available {
+                raw.copy_from_slice(waveform);
+                raw.len()
+            } else {
+                0
+            };
+            cached.transient_shape = TransientShape::GrainCloud {
+                size_ms,
+                raw_frames,
+            };
+            None
         }
-        accumulate_grain(samples, window, step, phase);
-    }
+    };
+    #[cfg(feature = "profiling")]
+    let start = cpu_cycle_count();
 
-    let mut envelope = DecayEnvelope::new(decay_rate(decay, rate));
+    let envelope = DecayEnvelope::new(decay_rate(decay, rate));
     let normalization = positive_pow((density * size_ms / 2000.0).max(1.0), -0.5);
     let shape = LayerShape::new(drive, rate, waveform.len(), tables);
     // The first grain's window supplies the attack in the original voice.
     let steady = waveform
         .len()
         .saturating_sub(milliseconds(rate, RELEASE_FADE_MS) + 1);
-    let (body, release) = waveform.split_at_mut_checked(steady)?;
-    for (frame, sample) in body.iter_mut().enumerate() {
-        *sample = shape.drive(*sample * normalization * envelope.next::<256>(frame));
+    if let Some(raw) = reused {
+        shape_grains(
+            waveform.iter_mut().zip(raw.iter().copied()),
+            steady,
+            normalization,
+            envelope,
+            &shape,
+        );
+    } else {
+        shape_grains(
+            waveform.iter_mut().map(|sample| {
+                let raw = *sample;
+                (sample, raw)
+            }),
+            steady,
+            normalization,
+            envelope,
+            &shape,
+        );
     }
-    for (offset, sample) in release.iter_mut().enumerate() {
-        let frame = steady + offset;
-        let gain = ((shape.last - frame) as f32 * shape.fade).min(1.0);
-        *sample = shape.drive(*sample * normalization * envelope.next::<256>(frame)) * gain;
+    #[cfg(feature = "profiling")]
+    {
+        _timing.shaping = Some(cpu_cycle_count().wrapping_sub(start));
     }
     Some(())
 }
 
+fn shape_grains<'a>(
+    samples: impl Iterator<Item = (&'a mut f32, f32)>,
+    steady: usize,
+    normalization: f32,
+    mut envelope: DecayEnvelope,
+    shape: &LayerShape<'_>,
+) {
+    let mut samples = samples.enumerate();
+    for (frame, (sample, raw)) in samples.by_ref().take(steady) {
+        *sample = shape.drive(raw * normalization * envelope.next::<256>(frame));
+    }
+    for (frame, (sample, raw)) in samples {
+        let gain = ((shape.last - frame) as f32 * shape.fade).min(1.0);
+        *sample = shape.drive(raw * normalization * envelope.next::<256>(frame)) * gain;
+    }
+}
+
+fn sync_exp2(octaves: f64) -> f64 {
+    // Hard Sync uses -0.21..=5 octaves here. Reduce to the nearest octave,
+    // then evaluate a [5/5] Padé approximant of exp on [-ln(2)/2, ln(2)/2].
+    let whole = (octaves + 0.5) as u32;
+    let x = (octaves - f64::from(whole)) * core::f64::consts::LN_2;
+    let squared = x * x;
+    let even = 30_240.0 + squared * (3360.0 + 30.0 * squared);
+    let odd = x * (15_120.0 + squared * (420.0 + squared));
+    let scale = f64::from_bits(u64::from(1023 + whole) << 52);
+    scale * ((even + odd) / (even - odd))
+}
+
+const SYNC_OVERSAMPLE: u32 = 4;
+
+struct SyncVoice {
+    leader: f64,
+    follower: f64,
+    low1: f32,
+    low2: f32,
+    tail_sin: f32,
+    tail_cos: f32,
+}
+
+impl SyncVoice {
+    fn anchor_tail(&mut self) {
+        let phase = self.follower as f32;
+        self.tail_sin = sine(phase);
+        self.tail_cos = sine(phase + 0.25);
+    }
+
+    fn advance<const STEADY: bool>(
+        &mut self,
+        step: f64,
+        ratio: f64,
+        lowpass: f32,
+        (sin_step, cos_step): (f32, f32),
+    ) -> f32 {
+        let follower_step = step * ratio;
+        for _ in 0..SYNC_OVERSAMPLE {
+            let sample = if STEADY {
+                self.tail_sin
+            } else {
+                sine(self.follower as f32)
+            };
+            self.low1 += lowpass * (sample - self.low1);
+            self.low2 += lowpass * (self.low1 - self.low2);
+            self.leader += step;
+            if self.leader >= 1.0 {
+                // Advance the follower by the fraction of this substep
+                // that elapsed after the leader reset it.
+                self.leader -= 1.0;
+                self.follower = self.leader * ratio;
+                if STEADY {
+                    self.anchor_tail();
+                }
+            } else {
+                self.follower += follower_step;
+                if STEADY {
+                    (self.tail_sin, self.tail_cos) = (
+                        self.tail_sin * cos_step + self.tail_cos * sin_step,
+                        self.tail_cos * cos_step - self.tail_sin * sin_step,
+                    );
+                }
+            }
+        }
+        self.low2
+    }
+}
+
+fn hard_sync(layer: &LayerPatch, rate: u32, waveform: &mut [f32], tables: Option<Lookup<'_>>) {
+    let [tune, decay, sweep, sweep_time, bend, bend_time, tail_ratio, drive, ..] = layer.controls;
+    let oversampled_rate = rate * SYNC_OVERSAMPLE;
+    let lowpass = filter_coefficient(12_000.0, oversampled_rate);
+    let dc_tracking = filter_coefficient(12.0, rate);
+    let steady_step = f64::from(tune) / f64::from(oversampled_rate);
+    // Tiny pitch errors can move a hard reset across a substep boundary.
+    // Step the pitch envelope and phases in f64 to keep those times stable.
+    let mut sweep_octaves = f64::from(sweep) / 12.0;
+    let sweep_ratio =
+        sync_exp2(-2000.0 * core::f64::consts::LOG2_10 / (f64::from(sweep_time) * f64::from(rate)));
+    let mut bend_envelope = (bend > 0.0).then(|| DecayEnvelope::new(decay_rate(bend_time, rate)));
+    let mut body_envelope = DecayEnvelope::new(decay_rate(decay, rate));
+    let steady_follower_step = (steady_step * f64::from(tail_ratio)) as f32;
+    let sin_step = sine(steady_follower_step);
+    let half_sine = sine(0.5 * steady_follower_step);
+    let rotation = (sin_step, 1.0 - 2.0 * half_sine * half_sine);
+    let mut voice = SyncVoice {
+        leader: 0.0,
+        follower: 0.0,
+        low1: 0.0,
+        low2: 0.0,
+        tail_sin: 0.0,
+        tail_cos: 1.0,
+    };
+    let mut was_steady = false;
+    let mut dc = 0.0;
+
+    render_layer(drive, rate, waveform, tables, |frame| {
+        let step = if sweep_octaves > 0.0 {
+            let multiplier = sync_exp2(sweep_octaves);
+            sweep_octaves = if multiplier == 1.0 {
+                0.0
+            } else {
+                sweep_octaves * sweep_ratio
+            };
+            steady_step * multiplier
+        } else {
+            steady_step
+        };
+        let ratio = bend_envelope.as_mut().map_or(tail_ratio, |envelope| {
+            tail_ratio + bend * envelope.next::<256>(frame)
+        });
+        let steady = step == steady_step && ratio == tail_ratio;
+        let low2 = if steady {
+            // Anchor every 256 substeps as well as on every fractional reset.
+            if !was_steady || frame % 64 == 0 {
+                voice.anchor_tail();
+            }
+            voice.advance::<true>(steady_step, f64::from(tail_ratio), lowpass, rotation)
+        } else {
+            voice.advance::<false>(step, f64::from(ratio), lowpass, rotation)
+        };
+        was_steady = steady;
+        dc += dc_tracking * (low2 - dc);
+        (low2 - dc) * body_envelope.next::<256>(frame)
+    });
+}
+
 fn bit_logic(layer: &LayerPatch, rate: u32, waveform: &mut [f32], tables: Option<Lookup<'_>>) {
-    let [tune, decay, _, sweep, sweep_time, ratio, clock_hz, bits, operation, tone] =
+    let [tune, decay, drive, sweep, sweep_time, ratio, clock_hz, bits, operation, tone] =
         layer.controls;
     let mask = (1 << bits as u32) - 1u32;
     let step = clock_hz / rate as f32;
@@ -984,7 +1207,7 @@ fn bit_logic(layer: &LayerPatch, rate: u32, waveform: &mut [f32], tables: Option
     let mut body_envelope = DecayEnvelope::new(decay_rate(decay, rate));
     let (mut clock, mut first_phase, mut second_phase) = (1.0, 0.0, 0.31);
     let (mut held, mut filtered, mut dc) = (0.0, 0.0, 0.0);
-    render_layer(layer, rate, waveform, tables, |frame| {
+    render_layer(drive, rate, waveform, tables, |frame| {
         if clock >= 1.0 {
             clock -= 1.0;
             let first = (first_phase * (mask + 1) as f32) as u32;
@@ -1020,6 +1243,90 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec;
+
+    fn reference_hard_sync(layer: &LayerPatch, rate: u32, waveform: &mut [f32]) {
+        use core::f64::consts::{LN_10, TAU};
+
+        // Direct transcription of the browser renderer. Use f64 phases,
+        // exact exponentials, and the browser's shaping order.
+        let [tune, body, sweep, sweep_time, bend, bend_time, tail, drive, ..] =
+            layer.controls.map(f64::from);
+        let rate = f64::from(rate);
+        let lowpass = 1.0 - (-TAU * 12_000.0 / (4.0 * rate)).exp();
+        let dc_tracking = 1.0 - (-TAU * 12.0 / rate).exp();
+        let boost = 10.0f64.powf(drive / 20.0);
+        let decay = |time: f64, ms: f64| (-2.0 * LN_10 * time / (ms * 0.001)).exp();
+        let last = waveform.len() - 1;
+        let (mut leader, mut follower) = (0.0, 0.0);
+        let (mut low1, mut low2, mut dc) = (0.0, 0.0, 0.0);
+        for (frame, sample) in waveform.iter_mut().enumerate() {
+            let time = frame as f64 / rate;
+            let step = tune * (sweep / 12.0 * decay(time, sweep_time)).exp2() / (4.0 * rate);
+            let ratio = tail + bend * decay(time, bend_time);
+            for _ in 0..4 {
+                let wave = (TAU * follower).sin();
+                low1 += lowpass * (wave - low1);
+                low2 += lowpass * (low1 - low2);
+                leader += step;
+                if leader >= 1.0 {
+                    leader -= 1.0;
+                    follower = leader * ratio;
+                } else {
+                    follower += step * ratio;
+                }
+            }
+            dc += dc_tracking * (low2 - dc);
+            let raw = (low2 - dc) * (time / 0.0007).min(1.0) * decay(time, body);
+            let shaped = raw + ((raw * boost).tanh() - raw) * (drive / 5.0).min(1.0);
+            // At 48 kHz this is the browser's 240-sample release.
+            *sample = (shaped * ((last - frame) as f64 / (rate * 0.005)).min(1.0)) as f32;
+        }
+    }
+
+    #[test]
+    fn hard_sync_matches_web_reference_with_and_without_sweep_and_bend() {
+        let mut table_memory = [0.0; lookup::BYTES as usize / 4];
+        let tables = Some(lookup::test_tables(&mut table_memory));
+        for rate in [32_000, 48_000, 96_000, 192_000] {
+            for controls in [
+                [51.0, 410.0, 21.0, 34.0, 5.5, 110.0, 1.0, 5.0, 0.0, 0.0],
+                [25.0, 1000.0, 0.0, 34.0, 0.0, 110.0, 2.35, 0.0, 0.0, 0.0],
+                [
+                    120.0, 1000.0, 60.0, 200.0, 12.0, 500.0, 5.85, 24.0, 0.0, 0.0,
+                ],
+                [75.0, 45.0, 0.0, 1.0, 12.0, 5.0, 6.0, 0.0, 0.0, 0.0],
+                [42.0, 200.0, 60.0, 1.0, 0.0, 5.0, 1.75, 12.0, 0.0, 0.0],
+            ] {
+                let layer = LayerPatch {
+                    model: Model::HardSync,
+                    controls,
+                };
+                let frames = milliseconds(rate, controls[1] as usize * 3 + 10)
+                    .div_ceil(2)
+                    .min(max_frames(rate));
+                let mut reference = vec![0.0; frames];
+                let mut waveform = vec![0.0; frames];
+                reference_hard_sync(&layer, rate, &mut reference);
+                hard_sync(&layer, rate, &mut waveform, tables);
+                let mut peak = 0.0f32;
+                let mut error_power = 0.0;
+                let mut reference_power = 0.0;
+                for (&actual, expected) in waveform.iter().zip(reference) {
+                    let error = actual - expected;
+                    peak = peak.max(error.abs());
+                    error_power += f64::from(error).powi(2);
+                    reference_power += f64::from(expected).powi(2);
+                }
+                let relative_rms = (error_power / reference_power).sqrt();
+                assert!(
+                    peak < 0.007 && relative_rms < 0.001,
+                    "{rate} Hz, {controls:?}: peak error {peak}, relative RMS error {relative_rms}"
+                );
+                assert_eq!(waveform[0], 0.0);
+                assert_eq!(waveform[frames - 1], 0.0);
+            }
+        }
+    }
 
     #[test]
     fn grain_cloud_matches_web_onsets_and_waveform_samples() {
@@ -1082,6 +1389,7 @@ mod tests {
                 &mut waveform,
                 &mut buffer,
                 tables,
+                &mut GrainTiming::default(),
             )
             .unwrap();
             for (frame, expected) in samples {
@@ -1095,6 +1403,58 @@ mod tests {
             assert_eq!(waveform[0], 0.0);
             assert!(waveform[1].abs() > 0.0); // No additional attack ramp.
             assert_eq!(waveform[frames - 1], 0.0);
+        }
+    }
+
+    #[test]
+    fn short_grain_cache_reuses_only_the_matching_raw_cloud() {
+        let rate = 48_000;
+        let mut patch = LayerPatch {
+            model: Model::GrainCloud,
+            controls: crate::GRAIN_CLOUD.map(|control| control.decode(control.initial)),
+        };
+        let mut cache = CachedLayer::EMPTY;
+        let mut storage = vec![f32::NAN; layer_cache_frames(rate)];
+        let mut fresh_storage = storage.clone();
+        for (frames, control, value, _reuse) in [
+            (9000, 1, 120.0, false),
+            (9000, 9, 10.0, true),
+            (6000, 1, 80.0, true),
+            (8500, 1, 110.0, true),
+            (48_000, 1, 1000.0, false),
+            (9000, 1, 120.0, false),
+            (9000, 0, 70.0, false),
+            (9000, 9, 5.0, true),
+        ] {
+            patch.controls[control] = value;
+            let mut hit = vec![0.0; frames];
+            let mut fresh = hit.clone();
+            let mut timing = GrainTiming::default();
+            grain_cloud(
+                &patch,
+                &mut cache,
+                rate,
+                &mut hit,
+                &mut storage,
+                None,
+                &mut timing,
+            )
+            .unwrap();
+            #[cfg(feature = "profiling")]
+            assert_eq!(timing.accumulation.is_none(), _reuse);
+            cache.patch = patch;
+            let mut cold = CachedLayer::EMPTY;
+            grain_cloud(
+                &patch,
+                &mut cold,
+                rate,
+                &mut fresh,
+                &mut fresh_storage,
+                None,
+                &mut GrainTiming::default(),
+            )
+            .unwrap();
+            assert_eq!(hit, fresh);
         }
     }
 
@@ -1121,9 +1481,19 @@ mod tests {
                     &mut fresh_waveform,
                     &mut fresh_buffer,
                     None,
+                    &mut GrainTiming::default(),
                 )
                 .unwrap();
-                grain_cloud(&patch, &mut cached, rate, &mut waveform, &mut buffer, None).unwrap();
+                grain_cloud(
+                    &patch,
+                    &mut cached,
+                    rate,
+                    &mut waveform,
+                    &mut buffer,
+                    None,
+                    &mut GrainTiming::default(),
+                )
+                .unwrap();
                 assert_eq!(waveform, fresh_waveform);
                 assert!(waveform.iter().all(|sample| sample.is_finite()));
             }
@@ -1231,7 +1601,7 @@ mod tests {
         let modes = modal_modes(layer, rate);
         let mut noise = NoiseBand::new(650.0, 1200.0 + hardness * 72.0, rate);
         let beater_decay = decay_rate(13.0 - hardness * 0.1, rate);
-        render_layer(layer, rate, waveform, tables, |frame| {
+        render_layer(layer.controls[2], rate, waveform, tables, |frame| {
             let frame = frame as f32;
             let body = modes
                 .iter()
@@ -1361,7 +1731,7 @@ mod tests {
         let body_decay = decay_rate(decay, rate);
         let click_decay = decay_rate(click_decay, rate);
         let mut phase = 0.0;
-        render_layer(layer, rate, waveform, None, |frame| {
+        render_layer(layer.controls[2], rate, waveform, None, |frame| {
             let frame = frame as f32;
             let body = sine(phase) * exp2(frame * body_decay);
             let position = if curve == 0.0 {

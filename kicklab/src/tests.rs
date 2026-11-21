@@ -186,7 +186,8 @@ impl Host {
         assert_eq!(
             req.dram as usize,
             ((BUFFERS + layers as usize) * render::max_frames(48_000)
-                + layers as usize * render::layer_cache_frames(48_000))
+                + layers as usize * render::layer_cache_frames(48_000)
+                + render::spectral_workspace_frames(48_000))
                 * 4
         );
         let mut sram = vec![0; (req.sram as usize).div_ceil(8)];
@@ -562,7 +563,10 @@ fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
     let model = model_index(layer);
     let first_control = model + 2;
     let density_envelope = first_control + 6;
-    assert_eq!(unsafe { (*(*host.base).parameters.add(model)).max }, 4);
+    assert_eq!(
+        unsafe { (*(*host.base).parameters.add(model)).max },
+        (MODEL_NAMES.len() - 1) as i16
+    );
     host.values[model] = 4;
     host.values[density_envelope] = -25;
     host.notify(model);
@@ -594,6 +598,97 @@ fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
     host.set(model, 4);
     for (offset, control) in GRAIN_CLOUD.iter().enumerate() {
         assert_eq!(host.values[first_control + offset], control.initial);
+    }
+}
+
+#[test]
+fn hard_sync_switches_to_eight_controls_without_moving_mix_or_randomize() {
+    let mut host = Host::new(2);
+    let layer = 1;
+    let model = model_index(layer);
+    let solo = solo_index(layer);
+    let randomize = RANDOMIZE_START + layer;
+    host.set(model + 1, 78);
+    host.set(solo, 1);
+    host.set(model, 5);
+
+    let mut name = [0; PARAMETER_STRING_SIZE];
+    unsafe {
+        factory().parameter_string.unwrap()(host.base, model as i32, 5, name.as_mut_ptr());
+    }
+    assert_eq!(unsafe { CStr::from_ptr(name.as_ptr()) }, c"Hard Sync");
+    assert_eq!(host.values[model + 1], 78);
+    assert_eq!(host.values[solo], 1);
+    assert_eq!(
+        host.page(layer + 1),
+        (
+            1,
+            13,
+            [model, model + 1, solo, solo + 1]
+                .into_iter()
+                .chain(model + 2..model + 2 + HARD_SYNC.len())
+                .chain([randomize])
+                .map(|index| index as u8)
+                .collect()
+        )
+    );
+    for (offset, control) in HARD_SYNC.iter().enumerate() {
+        let definition = unsafe { *(*host.base).parameters.add(model + 2 + offset) };
+        assert_eq!(unsafe { CStr::from_ptr(definition.name) }, control.name);
+        assert_eq!([definition.min, definition.max], control.range);
+        assert_eq!(host.values[model + 2 + offset], control.initial);
+    }
+    host.step([0.0; 4]);
+    let rendered = host.complete();
+    assert!(host.sample(rendered, 761).abs() > 0.001);
+}
+
+#[test]
+fn new_kick_models_use_the_existing_layer_page_and_worker() {
+    let mut host = Host::new(4);
+    let layer = 3;
+    let base = model_index(layer);
+    let solo = solo_index(layer);
+    host.set(base + 1, 73);
+    host.set(solo, 1);
+    for (id, name, controls) in [
+        (6, c"Resonator", RESONATOR.as_slice()),
+        (7, c"Two-Operator FM", TWO_OPERATOR_FM.as_slice()),
+        (8, c"Noise Sweep", NOISE_SWEEP.as_slice()),
+        (9, c"Ring Mod", RING_MOD.as_slice()),
+        (10, c"Wavefold", WAVEFOLD.as_slice()),
+        (11, c"Delay Drum", DELAY_DRUM.as_slice()),
+        (12, c"Spectral Pulse", SPECTRAL_PULSE.as_slice()),
+    ] {
+        host.set(base, id);
+        let mut text = [0; PARAMETER_STRING_SIZE];
+        unsafe {
+            factory().parameter_string.unwrap()(
+                host.base,
+                base as i32,
+                i32::from(id),
+                text.as_mut_ptr(),
+            );
+        }
+        assert_eq!(unsafe { CStr::from_ptr(text.as_ptr()) }, name);
+        let expected: Vec<_> = [base, base + 1, solo, solo + 1]
+            .into_iter()
+            .chain(base + 2..base + 2 + controls.len())
+            .chain([RANDOMIZE_START + layer])
+            .map(|index| index as u8)
+            .collect();
+        assert_eq!(host.page(layer + 1), (1, expected.len() as u8, expected));
+        assert_eq!(host.values[base + 1], 73);
+        assert_eq!(host.values[solo], 1);
+        for (slot, control) in controls.iter().enumerate() {
+            let index = base + 2 + slot;
+            let definition = unsafe { *(*host.base).parameters.add(index) };
+            assert_eq!(unsafe { CStr::from_ptr(definition.name) }, control.name);
+            assert_eq!(host.values[index], control.initial);
+        }
+        host.step([0.0; 4]);
+        let wave = host.complete();
+        assert!((1..128).any(|frame| host.sample(wave, frame).abs() > 0.001));
     }
 }
 

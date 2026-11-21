@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import monitor_diagnostics
@@ -70,10 +71,159 @@ BIT_CASES = {
     ),
     "tone-cutoff": ({}, "L1: Tone Cutoff", (600, 3500, 1200, 6500)),
 }
+SYNC_DEFAULTS = {
+    TUNE: 510, "L1: Body Decay": 410, DRIVE: 50, "L1: Sweep Depth": 21,
+    "L1: Sweep Time": 34, "L1: Sync Bend": 55, "L1: Sync Decay": 110,
+    "L1: Tail Ratio": 100,
+}
+SYNC_REFERENCE = {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0} | SYNC_DEFAULTS
+SYNC_CASES = {
+    "tail-tune": ({}, TUNE, (420, 650, 530, 750)),
+    "tail-tune-sync-defaults": (SYNC_DEFAULTS, TUNE, (420, 650, 530, 750)),
+    "tail-tune-sync-steady": (
+        {"L1: Sweep Depth": 0, "L1: Sync Bend": 0},
+        TUNE, (420, 650, 530, 750),
+    ),
+    "tail-tune-sync-deep": (
+        {"L1: Sweep Depth": 60, "L1: Sync Bend": 120, "L1: Sweep Time": 200,
+         "L1: Sync Decay": 500, "L1: Tail Ratio": 585, "L1: Body Decay": 1000},
+        TUNE, (420, 650, 530, 750),
+    ),
+}
+GRAIN_DEFAULTS = {
+    TUNE: 550, "L1: Body Decay": 470, DRIVE: 40, "L1: Sweep Depth": 20,
+    "L1: Sweep Time": 70, "L1: Grain Size": 29, "L1: Grain Rate": 107,
+    "L1: Density Envelope": 0, "L1: Pitch Spread": 48, "L1: Timing Jitter": 35,
+}
+GRAIN_REFERENCE = {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0} | GRAIN_DEFAULTS
+GRAIN_CASES = {
+    "tail-tune": ({}, TUNE, (420, 650, 530, 750)),
+    "grain-rate": ({}, "L1: Grain Rate", (70, 150, 105, 210)),
+    "drive": ({}, DRIVE, (20, 75, 40, 140)),
+    "grain-defaults": (GRAIN_DEFAULTS, TUNE, (420, 650, 530, 750)),
+    "grain-dense": (
+        {"L1: Body Decay": 1000, "L1: Grain Size": 100, "L1: Grain Rate": 220,
+         "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+         "L1: Density Envelope": 30, "L1: Pitch Spread": 240, "L1: Timing Jitter": 100},
+        TUNE, (420, 650, 530, 750),
+    ),
+    "grain-zero-modulation": (
+        {"L1: Sweep Depth": 0, "L1: Pitch Spread": 0, "L1: Density Envelope": 0},
+        TUNE, (420, 650, 530, 750),
+    ),
+    "grain-short-drive": (
+        {"L1: Body Decay": 120}, DRIVE, (20, 75, 40, 140),
+    ),
+}
 MODELS = {
     "pitch-sweep": ("Pitch Sweep", 1, REFERENCE, CASES),
     "modal-drum": ("Modal Drum", 2, MODAL_REFERENCE, MODAL_CASES),
     "bit-logic": ("Bit Logic", 3, BIT_REFERENCE, BIT_CASES),
+    "hard-sync": ("Hard Sync", 5, SYNC_REFERENCE, SYNC_CASES),
+    "grain-cloud": ("Grain Cloud", 4, GRAIN_REFERENCE, GRAIN_CASES),
+    "resonator": (
+        "Resonator", 6,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 530,
+         "L1: Body Decay": 820, DRIVE: 10, "L1: Sweep Depth": 13, "L1: Sweep Time": 12,
+         "L1: Tail Pitch Drift": 15, "L1: Excitation": 65, "L1: Exciter Width": 50,
+         "L1: Tone Cutoff": 2000},
+        {
+            "resonator-default": ({}, TUNE, (420, 650, 530, 750)),
+            "resonator-deep": (
+                {"L1: Body Decay": 1000, "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+                 "L1: Tail Pitch Drift": 60, "L1: Exciter Width": 300},
+                TUNE, (420, 650, 530, 750),
+            ),
+        },
+    ),
+    "two-operator-fm": (
+        "Two-Operator FM", 7,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 490,
+         "L1: Body Decay": 420, DRIVE: 30, "L1: Sweep Depth": 24, "L1: Sweep Time": 22,
+         "L1: FM Amount": 320, "L1: Modulator Ratio": 345, "L1: FM Decay": 78,
+         "L1: Modulator Sweep": 0},
+        {
+            "fm-default": ({}, TUNE, (420, 650, 530, 750)),
+            "fm-deep": (
+                {"L1: Body Decay": 1000, "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+                 "L1: FM Amount": 900, "L1: Modulator Ratio": 1600,
+                 "L1: FM Decay": 400, "L1: Modulator Sweep": 36},
+                TUNE, (420, 650, 530, 750),
+            ),
+            "fm-amount-off": ({"L1: FM Amount": 0}, TUNE, (420, 650, 530, 750)),
+        },
+    ),
+    "noise-sweep": (
+        "Noise Sweep", 8,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, "L1: Tail Center": 580,
+         "L1: Body Decay": 260, DRIVE: 40, "L1: Sweep Depth": 41, "L1: Sweep Time": 27,
+         "L1: Filter Q": 41, "L1: Q Sweep": 0, "L1: Grain": 12},
+        {
+            "noise-default": ({}, "L1: Tail Center", (420, 650, 530, 750)),
+            "noise-deep": (
+                {"L1: Body Decay": 1000, "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+                 "L1: Filter Q": 5, "L1: Q Sweep": -30, "L1: Grain": 100},
+                "L1: Tail Center", (420, 650, 530, 750),
+            ),
+            "noise-steady": (
+                {"L1: Sweep Depth": 0, "L1: Q Sweep": 0, "L1: Grain": 0},
+                "L1: Tail Center", (420, 650, 530, 750),
+            ),
+        },
+    ),
+    "ring-mod": (
+        "Ring Mod", 9,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 520,
+         "L1: Body Decay": 420, DRIVE: 30, "L1: Sweep Depth": 17, "L1: Sweep Time": 32,
+         "L1: Lower Osc Ratio": 350, "L1: Clang Level": 65, "L1: Clang Decay": 102,
+         "L1: Clang Pitch Env": 0},
+        {
+            "ring-default": ({}, TUNE, (420, 650, 530, 750)),
+            "ring-deep": ({"L1: Body Decay": 1000, "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+                           "L1: Lower Osc Ratio": 900, "L1: Clang Level": 100,
+                           "L1: Clang Decay": 600, "L1: Clang Pitch Env": -24},
+                          TUNE, (420, 650, 530, 750)),
+        },
+    ),
+    "wavefold": (
+        "Wavefold", 10,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 490,
+         "L1: Body Decay": 430, DRIVE: 10, "L1: Sweep Depth": 16, "L1: Sweep Time": 28,
+         "L1: Fold Amount": 42, "L1: Fold Decay": 158, "L1: Fold Bias": 26,
+         "L1: Clean Sub Blend": 0},
+        {
+            "fold-default": ({}, TUNE, (420, 650, 530, 750)),
+            "fold-deep": ({"L1: Body Decay": 1000, "L1: Sweep Depth": 60, "L1: Sweep Time": 200,
+                           "L1: Fold Amount": 100, "L1: Fold Decay": 650, "L1: Fold Bias": -80},
+                          TUNE, (420, 650, 530, 750)),
+            "fold-clean": ({"L1: Clean Sub Blend": 100}, TUNE, (420, 650, 530, 750)),
+        },
+    ),
+    "delay-drum": (
+        "Delay Drum", 11,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 640,
+         "L1: Body Decay": 520, DRIVE: 50, "L1: Loop Cutoff": 1700, "L1: Strike Mix": 100,
+         "L1: Strike Width": 57, "L1: Strike Tone": 2600},
+        {
+            "delay-default": ({}, TUNE, (420, 650, 530, 750)),
+            "delay-long": ({"L1: Body Decay": 1000, "L1: Loop Cutoff": 250,
+                            "L1: Strike Mix": 0, "L1: Strike Width": 200,
+                            "L1: Strike Tone": 8500}, TUNE, (250, 325, 460, 640)),
+        },
+    ),
+    "spectral-pulse": (
+        "Spectral Pulse", 12,
+        {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 540,
+         "L1: Body Decay": 345, DRIVE: 20, "L1: Snap Level": 75, "L1: Snap Center": 720,
+         "L1: Snap Bandwidth": 38, "L1: Dispersion": 12},
+        {
+            "spectral-default": ({}, TUNE, (420, 650, 530, 750)),
+            "spectral-wide": ({"L1: Body Decay": 850, "L1: Snap Level": 100,
+                               "L1: Snap Center": 3800, "L1: Snap Bandwidth": 100,
+                               "L1: Dispersion": 200}, TUNE, (420, 650, 530, 750)),
+            "spectral-bass": ({"L1: Snap Level": 0}, TUNE, (420, 650, 530, 750)),
+        },
+    ),
 }
 NTP_SEQUENCE = slice(13, 18)
 
@@ -94,6 +244,28 @@ def choose_port(names, requested):
     if len(candidates) != 1:
         raise ValueError(f"Expected one Disting NT port, found {candidates!r} in {names!r}")
     return candidates[0]
+
+
+@contextmanager
+def polling_input(mido, name):
+    # Windows RtMidi can stall when a port closes with a receive callback
+    # active. The benchmark only polls, so use RtMidi's queue directly.
+    import rtmidi
+
+    midi_in = rtmidi.MidiIn()
+    midi_in.ignore_types(sysex=False)
+    midi_in.open_port(midi_in.get_ports().index(name))
+
+    class Input:
+        @staticmethod
+        def poll():
+            received = midi_in.get_message()
+            return mido.Message.from_bytes(received[0]) if received is not None else None
+
+    try:
+        yield Input()
+    finally:
+        midi_in.close_port()
 
 
 class Device:
@@ -298,7 +470,8 @@ def main():
                         help="Send verified edits to a build without profiling telemetry")
     parser.add_argument("--model", choices=MODELS, default="pitch-sweep")
     workload = parser.add_mutually_exclusive_group()
-    workload.add_argument("--case", action="append", choices=sorted(CASES.keys() | MODAL_CASES.keys() | BIT_CASES.keys()))
+    workload.add_argument("--case", action="append",
+                          choices=sorted({name for _, _, _, cases in MODELS.values() for name in cases}))
     workload.add_argument("--sweep", nargs="+", metavar="FIELD_OR_VALUE",
                           help="A layer 1 field name followed by raw SysEx values")
     parser.add_argument("--seconds", type=int, default=12, choices=range(8, 101),
@@ -336,7 +509,7 @@ def main():
     with args.summary.open("x", encoding="utf-8") as summary:
         try:
             with (args.output.open("x", encoding="utf-8") as raw,
-                  mido.open_input(input_port) as rx, mido.open_output(output_port) as tx):
+                  polling_input(mido, input_port) as rx, mido.open_output(output_port) as tx):
                 device = Device(mido, rx, tx, capture, raw, args)
                 params = device.parameters(args.model)
                 result["original"] = {name: params[name][3] for name in reference}

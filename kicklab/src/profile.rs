@@ -9,12 +9,22 @@ pub struct RenderTiming {
     pub synthesis: [Option<u32>; crate::MAX_LAYERS],
     pub lowpass: Option<u32>,
     pub gain_and_peak: Option<u32>,
+    pub grains: [GrainTiming; crate::MAX_LAYERS],
+}
+#[derive(Clone, Copy, Default)]
+pub struct GrainTiming {
+    pub accumulation: Option<u32>,
+    pub shaping: Option<u32>,
 }
 pub const NO_RENDER_TIMING: RenderTiming = RenderTiming {
     total: None,
     synthesis: [None; crate::MAX_LAYERS],
     lowpass: None,
     gain_and_peak: None,
+    grains: [GrainTiming {
+        accumulation: None,
+        shaping: None,
+    }; crate::MAX_LAYERS],
 };
 
 pub const STEP: usize = 0;
@@ -29,7 +39,9 @@ pub const SUBMIT: usize = 8;
 const CALLBACK_TOTAL: usize = 9;
 const OUTSIDE_CALLBACK: usize = 10;
 pub const TELEMETRY_SEND: usize = 11;
-pub(crate) const FUNCTIONS: [&[u8]; 12] = [
+const GRAIN_ACCUMULATION: usize = 12;
+const GRAIN_SHAPING: usize = 13;
+pub(crate) const FUNCTIONS: [&[u8]; 14] = [
     b"KickLab::step",
     b"KickLab::process_render",
     b"KickLab::render::render",
@@ -42,6 +54,8 @@ pub(crate) const FUNCTIONS: [&[u8]; 12] = [
     b"KickLab::callback_total",
     b"KickLab::outside_callback",
     b"KickLab::profiling_midi_send",
+    b"KickLab::render::grain_accumulation",
+    b"KickLab::render::grain_shaping",
 ];
 const FUNCTION_COUNT: usize = FUNCTIONS.len();
 const METADATA_PACKETS: usize = 1 + FUNCTION_COUNT;
@@ -57,6 +71,8 @@ const BUILD: u32 = build_id(&[
     include_bytes!("profile.rs"),
     include_bytes!("playback.rs"),
     include_bytes!("render.rs"),
+    include_bytes!("extra_models.rs"),
+    include_bytes!("spectral.rs"),
     include_bytes!("../Cargo.toml"),
     include_bytes!("../../Cargo.lock"),
     include_bytes!("../../.cargo/config.toml"),
@@ -196,6 +212,14 @@ impl Meter {
         }
         if let Some(cycles) = timing.gain_and_peak {
             self.record(GAIN_AND_PEAK, cycles);
+        }
+        for grain in timing.grains {
+            if let Some(cycles) = grain.accumulation {
+                self.record(GRAIN_ACCUMULATION, cycles);
+            }
+            if let Some(cycles) = grain.shaping {
+                self.record(GRAIN_SHAPING, cycles);
+            }
         }
     }
 
