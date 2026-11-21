@@ -21,6 +21,7 @@ std::thread_local! {
     static CYCLES: Cell<u32> = const { Cell::new(u32::MAX - 7) };
     static AUDIO_WRITES: Cell<usize> = const { Cell::new(0) };
     static REENTER_RANDOMIZE: Cell<Option<usize>> = const { Cell::new(None) };
+    static DEFER_MODEL_NOTIFICATION: Cell<bool> = const { Cell::new(false) };
 }
 
 #[no_mangle]
@@ -101,11 +102,11 @@ extern "C" fn NT_setParameterFromAudio(algorithm: u32, parameter: u32, value: i1
     AUDIO_WRITES.with(|writes| writes.set(writes.get() + 1));
     let base = ACTIVE.with(Cell::get);
     let local = (parameter - NT_parameterOffset()) as usize;
-    assert!(!matches!(
-        parameter_layer(local as i32, MAX_LAYERS),
-        Some((_, 0))
-    ));
+    let is_model = matches!(parameter_layer(local as i32, MAX_LAYERS), Some((_, 0)));
     unsafe {
+        if is_model {
+            assert_eq!((*base).v.add(RANDOMIZE_LAYERS).read(), 1);
+        }
         if let Some(action) = REENTER_RANDOMIZE.with(Cell::take) {
             assert_eq!((*base).v.add(action).read(), 1);
             factory().parameter_changed.unwrap()(base, action as i32);
@@ -116,7 +117,9 @@ extern "C" fn NT_setParameterFromAudio(algorithm: u32, parameter: u32, value: i1
             .add(local)
             .cast_mut()
             .write(value.clamp(def.min, def.max));
-        factory().parameter_changed.unwrap()(base, local as i32);
+        if !is_model || !DEFER_MODEL_NOTIFICATION.with(Cell::get) {
+            factory().parameter_changed.unwrap()(base, local as i32);
+        }
     }
 }
 
@@ -125,7 +128,7 @@ extern "C" fn NT_updateParameterDefinition(algorithm: u32, local_parameter: u32)
     assert_eq!(algorithm, 3);
     assert!(matches!(
         parameter_layer(local_parameter as i32, MAX_LAYERS),
-        Some((_, 2..))
+        Some((_, LAYER_FIRST_CONTROL..))
     ));
     // Simulate a host that clamps the value on a definition change.
     let base = ACTIVE.with(Cell::get);
@@ -188,7 +191,7 @@ impl Host {
             itc: 0,
         };
         unsafe { factory().calculate_requirements.unwrap()(&mut req, specs.as_ptr()) };
-        assert_eq!(req.num_parameters as usize, solo_index(layers as usize));
+        assert_eq!(req.num_parameters as usize, model_index(layers as usize));
         assert_eq!(
             req.dram as usize,
             (((buffers + layers) as usize) * render::max_frames(48_000)
@@ -319,8 +322,8 @@ fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages()
 fn two_output_buffers_wait_for_a_playing_tail_before_reusing_its_slot() {
     let mut host = Host::with_specs([1, 2]);
     host.notify(TRIGGER);
-    let level = model_index(0) + 1;
-    host.set(model_index(0) + 3, 45);
+    let level = model_index(0) + LAYER_LEVEL;
+    host.set(model_index(0) + LAYER_FIRST_CONTROL + 1, 45);
     host.step([0.0; 4]);
     assert_eq!(host.complete(), 0);
     host.step([5.0, 0.0, 0.0, 0.0]);
@@ -343,6 +346,28 @@ fn two_output_buffers_wait_for_a_playing_tail_before_reusing_its_slot() {
 }
 
 #[test]
+fn a_new_instance_starts_with_the_captured_pitch_sweep_patch_on_layer_one() {
+    let mut host = Host::new(2);
+    let first = model_index(0);
+    let second = model_index(1);
+    let controls = first + LAYER_FIRST_CONTROL;
+    assert_eq!(&host.values[first..controls], &[1, 0, 100, 0, 0]);
+    assert_eq!(
+        &host.values[controls..controls + PITCH_SWEEP.len()],
+        &[900, 500, 164, 10, 50, 15, 20, 3000, 160]
+    );
+    assert_eq!(host.values[second], 0);
+
+    host.set(second, 1);
+    for (slot, control) in PITCH_SWEEP.iter().enumerate() {
+        assert_eq!(
+            host.values[second + LAYER_FIRST_CONTROL + slot],
+            control.initial
+        );
+    }
+}
+
+#[test]
 fn model_controls_refresh_on_notification_and_preserve_restored_values() {
     let mut host = Host::uninitialized(2);
     let first = model_index(0);
@@ -362,65 +387,77 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
     host.step([0.0; 4]);
     assert!(WORK.with(Cell::get).is_none());
     host.values[first] = 3;
-    host.values[first + 2 + 5] = 415; // Outside the Pitch Sweep slot's range.
-    host.values[first + 2 + 8] = 2; // OR
-    host.values[first + 1] = 72;
+    host.values[first + LAYER_FIRST_CONTROL + 5] = 415; // Outside the Pitch Sweep slot's range.
+    host.values[first + LAYER_FIRST_CONTROL + 8] = 2; // OR
+    host.values[first + LAYER_LEVEL] = 72;
+    host.values[first + LAYER_SOLO] = 1;
+    host.values[first + LAYER_MUTE] = 1;
     host.notify(first);
-    assert_eq!(host.values[first + 7], 415);
-    assert_eq!(host.values[first + 10], 2);
+    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 5], 415);
+    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 8], 2);
     assert_eq!(
         host.page(1),
-        (
-            1,
-            15,
-            [
-                first as u8,
-                (first + 1) as u8,
-                MIX_START as u8,
-                (MIX_START + 1) as u8
-            ]
-            .into_iter()
-            .chain((first + 2) as u8..(first + 12) as u8)
-            .chain([RANDOMIZE_START as u8])
-            .collect()
-        )
+        (1, 15, (first as u8..(first + LAYER_FIELDS) as u8).collect())
     );
     assert_eq!(host.page(2), (1, 1, vec![second as u8]));
     assert_eq!(PAGE_UPDATES.with(Cell::get), 1);
 
     host.set(first, 2);
     assert_eq!(host.values[first], 2);
-    assert_eq!(host.values[first + 1], 72);
-    assert_eq!(host.values[first + 2], 570);
-    assert_eq!(host.values[first + 7], 50);
+    assert_eq!(host.values[first + LAYER_LEVEL], 72);
+    assert_eq!(
+        &host.values[first + LAYER_SOLO..=first + LAYER_MUTE],
+        &[1, 1]
+    );
+    assert_eq!(host.values[first + LAYER_FIRST_CONTROL], 570);
+    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 5], 50);
     assert_eq!(host.page(1).1, 13);
-    assert_eq!(host.page(1).2.last(), Some(&(RANDOMIZE_START as u8)));
+    assert_eq!(
+        &host.page(1).2[..5],
+        &[
+            first as u8,
+            (first + LAYER_RANDOMIZE) as u8,
+            (first + LAYER_LEVEL) as u8,
+            (first + LAYER_SOLO) as u8,
+            (first + LAYER_MUTE) as u8
+        ]
+    );
     host.set(first, 0);
     assert_eq!(host.page(1), (1, 1, vec![first as u8]));
     host.set(first, 3);
-    assert_eq!(host.values[first + 7], 205);
+    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 5], 205);
     assert_eq!(host.page(1).1, 15);
 }
 
 #[test]
-fn mix_switches_and_randomize_have_stable_ordinals_at_every_layer_count() {
+fn common_controls_have_stable_ordinals_at_every_layer_count() {
     for count in 1..=MAX_LAYERS {
         let mut host = Host::new(count as i32);
         host.step([0.0; 4]);
         for layer in 0..count {
-            let index = RANDOMIZE_START + layer;
-            let solo = MIX_START + 2 * layer;
+            let base = GLOBALS + 15 * layer;
+            let index = base + 1;
+            let solo = base + 3;
             let (group, _, indices) = host.page(layer + 1);
             assert_eq!(group, 1);
-            assert_eq!(indices[0] as usize, model_index(layer));
+            assert_eq!(indices[0] as usize, base);
             if layer == 0 {
                 assert_eq!(
-                    &indices[1..4],
-                    &[(model_index(layer) + 1) as u8, solo as u8, (solo + 1) as u8]
+                    &indices[1..5],
+                    &[index as u8, (base + 2) as u8, solo as u8, (solo + 1) as u8]
                 );
-                assert_eq!(indices.last().copied(), Some(index as u8));
             } else {
                 assert_eq!(indices.len(), 1);
+            }
+            for (offset, name) in [
+                (0, c"Model"),
+                (1, c"Randomize"),
+                (2, c"Level"),
+                (3, c"Solo"),
+                (4, c"Mute"),
+            ] {
+                let def = unsafe { *(*host.base).parameters.add(base + offset) };
+                assert_eq!(unsafe { CStr::from_ptr(def.name) }, name);
             }
             let def = unsafe { *(*host.base).parameters.add(index) };
             assert_eq!(unsafe { CStr::from_ptr(def.name) }, c"Randomize");
@@ -452,11 +489,7 @@ fn mix_switches_and_randomize_have_stable_ordinals_at_every_layer_count() {
                 );
             }
         }
-        for index in (model_index(count)..RANDOMIZE_START).chain(RANDOMIZE_START + count..MIX_START)
-        {
-            let def = unsafe { *(*host.base).parameters.add(index) };
-            assert_eq!(unsafe { CStr::from_ptr(def.name) }, c"Unused");
-        }
+        assert_eq!(host.values.len(), GLOBALS + 15 * count);
     }
 }
 
@@ -464,11 +497,11 @@ fn mix_switches_and_randomize_have_stable_ordinals_at_every_layer_count() {
 fn confirmed_randomize_runs_once_and_rearms_after_reset() {
     let mut host = Host::uninitialized(2);
     let base = model_index(1);
-    let action = RANDOMIZE_START + 1;
+    let action = base + LAYER_RANDOMIZE;
     host.values[base] = 3;
-    host.values[base + 1] = 37;
-    host.values[solo_index(1)] = 1;
-    host.values[solo_index(1) + 1] = 1;
+    host.values[base + LAYER_LEVEL] = 37;
+    host.values[model_index(1) + LAYER_SOLO] = 1;
+    host.values[model_index(1) + LAYER_MUTE] = 1;
     host.values[action] = 1;
     let original = host.values.clone();
     host.notify(action);
@@ -477,7 +510,10 @@ fn confirmed_randomize_runs_once_and_rearms_after_reset() {
     host.complete();
     host.step([0.0; 4]);
     assert_eq!(host.values[action], 0);
-    assert_eq!(host.values[base + 1], original[base + 1]);
+    assert_eq!(
+        host.values[base + LAYER_LEVEL],
+        original[base + LAYER_LEVEL]
+    );
 
     let before = host.values.clone();
     let mut text = [0; PARAMETER_STRING_SIZE];
@@ -495,17 +531,21 @@ fn confirmed_randomize_runs_once_and_rearms_after_reset() {
         host.notify(action);
         assert_eq!(AUDIO_WRITES.with(Cell::get) - writes, BIT_LOGIC.len() + 1);
         assert_eq!(host.values[action], 0);
-        assert_eq!(&host.values[..base + 2], &before[..base + 2]);
+        assert_eq!(
+            &host.values[..base + LAYER_FIRST_CONTROL],
+            &before[..base + LAYER_FIRST_CONTROL]
+        );
         assert_eq!(
             &host.values[base + LAYER_FIELDS..],
             &before[base + LAYER_FIELDS..]
         );
         assert_ne!(
-            &host.values[base + 2..base + LAYER_FIELDS],
-            &before[base + 2..base + LAYER_FIELDS]
+            &host.values[base + LAYER_FIRST_CONTROL..base + LAYER_FIELDS],
+            &before[base + LAYER_FIRST_CONTROL..base + LAYER_FIELDS]
         );
         for (offset, control) in BIT_LOGIC.iter().enumerate() {
-            assert!((control.range[0]..=control.range[1]).contains(&host.values[base + 2 + offset]));
+            assert!((control.range[0]..=control.range[1])
+                .contains(&host.values[base + LAYER_FIRST_CONTROL + offset]));
         }
         host.step([0.0; 4]);
         host.complete();
@@ -517,12 +557,94 @@ fn confirmed_randomize_runs_once_and_rearms_after_reset() {
     host.step([0.0; 4]);
     host.complete();
     host.step([0.0; 4]);
-    let level = host.values[base + 1];
+    let level = host.values[base + LAYER_LEVEL];
     host.set(action, 1);
     host.step([0.0; 4]);
-    assert_eq!(host.values[base + 1], level);
+    assert_eq!(host.values[base + LAYER_LEVEL], level);
     assert_eq!(host.values[action], 0);
     assert!(WORK.with(Cell::get).is_none());
+}
+
+#[test]
+fn confirmed_global_randomize_selects_models_and_preserves_layer_switches() {
+    CYCLES.with(|cycles| cycles.set(1));
+    let mut host = Host::uninitialized(4);
+    let action = RANDOMIZE_LAYERS;
+    assert_eq!(host.page(0), (0, 6, (0..GLOBALS as u8).collect::<Vec<_>>()));
+    let def = unsafe { *(*host.base).parameters.add(action) };
+    assert_eq!(unsafe { CStr::from_ptr(def.name) }, c"Randomize Layers");
+    assert_eq!(
+        (def.min, def.max, def.default, def.unit),
+        (0, 1, 0, UNIT_CONFIRM)
+    );
+
+    host.values[action] = 1;
+    host.notify(action);
+    assert_eq!(host.values[action], 0);
+    assert_eq!(host.values[model_index(0)], 1);
+
+    let mut text = [0; PARAMETER_STRING_SIZE];
+    let writes = AUDIO_WRITES.with(Cell::get);
+    unsafe {
+        factory().parameter_string.unwrap()(host.base, action as i32, 1, text.as_mut_ptr());
+    }
+    assert_eq!(unsafe { CStr::from_ptr(text.as_ptr()) }, c"Randomize?");
+    assert_eq!(AUDIO_WRITES.with(Cell::get), writes);
+
+    for layer in 0..4 {
+        let base = model_index(layer);
+        host.values[base + LAYER_SOLO] = i16::from(layer == 1);
+        host.values[base + LAYER_MUTE] = i16::from(layer == 0);
+        host.values[base + LAYER_RANDOMIZE] = i16::from(layer == 2);
+    }
+    let original = host.values.clone();
+    let mut expected_seed = 1;
+    for (defer, expected) in [
+        (false, [(0, 1), (8, 7), (9, 1), (11, 1)]),
+        (true, [(0, 67), (4, 22), (10, 55), (6, 8)]),
+    ] {
+        DEFER_MODEL_NOTIFICATION.with(|pending| pending.set(defer));
+        REENTER_RANDOMIZE.with(|pending| pending.set(Some(action)));
+        host.set(action, 1);
+        DEFER_MODEL_NOTIFICATION.with(|pending| pending.set(false));
+        assert_eq!(host.values[action], 0);
+        let writes = AUDIO_WRITES.with(Cell::get);
+        host.notify(action);
+        assert_eq!(AUDIO_WRITES.with(Cell::get), writes);
+        assert_eq!(host.values[..action], original[..action]);
+
+        for (layer, (model, level)) in expected.into_iter().enumerate() {
+            let base = model_index(layer);
+            assert_eq!(host.values[base], model);
+            assert_eq!(host.values[base + LAYER_LEVEL], level);
+            assert_eq!(random_value(&mut expected_seed, 0, 12), model);
+            assert_eq!(random_value(&mut expected_seed, 0, 100), level);
+            for offset in [LAYER_RANDOMIZE, LAYER_SOLO, LAYER_MUTE] {
+                assert_eq!(host.values[base + offset], original[base + offset]);
+            }
+            let controls = Model::from_value(model).controls();
+            let visible = if model == 0 {
+                1
+            } else {
+                LAYER_FIRST_CONTROL + controls.len()
+            };
+            assert_eq!(
+                host.page(layer + 1).2,
+                (base as u8..(base + visible) as u8).collect::<Vec<_>>()
+            );
+            for (offset, control) in controls.iter().enumerate() {
+                let i = base + LAYER_FIRST_CONTROL + offset;
+                let def = unsafe { *(*host.base).parameters.add(i) };
+                assert_eq!(unsafe { CStr::from_ptr(def.name) }, control.name);
+                let [min, max] = control.range;
+                assert_eq!(host.values[i], random_value(&mut expected_seed, min, max));
+            }
+        }
+        host.step([0.0; 4]);
+        host.complete();
+        host.step([0.0; 4]);
+        assert!(WORK.with(Cell::get).is_none());
+    }
 }
 
 #[test]
@@ -563,10 +685,10 @@ fn mix_applies_layer_levels_to_cached_waveforms() {
     host.set(model_index(1), 2);
     host.set(model_index(2), 3);
     for layer in 0..3 {
-        host.set(model_index(layer) + 1, 10);
+        host.set(model_index(layer) + LAYER_LEVEL, 10);
     }
     for (layer, decay) in [45, 120, 90].into_iter().enumerate() {
-        host.set(model_index(layer) + 3, decay);
+        host.set(model_index(layer) + LAYER_FIRST_CONTROL + 1, decay);
     }
     host.step([0.0; 4]);
     let original_mix = host.complete();
@@ -581,8 +703,8 @@ fn mix_applies_layer_levels_to_cached_waveforms() {
     assert_ne!(modal_tail, 0.0);
     assert_eq!(host.sample(original_mix, 7500), modal_tail);
 
-    host.set(model_index(0) + 1, 0);
-    host.set(model_index(1) + 1, 20);
+    host.set(model_index(0) + LAYER_LEVEL, 0);
+    host.set(model_index(1) + LAYER_LEVEL, 20);
     host.step([0.0; 4]);
     let remixed = host.complete();
     assert_ne!(remixed, original_mix);
@@ -600,6 +722,8 @@ fn mix_applies_layer_levels_to_cached_waveforms() {
 fn switching_models_reuses_the_layer_cache_and_regenerates_its_contents() {
     let mut host = Host::new(1);
     let model = model_index(0);
+    host.set(model, 0);
+    host.set(model, 1);
     host.step([0.0; 4]);
     host.complete();
     let prefix_frames = render::layer_cache_frames(48_000) / 2;
@@ -630,7 +754,7 @@ fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
     let mut host = Host::uninitialized(4);
     let layer = 3;
     let model = model_index(layer);
-    let first_control = model + 2;
+    let first_control = model + LAYER_FIRST_CONTROL;
     let density_envelope = first_control + 6;
     assert_eq!(
         unsafe { (*(*host.base).parameters.add(model)).max },
@@ -649,12 +773,7 @@ fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
     assert_eq!(group, 1);
     assert_eq!(
         indices,
-        [model, model + 1, solo_index(layer), solo_index(layer) + 1]
-            .into_iter()
-            .chain(first_control..first_control + GRAIN_CLOUD.len())
-            .chain([RANDOMIZE_START + layer])
-            .map(|index| index as u8)
-            .collect::<Vec<_>>()
+        (model as u8..(first_control + GRAIN_CLOUD.len()) as u8).collect::<Vec<_>>()
     );
     for (offset, control) in GRAIN_CLOUD.iter().enumerate() {
         let parameter = unsafe { *(*host.base).parameters.add(first_control + offset) };
@@ -675,9 +794,8 @@ fn hard_sync_switches_to_eight_controls_without_moving_mix_or_randomize() {
     let mut host = Host::new(2);
     let layer = 1;
     let model = model_index(layer);
-    let solo = solo_index(layer);
-    let randomize = RANDOMIZE_START + layer;
-    host.set(model + 1, 78);
+    let solo = model + LAYER_SOLO;
+    host.set(model + LAYER_LEVEL, 78);
     host.set(solo, 1);
     host.set(model, 5);
 
@@ -686,26 +804,28 @@ fn hard_sync_switches_to_eight_controls_without_moving_mix_or_randomize() {
         factory().parameter_string.unwrap()(host.base, model as i32, 5, name.as_mut_ptr());
     }
     assert_eq!(unsafe { CStr::from_ptr(name.as_ptr()) }, c"Hard Sync");
-    assert_eq!(host.values[model + 1], 78);
+    assert_eq!(host.values[model + LAYER_LEVEL], 78);
     assert_eq!(host.values[solo], 1);
     assert_eq!(
         host.page(layer + 1),
         (
             1,
             13,
-            [model, model + 1, solo, solo + 1]
-                .into_iter()
-                .chain(model + 2..model + 2 + HARD_SYNC.len())
-                .chain([randomize])
-                .map(|index| index as u8)
-                .collect()
+            (model as u8..(model + LAYER_FIRST_CONTROL + HARD_SYNC.len()) as u8).collect()
         )
     );
     for (offset, control) in HARD_SYNC.iter().enumerate() {
-        let definition = unsafe { *(*host.base).parameters.add(model + 2 + offset) };
+        let definition = unsafe {
+            *(*host.base)
+                .parameters
+                .add(model + LAYER_FIRST_CONTROL + offset)
+        };
         assert_eq!(unsafe { CStr::from_ptr(definition.name) }, control.name);
         assert_eq!([definition.min, definition.max], control.range);
-        assert_eq!(host.values[model + 2 + offset], control.initial);
+        assert_eq!(
+            host.values[model + LAYER_FIRST_CONTROL + offset],
+            control.initial
+        );
     }
     host.step([0.0; 4]);
     let rendered = host.complete();
@@ -717,8 +837,8 @@ fn new_kick_models_use_the_existing_layer_page_and_worker() {
     let mut host = Host::new(4);
     let layer = 3;
     let base = model_index(layer);
-    let solo = solo_index(layer);
-    host.set(base + 1, 73);
+    let solo = base + LAYER_SOLO;
+    host.set(base + LAYER_LEVEL, 73);
     host.set(solo, 1);
     for (id, name, controls) in [
         (6, c"Resonator", RESONATOR.as_slice()),
@@ -740,17 +860,13 @@ fn new_kick_models_use_the_existing_layer_page_and_worker() {
             );
         }
         assert_eq!(unsafe { CStr::from_ptr(text.as_ptr()) }, name);
-        let expected: Vec<_> = [base, base + 1, solo, solo + 1]
-            .into_iter()
-            .chain(base + 2..base + 2 + controls.len())
-            .chain([RANDOMIZE_START + layer])
-            .map(|index| index as u8)
-            .collect();
+        let expected: Vec<_> =
+            (base as u8..(base + LAYER_FIRST_CONTROL + controls.len()) as u8).collect();
         assert_eq!(host.page(layer + 1), (1, expected.len() as u8, expected));
-        assert_eq!(host.values[base + 1], 73);
+        assert_eq!(host.values[base + LAYER_LEVEL], 73);
         assert_eq!(host.values[solo], 1);
         for (slot, control) in controls.iter().enumerate() {
-            let index = base + 2 + slot;
+            let index = base + LAYER_FIRST_CONTROL + slot;
             let definition = unsafe { *(*host.base).parameters.add(index) };
             assert_eq!(unsafe { CStr::from_ptr(definition.name) }, control.name);
             assert_eq!(host.values[index], control.initial);
@@ -766,7 +882,7 @@ fn solo_and_mute_select_which_cached_layers_are_mixed() {
     let mut host = Host::new(3);
     host.set(model_index(1), 2);
     for layer in 0..2 {
-        host.set(model_index(layer) + 1, 10);
+        host.set(model_index(layer) + LAYER_LEVEL, 10);
     }
     host.step([0.0; 4]);
     let initial = host.complete();
@@ -779,13 +895,13 @@ fn solo_and_mute_select_which_cached_layers_are_mixed() {
 
     let page_updates = PAGE_UPDATES.with(Cell::get);
     for (parameter, value, expected) in [
-        (solo_index(2), 1, first + second), // A layer with Model Off cannot solo.
-        (solo_index(0), 1, first),
-        (solo_index(1), 1, first + second),
-        (solo_index(0) + 1, 1, second),
-        (solo_index(0), 0, second),
-        (solo_index(1), 0, second),
-        (solo_index(0) + 1, 0, first + second),
+        (model_index(2) + LAYER_SOLO, 1, first + second), // A layer with Model Off cannot solo.
+        (model_index(0) + LAYER_SOLO, 1, first),
+        (model_index(1) + LAYER_SOLO, 1, first + second),
+        (model_index(0) + LAYER_MUTE, 1, second),
+        (model_index(0) + LAYER_SOLO, 0, second),
+        (model_index(1) + LAYER_SOLO, 0, second),
+        (model_index(0) + LAYER_MUTE, 0, first + second),
     ] {
         host.set(parameter, value);
         host.step([0.0; 4]);
@@ -796,8 +912,8 @@ fn solo_and_mute_select_which_cached_layers_are_mixed() {
     }
     assert_eq!(PAGE_UPDATES.with(Cell::get), page_updates);
 
-    host.set(solo_index(0), 1);
-    host.set(solo_index(0) + 1, 1);
+    host.set(model_index(0) + LAYER_SOLO, 1);
+    host.set(model_index(0) + LAYER_MUTE, 1);
     host.step([0.0; 4]);
     host.complete();
     if !cfg!(feature = "profiling-hold-playback") {
@@ -816,11 +932,11 @@ fn one_second_cap_fades_and_finishes_all_models_and_the_filter_tail() {
     ] {
         let mut host = Host::uninitialized(1);
         host.values[model_index(0)] = model;
-        host.values[model_index(0) + 3] = decay;
+        host.values[model_index(0) + LAYER_FIRST_CONTROL + 1] = decay;
         host.values[CUTOFF] = cutoff;
         host.notify(model_index(0));
         host.step([0.0; 4]);
-        let decay_index = model_index(0) + 3;
+        let decay_index = model_index(0) + LAYER_FIRST_CONTROL + 1;
         assert_eq!(host.values[decay_index], decay.min(1000));
         assert_eq!(
             unsafe { (*(*host.base).parameters.add(decay_index)).max },
@@ -848,7 +964,7 @@ fn single_layer_master_gain_preserves_peak_normalization() {
     let gain = distingnt_api::api::math::exp2(12.0 * (core::f32::consts::LOG2_10 / 20.0));
     for level in [81, 100] {
         let mut host = Host::new(1);
-        host.set(model_index(0) + 1, level);
+        host.set(model_index(0) + LAYER_LEVEL, level);
         host.step([0.0; 4]);
         let dry = host.complete();
         let peak = (0..length).fold(1.0f32, |peak, frame| {
@@ -874,7 +990,7 @@ fn click_diagnostic_can_suppress_rebuilds_after_the_first_waveform() {
     host.step([0.0; 4]);
     host.complete();
     host.step([0.0; 4]);
-    host.set(model_index(0) + 2 + 6, 30);
+    host.set(model_index(0) + LAYER_FIRST_CONTROL + 6, 30);
     host.step([0.0; 4]);
     assert_eq!(
         WORK.with(Cell::get).is_none(),
@@ -891,9 +1007,9 @@ fn synthesis_runs_only_for_layers_with_changed_patches() {
     host.step([0.0; 4]);
     host.complete();
     for (parameter, value) in [
-        (model_index(0) + 2, 680),
+        (model_index(0) + LAYER_FIRST_CONTROL, 680),
         (CUTOFF, 50),
-        (model_index(0) + 1, 75),
+        (model_index(0) + LAYER_LEVEL, 75),
         (GAIN, -50),
     ] {
         host.set(parameter, value);

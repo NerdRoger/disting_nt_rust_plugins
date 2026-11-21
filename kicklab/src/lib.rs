@@ -49,13 +49,16 @@ const OUTPUT_MODE: usize = 2;
 const GAIN: usize = 3;
 const CUTOFF: usize = 4;
 const CUTOFF_OFF: i16 = 101;
-const GLOBALS: usize = 5;
+const RANDOMIZE_LAYERS: usize = 5;
+const GLOBALS: usize = 6;
 const CONTROLS: usize = 10;
-const LAYER_FIELDS: usize = 2 + CONTROLS;
-// Keep all pre-existing ordinals, including the space used by larger presets.
-const RANDOMIZE_START: usize = GLOBALS + MAX_LAYERS * LAYER_FIELDS;
-const MIX_START: usize = RANDOMIZE_START + MAX_LAYERS;
-const LAYER_PAGE_FIELDS: usize = LAYER_FIELDS + 3;
+// Each layer has a fixed-width parameter block in page order.
+const LAYER_RANDOMIZE: usize = 1;
+const LAYER_LEVEL: usize = 2;
+const LAYER_SOLO: usize = 3;
+const LAYER_MUTE: usize = 4;
+const LAYER_FIRST_CONTROL: usize = 5;
+const LAYER_FIELDS: usize = LAYER_FIRST_CONTROL + CONTROLS;
 const LAYER_NAMES: [&CStr; MAX_LAYERS] = [c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4"];
 const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [b"L1: ", b"L2: ", b"L3: ", b"L4: "];
 const MODEL_NAMES: [&CStr; 13] = [
@@ -224,6 +227,17 @@ const PITCH_SWEEP: [Control; 9] = [
         UNIT_MS,
         SCALING_10,
     ),
+];
+const FIRST_LAYER_PITCH_SWEEP: [i16; PITCH_SWEEP.len()] = [
+    900,  // Tail Tune
+    500,  // Body Decay
+    164,  // Drive
+    10,   // Sweep Depth
+    50,   // Sweep Time
+    15,   // Sweep Curve
+    20,   // Click Level
+    3000, // Click Tone
+    160,  // Click Decay
 ];
 const MODAL_DRUM: [Control; 8] = [
     tune(c"Tail Tune", 570),
@@ -479,33 +493,9 @@ fn model_index(layer: usize) -> usize {
     GLOBALS + LAYER_FIELDS * layer
 }
 
-fn randomize_layer_index(parameter: i32, layers: usize) -> Option<usize> {
-    let layer = usize::try_from(parameter)
-        .ok()?
-        .checked_sub(RANDOMIZE_START)?;
-    (layer < layers).then_some(layer)
-}
-
-fn solo_index(layer: usize) -> usize {
-    MIX_START + 2 * layer
-}
-
-fn mix_parameter_layer(parameter: i32, layers: usize) -> Option<usize> {
-    let layer = usize::try_from(parameter).ok()?.checked_sub(MIX_START)? / 2;
-    (layer < layers).then_some(layer)
-}
-
-fn layer_page_indices(layer: usize, controls: usize) -> [u8; LAYER_PAGE_FIELDS] {
+fn layer_page_indices(layer: usize) -> [u8; LAYER_FIELDS] {
     let base = model_index(layer);
-    core::array::from_fn(|slot| {
-        let index = match slot {
-            0 | 1 => base + slot,
-            2 | 3 => solo_index(layer) + slot - 2,
-            _ if slot == 4 + controls => RANDOMIZE_START + layer,
-            _ => base + slot - 2,
-        };
-        index as u8
-    })
+    core::array::from_fn(|slot| (base + slot) as u8)
 }
 
 fn cutoff_hz(value: i16) -> i16 {
@@ -535,7 +525,7 @@ fn update_model_controls(context: &mut Callback<'_, Audio>, layer: usize, restor
     *previous = model;
     let controls = model.controls();
     for slot in 0..CONTROLS {
-        let index = base + 2 + slot;
+        let index = base + LAYER_FIRST_CONTROL + slot;
         let control = controls.get(slot).copied();
         let def = control.and_then(Control::definition).unwrap_or(UNUSED);
         // Read saved controls before the host can clamp them to the new definition.
@@ -559,11 +549,11 @@ fn update_model_controls(context: &mut Callback<'_, Audio>, layer: usize, restor
             context.parameters().set(index, value);
         }
     }
-    let indices = layer_page_indices(layer, controls.len());
+    let indices = layer_page_indices(layer);
     let visible = if model == Model::Off {
         1
     } else {
-        5 + controls.len()
+        LAYER_FIRST_CONTROL + controls.len()
     };
     if let Some(indices) = indices.get(..visible) {
         context.set_page_parameter_indices(layer + 1, indices);
@@ -577,18 +567,41 @@ fn restore_model_controls(context: &mut Callback<'_, Audio>) {
     for layer in 0..context.state().layers {
         update_model_controls(context, layer, true);
         // A nonzero action restored with a preset is a stale request.
-        let action = RANDOMIZE_START + layer;
+        let action = model_index(layer) + LAYER_RANDOMIZE;
         if context.read_parameters().value(action) == Some(1) {
             context.parameters().set(action, 0);
         }
+    }
+    if context.read_parameters().value(RANDOMIZE_LAYERS) == Some(1) {
+        context.parameters().set(RANDOMIZE_LAYERS, 0);
     }
     let state = context.state_mut();
     state.parameter_setup = ParameterSetup::Ready;
     state.dirty = true;
 }
 
+fn random_value(seed: &mut u32, min: i16, max: i16) -> i16 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    let width = (i32::from(max) - i32::from(min) + 1) as u32;
+    let offset = ((u64::from(*seed) * u64::from(width)) >> 32) as i32;
+    (i32::from(min) + offset) as i16
+}
+
+fn randomize_model_controls(context: &mut Callback<'_, Audio>, base: usize, model: Model) {
+    for (index, control) in model.controls().iter().enumerate() {
+        let [min, max] = control.range;
+        let value = random_value(&mut context.state_mut().random_seed, min, max);
+        context
+            .parameters()
+            .set(base + LAYER_FIRST_CONTROL + index, value);
+    }
+}
+
 fn randomize_layer(context: &mut Callback<'_, Audio>, layer: usize) {
-    let action = RANDOMIZE_START + layer;
+    let base = model_index(layer);
+    let action = base + LAYER_RANDOMIZE;
     let request = 1 << layer;
     if context.state().randomizing & request != 0
         || context.read_parameters().value(action) != Some(1)
@@ -600,22 +613,43 @@ fn randomize_layer(context: &mut Callback<'_, Audio>, layer: usize) {
     };
     context.state_mut().randomizing |= request;
     if model != Model::Off {
-        let base = model_index(layer);
-        for (index, control) in model.controls().iter().enumerate() {
-            let seed = &mut context.state_mut().random_seed;
-            *seed ^= *seed << 13;
-            *seed ^= *seed >> 17;
-            *seed ^= *seed << 5;
-            let [min, max] = control.range;
-            let width = (i32::from(max) - i32::from(min) + 1) as u32;
-            let offset = ((u64::from(*seed) * u64::from(width)) >> 32) as i32;
-            let value = i32::from(min) + offset;
-            context.parameters().set(base + 2 + index, value as i16);
-        }
+        randomize_model_controls(context, base, model);
         context.state_mut().dirty = true;
     }
     // Keep the same-layer guard set until the host's reset notification returns.
     context.parameters().set(action, 0);
+    context.state_mut().randomizing &= !request;
+}
+
+fn randomize_layers(context: &mut Callback<'_, Audio>) {
+    let request = 1 << MAX_LAYERS;
+    if context.state().randomizing & request != 0
+        || context.read_parameters().value(RANDOMIZE_LAYERS) != Some(1)
+    {
+        return;
+    }
+    context.state_mut().randomizing |= request;
+    for layer in 0..context.state().layers {
+        let base = model_index(layer);
+        let model_value = random_value(
+            &mut context.state_mut().random_seed,
+            0,
+            (MODEL_NAMES.len() - 1) as i16,
+        );
+        if context.read_parameters().value(base) != Some(model_value) {
+            context.parameters().set(base, model_value);
+            // Refresh definitions even when the host defers its notification.
+            update_model_controls(context, layer, false);
+        }
+        let [min, max] = LEVEL.range;
+        let level = random_value(&mut context.state_mut().random_seed, min, max);
+        context.parameters().set(base + LAYER_LEVEL, level);
+        if let Some(&model) = context.state().models.get(layer) {
+            randomize_model_controls(context, base, model);
+        }
+    }
+    context.state_mut().dirty = true;
+    context.parameters().set(RANDOMIZE_LAYERS, 0);
     context.state_mut().randomizing &= !request;
 }
 
@@ -631,24 +665,27 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
         ParameterSetup::Ready => {}
     }
 
+    if parameter == RANDOMIZE_LAYERS as i32 {
+        randomize_layers(context);
+        return;
+    }
     let layers = context.state().layers;
-    if let Some(layer) = randomize_layer_index(parameter, layers) {
+    let layer_field = parameter_layer(parameter, layers);
+    if let Some((layer, LAYER_RANDOMIZE)) = layer_field {
         randomize_layer(context, layer);
         return;
     }
-    if !(GAIN as i32..model_index(layers) as i32).contains(&parameter)
-        && mix_parameter_layer(parameter, layers).is_none()
-    {
+    if !(GAIN as i32..model_index(layers) as i32).contains(&parameter) {
         return;
     }
     #[cfg(feature = "profiling-no-click-rebuild")]
-    if parameter == (model_index(0) + 2 + 6) as i32
+    if parameter == (model_index(0) + LAYER_FIRST_CONTROL + 6) as i32
         && context.state().models[0] == Model::PitchSweep
         && context.state().player.has_waveform()
     {
         return;
     }
-    if let Some((layer, 0)) = parameter_layer(parameter, layers) {
+    if let Some((layer, 0)) = layer_field {
         update_model_controls(context, layer, false);
     }
     context.state_mut().dirty = true;
@@ -715,10 +752,13 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     {
         let base = model_index(layer);
         snapshot.patch.model = model;
-        snapshot.level = parameters.value(base + 1).unwrap_or(0).clamp(0, 100) as f32 / 100.0;
-        let solo = solo_index(layer);
-        snapshot.solo = parameters.value(solo) == Some(1);
-        snapshot.mute = parameters.value(solo + 1) == Some(1);
+        snapshot.level = parameters
+            .value(base + LAYER_LEVEL)
+            .unwrap_or(0)
+            .clamp(0, 100) as f32
+            / 100.0;
+        snapshot.solo = parameters.value(base + LAYER_SOLO) == Some(1);
+        snapshot.mute = parameters.value(base + LAYER_MUTE) == Some(1);
         for (index, (decoded, control)) in snapshot
             .patch
             .controls
@@ -727,7 +767,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
             .enumerate()
         {
             let value = parameters
-                .value(base + 2 + index)
+                .value(base + LAYER_FIRST_CONTROL + index)
                 .unwrap_or(control.initial);
             *decoded = control.decode(value);
         }
@@ -793,9 +833,9 @@ impl Plugin for KickLab {
         let layers = layer_count(specs)?;
         output_buffer_count(specs)?;
         Some(Configuration {
-            parameters: solo_index(layers),
+            parameters: model_index(layers),
             pages: layers + 1,
-            page_indices: GLOBALS + layers * LAYER_PAGE_FIELDS,
+            page_indices: model_index(layers),
             regions: 0,
         })
     }
@@ -913,14 +953,12 @@ impl Plugin for KickLab {
         for (index, item) in routing.into_iter().enumerate() {
             metadata.set_parameter(index, item)?;
         }
-        metadata.add_page(c"KickLab", 0, &[0, 1, 2, 3, 4])?;
+        metadata.set_parameter(
+            RANDOMIZE_LAYERS,
+            definition(c"Randomize Layers", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE),
+        )?;
+        metadata.add_page(c"KickLab", 0, &[0, 1, 2, 3, 4, RANDOMIZE_LAYERS as u8])?;
         let layers = layer_count(specs)?;
-        for index in model_index(layers)..RANDOMIZE_START {
-            metadata.set_parameter(index, UNUSED)?;
-        }
-        for index in (RANDOMIZE_START + layers)..MIX_START {
-            metadata.set_parameter(index, UNUSED)?;
-        }
         for (layer, &name) in LAYER_NAMES.iter().enumerate().take(layers) {
             let base = model_index(layer);
             let default_model = if layer == 0 { 1 } else { 0 };
@@ -935,13 +973,23 @@ impl Plugin for KickLab {
                     SCALING_NONE,
                 ),
             )?;
-            metadata.set_parameter(base + 1, LEVEL.definition()?)?;
-            let controls = Model::from_value(default_model).controls();
+            metadata.set_parameter(base + LAYER_RANDOMIZE, RANDOMIZE)?;
+            metadata.set_parameter(base + LAYER_LEVEL, LEVEL.definition()?)?;
+            for (offset, name) in [(LAYER_SOLO, c"Solo"), (LAYER_MUTE, c"Mute")] {
+                let toggle =
+                    Definition::new(name, 0, 1, 0, UNIT_ENUM, SCALING_NONE, Some(OFF_ON.table()))?;
+                metadata.set_parameter(base + offset, toggle)?;
+            }
+            let defaults = if layer == 0 {
+                FIRST_LAYER_PITCH_SWEEP.as_slice()
+            } else {
+                &[]
+            };
             for slot in 0..CONTROLS {
-                let initial = controls.get(slot).map_or(0, |control| control.initial);
+                let initial = defaults.get(slot).copied().unwrap_or(0);
                 // Start with bounds that admit the stored raw values of any model.
                 metadata.set_parameter(
-                    base + 2 + slot,
+                    base + LAYER_FIRST_CONTROL + slot,
                     definition(
                         c"Loading",
                         i16::MIN,
@@ -952,14 +1000,7 @@ impl Plugin for KickLab {
                     ),
                 )?;
             }
-            metadata.set_parameter(RANDOMIZE_START + layer, RANDOMIZE)?;
-            let solo = solo_index(layer);
-            for (index, name) in [(solo, c"Solo"), (solo + 1, c"Mute")] {
-                let toggle =
-                    Definition::new(name, 0, 1, 0, UNIT_ENUM, SCALING_NONE, Some(OFF_ON.table()))?;
-                metadata.set_parameter(index, toggle)?;
-            }
-            let indices = layer_page_indices(layer, CONTROLS);
+            let indices = layer_page_indices(layer);
             metadata.add_page(name, 1, &indices)?;
         }
         Some(())
@@ -971,7 +1012,9 @@ impl Plugin for KickLab {
         value: i32,
         output: &mut [c_char],
     ) -> i32 {
-        if randomize_layer_index(parameter, context.state().layers).is_some() {
+        let layer_field = parameter_layer(parameter, context.state().layers);
+        if parameter == RANDOMIZE_LAYERS as i32 || matches!(layer_field, Some((_, LAYER_RANDOMIZE)))
+        {
             return write_text(output, if value == 0 { b"Ready" } else { b"Randomize?" });
         }
         if parameter == CUTOFF as i32 {
@@ -987,10 +1030,7 @@ impl Plugin for KickLab {
                 });
             }
         }
-        if matches!(
-            parameter_layer(parameter, context.state().layers),
-            Some((_, 0))
-        ) {
+        if matches!(layer_field, Some((_, 0))) {
             if let Some(name) = MODEL_NAMES.get(value as usize) {
                 return write_text(output, name.to_bytes());
             }
@@ -1000,9 +1040,8 @@ impl Plugin for KickLab {
 
     fn prefix(context: &mut Callback<'_, ReadOnly>, parameter: i32, output: &mut [c_char]) -> i32 {
         let layers = context.state().layers;
-        randomize_layer_index(parameter, layers)
-            .or_else(|| mix_parameter_layer(parameter, layers))
-            .or_else(|| parameter_layer(parameter, layers).map(|(layer, _)| layer))
+        parameter_layer(parameter, layers)
+            .map(|(layer, _)| layer)
             .and_then(|layer| LAYER_PREFIXES.get(layer))
             .map_or(0, |prefix| write_text(output, prefix))
     }
