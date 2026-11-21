@@ -1102,6 +1102,12 @@ fn extra_region_overflow_is_rejected_and_disabled_policy_has_no_descriptor_stora
         core::mem::size_of::<<() as ExtraRegionLayout>::Descriptor>(),
         0
     );
+    assert_eq!(
+        core::mem::size_of::<<SharedResources<u32> as ExtraRegionLayout>::Dram>(),
+        0
+    );
+    let allocation = Allocation::new();
+    assert_eq!(allocation.req.dram, 0);
     let config = Example::configuration(&[]).unwrap();
     assert!(InstanceLayout::with_extra::<u32, u32, Sram, ()>(config, 1).is_none());
 }

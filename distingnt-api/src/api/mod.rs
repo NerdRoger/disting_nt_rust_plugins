@@ -17,6 +17,7 @@ pub mod metadata;
 pub mod parameters;
 pub mod plugin;
 pub mod state_memory;
+mod static_dram;
 pub mod text;
 
 #[cfg(test)]

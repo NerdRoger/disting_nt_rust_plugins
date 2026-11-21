@@ -1,0 +1,18 @@
+[package]
+name = "kicklab"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+profiling = []
+profiling-hold-playback = ["profiling"]
+profiling-no-click-rebuild = ["profiling-hold-playback"]
+
+[dependencies]
+distingnt-api = { path = "../distingnt-api" }
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dev-dependencies]
+distingnt-sys = { path = "../distingnt-sys" }

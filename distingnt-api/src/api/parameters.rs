@@ -163,6 +163,23 @@ impl<C> Parameters<'_, C> {
 }
 
 impl Parameters<'_, Audio> {
+    /// Replace a definition using validated, static metadata. The host retains
+    /// its current value and mappings according to its notification semantics.
+    pub fn replace_definition(
+        &mut self,
+        parameter: usize,
+        definition: super::metadata::Definition,
+    ) -> Option<()> {
+        self.raw_definition(parameter)?;
+        let index = self.index()?;
+        // Publish before notifying. No reference into host memory spans reentry.
+        unsafe {
+            self.definitions.add(parameter).write(definition.raw());
+            NT_updateParameterDefinition(index, parameter as u32);
+        }
+        Some(())
+    }
+
     #[inline]
     pub fn gray(&mut self, parameter: usize, gray: bool) -> Option<()> {
         if parameter >= self.count {

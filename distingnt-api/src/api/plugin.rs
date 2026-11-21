@@ -4,6 +4,7 @@
 //! capabilities borrow that same context, so safe code cannot keep a state borrow
 //! across a setter that synchronously reenters the plugin.
 use super::{
+    background::{DramBufferPolicy, DramStorage},
     drawing::Canvas,
     json::{JsonReader, JsonWriter},
     metadata::Definition,
@@ -14,6 +15,7 @@ use super::{
 #[path = "plugin_tests.rs"]
 mod tests;
 use super::state_memory::{Placement, Sram, StateMemory};
+pub use super::static_dram::{SharedStaticDram, StaticDramElement, StaticDramView};
 use crate::raw::*;
 use core::{
     alloc::Layout,
@@ -38,8 +40,8 @@ mod extra_sealed {
     pub trait Sealed {}
     impl Sealed for () {}
     impl<T: Copy + 'static> Sealed for super::ExtraRegions<T> {}
-    impl<T: Copy + Send + 'static, E: super::ExtraRegionLayout> Sealed
-        for super::SharedResources<T, E>
+    impl<T: Copy + Send + 'static, E: super::ExtraRegionLayout, D: super::DramBufferPolicy> Sealed
+        for super::SharedResources<T, E, D>
     {
     }
 }
@@ -50,6 +52,7 @@ pub trait ExtraRegionLayout: extra_sealed::Sealed + 'static {
     type Descriptor: Copy;
     type Shared: Copy + Send + 'static;
     type SharedDescriptor: Copy;
+    type Dram: DramBufferPolicy;
     #[doc(hidden)]
     const SHARED: bool;
     #[doc(hidden)]
@@ -68,6 +71,7 @@ impl ExtraRegionLayout for () {
     type Descriptor = ();
     type Shared = ();
     type SharedDescriptor = ();
+    type Dram = ();
     const SHARED: bool = false;
     fn shared_descriptor(_: usize, _: Option<AudioWorker>) {}
     fn shared_parts(_: &()) -> Option<(usize, Option<AudioWorker>)> {
@@ -84,6 +88,7 @@ impl<T: Copy + 'static> ExtraRegionLayout for ExtraRegions<T> {
     type Descriptor = ExtraRegionDescriptor;
     type Shared = ();
     type SharedDescriptor = ();
+    type Dram = ();
     const SHARED: bool = false;
     fn shared_descriptor(_: usize, _: Option<AudioWorker>) {}
     fn shared_parts(_: &()) -> Option<(usize, Option<AudioWorker>)> {
@@ -100,6 +105,7 @@ impl<T: Copy + 'static> ExtraRegionLayout for ExtraRegions<T> {
 
 /// Opt in to one synchronized preallocated shared object. Wrap an existing
 /// ExtraRegions policy in E to retain its independently sized array.
+/// Select a DramBuffers policy as D to add independently borrowed DRAM.
 /// Access is closure-scoped; queued workers and SysEx transfers reserve the
 /// object, and normal callbacks receive Busy instead of waiting.
 ///
@@ -117,20 +123,25 @@ impl<T: Copy + 'static> ExtraRegionLayout for ExtraRegions<T> {
 /// fn require_policy<T: ExtraRegionLayout>() {}
 /// require_policy::<SharedResources<*mut u32>>();
 /// ```
-pub struct SharedResources<T: Copy + Send + 'static, E: ExtraRegionLayout = ()>(
-    PhantomData<(T, E)>,
-);
+pub struct SharedResources<
+    T: Copy + Send + 'static,
+    E: ExtraRegionLayout = (),
+    D: DramBufferPolicy = (),
+>(PhantomData<(T, E, D)>);
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct SharedDescriptor {
     offset: usize,
     worker: Option<AudioWorker>,
 }
-impl<T: Copy + Send + 'static, E: ExtraRegionLayout> ExtraRegionLayout for SharedResources<T, E> {
+impl<T: Copy + Send + 'static, E: ExtraRegionLayout, D: DramBufferPolicy> ExtraRegionLayout
+    for SharedResources<T, E, D>
+{
     type Element = E::Element;
     type Descriptor = E::Descriptor;
     type Shared = T;
     type SharedDescriptor = SharedDescriptor;
+    type Dram = D;
     const ENABLED: bool = E::ENABLED;
     const SHARED: bool = true;
     fn descriptor(offset: usize, count: usize) -> Self::Descriptor {
@@ -171,6 +182,13 @@ pub struct StaticRequirements {
 /// ```
 pub struct StaticMemory<'a> {
     pub dram: &'a mut [u8],
+}
+
+impl StaticMemory<'_> {
+    /// Borrow the allocation as numeric elements with checked alignment and length.
+    pub fn dram_elements_mut<T: StaticDramElement>(&mut self) -> Option<&mut [T]> {
+        super::static_dram::elements_mut(self.dram)
+    }
 }
 
 pub struct Specification {
@@ -502,6 +520,37 @@ pub trait Plugin: Sized + 'static {
     /// Runs with exclusive access to the shared object; no unrestricted access
     /// to ordinary state, parameter setters, or live audio buffers is provided.
     fn audio_worker(_: &mut <Self::ExtraRegions as ExtraRegionLayout>::Shared, _: u32) {}
+    /// Number of elements in each buffer of the selected DRAM policy.
+    fn dram_buffer_len(_: &[i32], _: u32) -> usize {
+        0
+    }
+    /// Length of one DRAM buffer. The default uses the common buffer length.
+    /// Return the same layout during requirements calculation and construction.
+    fn dram_buffer_len_at(specifications: &[i32], rate: u32, _: usize) -> usize {
+        Self::dram_buffer_len(specifications, rate)
+    }
+    /// Number of DRAM buffers for these specifications, up to the policy maximum.
+    fn dram_buffer_count(_: &[i32]) -> usize {
+        <Self::ExtraRegions as ExtraRegionLayout>::Dram::MAX_COUNT
+    }
+    /// Worker entry point for plugins using the optional DRAM buffers.
+    fn audio_worker_with_dram(
+        shared: &mut <Self::ExtraRegions as ExtraRegionLayout>::Shared,
+        data: u32,
+        _: &<Self::ExtraRegions as ExtraRegionLayout>::Dram,
+    ) {
+        Self::audio_worker(shared, data);
+    }
+    /// Worker access to immutable factory-wide DRAM published after initialise.
+    /// Enabled by SHARED_STATIC_DRAM. The view is scoped to the worker call.
+    fn audio_worker_with_static_dram(
+        shared: &mut <Self::ExtraRegions as ExtraRegionLayout>::Shared,
+        data: u32,
+        buffers: &<Self::ExtraRegions as ExtraRegionLayout>::Dram,
+        _: StaticDramView<'_>,
+    ) {
+        Self::audio_worker_with_dram(shared, data, buffers);
+    }
     /// Return the next chunk. Firmware consumes it before asking for another;
     /// the shared object stays reserved until completion, even after the last fetch.
     fn large_sysex_chunk(
@@ -533,6 +582,9 @@ pub trait Plugin: Sized + 'static {
     const STRING_PARAMETERS: bool = false;
     /// Enable the optional factory-wide requirements and initialise callbacks.
     const STATIC_INITIALIZATION: bool = false;
+    /// Opt in to read-only access from the worker after factory initialization.
+    /// Firmware must retain the allocation until all callbacks have finished.
+    const SHARED_STATIC_DRAM: Option<&'static SharedStaticDram<Self>> = None;
     /// Place requirements calculation and instance construction in DRAM.
     /// Exclusive callees follow when packaging with --dram-callees.
     const INITIALIZATION_IN_DRAM: bool = false;
@@ -732,6 +784,8 @@ pub trait Plugin: Sized + 'static {
 struct Storage<S: Copy, M: StateMemory<S>, E: ExtraRegionLayout = ()> {
     base: NtAlgorithm,
     pages: NtParameterPages,
+    page_indices_end: *const u8,
+    dram: E::Dram,
     parameter_count: usize,
     region_count: usize,
     region_offset: usize,
@@ -760,6 +814,11 @@ pub struct Processing<'a, S, V, E = ()> {
 impl<S: Copy, V: Copy, Mode, M: StateMemory<S>, E: ExtraRegionLayout>
     Context<'_, S, V, Mode, M, E>
 {
+    /// Access the DRAM policy configured by this plugin.
+    pub fn dram_buffers(&self) -> &E::Dram {
+        // SAFETY: construction initialized the policy before publishing Storage.
+        unsafe { &*ptr::addr_of!((*self.raw).dram) }
+    }
     fn shared_slot(
         &self,
     ) -> Result<&super::background::SharedSlot<E::Shared>, super::background::Error> {
@@ -969,6 +1028,72 @@ impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V
 }
 
 impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V, Audio, M, E> {
+    /// Show a prefix of the indices stored in the page's backing allocation.
+    /// This changes only how many indices are visible.
+    pub fn set_page_parameter_count(&mut self, page: usize, count: u8) -> Option<()> {
+        let algorithm = self.algorithm_index()?;
+        let (target, capacity) = self.page_span(page)?;
+        if count == 0 || count as usize > capacity {
+            return None;
+        }
+        // SAFETY: page_span found a live page and the count fits its storage.
+        unsafe {
+            if (*target).num_params != count {
+                (*target).num_params = count;
+                NT_updateParameterPages(algorithm);
+            }
+        }
+        Some(())
+    }
+
+    /// Replace a page's visible indices within its original metadata allocation.
+    /// The page's name, group, and backing address stay fixed.
+    pub fn set_page_parameter_indices(&mut self, page: usize, indices: &[u8]) -> Option<()> {
+        let algorithm = self.algorithm_index()?;
+        let (target, capacity) = self.page_span(page)?;
+        let count = u8::try_from(indices.len()).ok()?;
+        let parameters = unsafe { (*self.raw).parameter_count };
+        if count == 0
+            || indices.len() > capacity
+            || indices.iter().any(|&index| index as usize >= parameters)
+        {
+            return None;
+        }
+        // SAFETY: the builder reserved and initialized the entire span. The
+        // indices are instance-owned and unavailable to callers as references.
+        // Publish all changes before notifying the host, which may reenter.
+        unsafe {
+            let destination = (*target).params.cast_mut();
+            if (*target).num_params != count
+                || slice::from_raw_parts(destination, indices.len()) != indices
+            {
+                ptr::copy_nonoverlapping(indices.as_ptr(), destination, indices.len());
+                (*target).num_params = count;
+                NT_updateParameterPages(algorithm);
+            }
+        }
+        Some(())
+    }
+
+    fn page_span(&self, page: usize) -> Option<(*mut NtParameterPage, usize)> {
+        // SAFETY: Context is admitted for a live instance. The metadata builder
+        // reserves nonempty page spans consecutively in the same allocation.
+        unsafe {
+            let total = (*self.raw).pages.num_pages as usize;
+            if page >= total {
+                return None;
+            }
+            let pages = (*self.raw).pages.pages.cast_mut();
+            let target = pages.add(page);
+            let end = if page + 1 == total {
+                (*self.raw).page_indices_end
+            } else {
+                (*pages.add(page + 1)).params
+            };
+            Some((target, end.offset_from((*target).params) as usize))
+        }
+    }
+
     /// Send a complete SysEx message from an audio callback. Include F0 and
     /// seven-bit payload bytes; the host appends F7 synchronously.
     pub fn send_midi_sysex(&mut self, destination: u32, message: &[u8]) -> bool {
@@ -1045,7 +1170,7 @@ impl Metadata<'_> {
             num_params: indices.len() as u8,
             group,
             unused: [0; 2],
-            params: destination.as_ptr().cast(),
+            params: destination.as_mut_ptr().cast(),
         });
         self.page_count += 1;
         self.used = end;
@@ -1128,6 +1253,18 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
     // to GOT_PREL, which the NT object loader does not support.
     const BACKGROUND_CALLBACKS: (AudioWorker, LargeSysExFetch, LargeSysExComplete) =
         (Self::audio_worker, Self::sysex_fetch, Self::sysex_complete);
+    const STATIC_DRAM_DESCRIPTOR: Option<&'static SharedStaticDram<P>> = P::SHARED_STATIC_DRAM;
+
+    #[inline(always)]
+    fn static_dram_descriptor() -> Option<&'static SharedStaticDram<P>> {
+        if P::SHARED_STATIC_DRAM.is_some() {
+            // Like BACKGROUND_CALLBACKS, retain the relocation in a constant
+            // table instead of materializing the address with GOT_PREL.
+            unsafe { ptr::read_volatile(&Self::STATIC_DRAM_DESCRIPTOR) }
+        } else {
+            None
+        }
+    }
     const SPECS: [NtSpecification; N] = {
         assert!(N == P::SPECIFICATIONS.len());
         let mut result = [NtSpecification {
@@ -1363,12 +1500,17 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
 
     /// # Safety
     /// mem/req are valid records; dram identifies an exclusive writable allocation
-    /// of req.dram bytes. The host must not access it concurrently during this call.
+    /// of req.dram bytes. For shared static DRAM, the host serializes initialise
+    /// with all callbacks and keeps the allocation live until they finish.
     #[inline(always)]
     pub(crate) unsafe extern "C" fn initialise(
         mem: *mut NtStaticMemoryPtrs,
         req: *const NtStaticRequirements,
     ) {
+        let resource = Self::static_dram_descriptor();
+        if let Some(resource) = resource {
+            resource.clear();
+        }
         let bytes = unsafe { (*req).dram as usize };
         if bytes > isize::MAX as usize {
             return;
@@ -1386,7 +1528,15 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 slice::from_raw_parts_mut(pointer, bytes)
             }
         };
+        let pointer = dram.as_mut_ptr();
         P::initialise(StaticMemory { dram });
+        if bytes != 0 {
+            if let Some(resource) = resource {
+                // SAFETY: the plugin's exclusive initialization has finished.
+                // The host retains the allocation across all worker callbacks.
+                unsafe { resource.publish(pointer, bytes) };
+            }
+        }
     }
 
     /// # Safety
@@ -1405,17 +1555,30 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
             itc: 0,
         };
         // SAFETY: host callback supplies readable specs and a writable result.
-        if let Some((config, layout)) = unsafe { Self::specs(specs) }.and_then(|specs| {
+        if let Some((config, layout, dram)) = unsafe { Self::specs(specs) }.and_then(|specs| {
             let config = P::configuration(specs)?;
             let layout =
                 InstanceLayout::with_extra::<P::State, P::Region, P::StateMemory, P::ExtraRegions>(
                     config,
                     P::extra_region_count(specs),
                 )?;
-            Some((config, layout))
+            let rate = if <P::ExtraRegions as ExtraRegionLayout>::Dram::ENABLED {
+                super::sample_rate()
+            } else {
+                0
+            };
+            Some((
+                config,
+                layout,
+                <P::ExtraRegions as ExtraRegionLayout>::Dram::bytes(
+                    P::dram_buffer_count(specs),
+                    |index| P::dram_buffer_len_at(specs, rate, index),
+                )?,
+            ))
         }) {
             result.num_parameters = config.parameters as u32;
             result.sram = layout.allocation.size() as u32;
+            result.dram = dram;
             result.dtc = P::StateMemory::dtc_size() as u32;
         }
         unsafe {
@@ -1538,6 +1701,20 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         let Some(page_count) = metadata.finish() else {
             return ptr::null_mut();
         };
+        let used_indices = metadata.used;
+        let sample_rate = super::sample_rate();
+        // SAFETY: the host supplies exclusive instance DRAM; the bank checks
+        // the requested length/alignment before initializing or exposing it.
+        let Some(dram) = (unsafe {
+            <P::ExtraRegions as ExtraRegionLayout>::Dram::initialize(
+                (*mem).dram,
+                (*req).dram,
+                P::dram_buffer_count(specs),
+                |index| P::dram_buffer_len_at(specs, sample_rate, index),
+            )
+        }) else {
+            return ptr::null_mut();
+        };
         // SAFETY: checked exclusive construction allocation. The initializer
         // never exposes uninitialized S and success requires every field written.
         let initialized = unsafe {
@@ -1547,7 +1724,7 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 (*req).dtc as usize,
                 |destination| {
                     let mut writer = RegionInitializer::new(destination);
-                    P::initialize_state(&mut writer, specs, super::sample_rate())?;
+                    P::initialize_state(&mut writer, specs, sample_rate)?;
                     writer.initialized.then_some(())
                 },
             )
@@ -1575,6 +1752,11 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
                 },
             );
             ptr::write(ptr::addr_of_mut!((*raw).parameter_count), config.parameters);
+            ptr::write(
+                ptr::addr_of_mut!((*raw).page_indices_end),
+                indices.add(used_indices),
+            );
+            ptr::write(ptr::addr_of_mut!((*raw).dram), dram);
             ptr::write(ptr::addr_of_mut!((*raw).region_count), config.regions);
             ptr::write(ptr::addr_of_mut!((*raw).region_offset), layout.regions);
             ptr::write(
@@ -1604,7 +1786,18 @@ impl<P: Plugin, const N: usize> Registration<P, N> {
         };
         // Reservation owns this value from successful submission through return.
         unsafe {
-            slot.run(|value| P::audio_worker(value, data));
+            let buffers = &*ptr::addr_of!((*raw).dram);
+            slot.run(|value| {
+                if let Some(resource) = Self::static_dram_descriptor() {
+                    // The live worker belongs to the same factory that published
+                    // the allocation. It cannot retain the callback-scoped view.
+                    resource.with_view(|view| {
+                        P::audio_worker_with_static_dram(value, data, buffers, view)
+                    });
+                } else {
+                    P::audio_worker_with_dram(value, data, buffers);
+                }
+            });
         }
     }
     unsafe extern "C" fn sysex_fetch(

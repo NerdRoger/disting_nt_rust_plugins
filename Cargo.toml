@@ -1,5 +1,5 @@
 [workspace]
-members = ["distingnt-sys", "distingnt-api", "monosynth", "window-comparator", "wavesmith"]
+members = ["distingnt-sys", "distingnt-api", "monosynth", "window-comparator", "wavesmith", "kicklab"]
 resolver = "2"
 
 [profile.release]

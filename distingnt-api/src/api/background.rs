@@ -53,8 +53,9 @@ use crate::raw::{
 };
 use core::{
     cell::UnsafeCell,
-    ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    mem::{align_of, size_of},
+    ptr, slice,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,150 @@ pub enum Error {
     Busy,
     QueueFull,
     NoAlgorithm,
+}
+
+/// Opt-in instance DRAM split into up to COUNT typed buffers. Normal callbacks
+/// and background workers can borrow different buffers without waiting.
+pub struct DramBuffers<T, const COUNT: usize> {
+    elements: *mut T,
+    ends: [usize; COUNT],
+    count: usize,
+    busy: AtomicU32,
+}
+
+impl<T, const COUNT: usize> DramBuffers<T, COUNT> {
+    /// Borrow a buffer for the duration of the closure. Returns None if the
+    /// index is out of range or a callback already holds that buffer.
+    pub fn with<R>(&self, index: usize, access: impl FnOnce(&mut [T]) -> R) -> Option<R> {
+        if index >= self.count {
+            return None;
+        }
+        let end = *self.ends.get(index)?;
+        let start = index
+            .checked_sub(1)
+            .and_then(|i| self.ends.get(i))
+            .copied()
+            .unwrap_or(0);
+        let bit = 1 << index;
+        if self.busy.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            return None;
+        }
+        struct Release<'a>(&'a AtomicU32, u32);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_and(!self.1, Ordering::Release);
+            }
+        }
+        let _release = Release(&self.busy, bit);
+        // The lock covers exactly this initialized, disjoint slice. The slice
+        // cannot escape the closure and release publishes all buffer writes.
+        Some(access(unsafe {
+            slice::from_raw_parts_mut(self.elements.add(start), end - start)
+        }))
+    }
+}
+
+// Every access to the disjoint spans is mediated by the reservation above.
+unsafe impl<T: Send, const COUNT: usize> Sync for DramBuffers<T, COUNT> {}
+
+mod dram_storage {
+    pub trait Storage: Sized {
+        const ENABLED: bool;
+        const MAX_COUNT: usize;
+        fn bytes(count: usize, length: impl FnMut(usize) -> usize) -> Option<u32>;
+        /// # Safety
+        /// The host supplies an exclusive instance allocation of `available`
+        /// bytes that will remain live until all callbacks finish.
+        unsafe fn initialize(
+            memory: *mut u8,
+            available: u32,
+            count: usize,
+            length: impl FnMut(usize) -> usize,
+        ) -> Option<Self>;
+    }
+}
+pub(crate) use dram_storage::Storage as DramStorage;
+
+/// Selects an optional DRAM allocation. Use `()` for no buffers or
+/// `DramBuffers<T, COUNT>` for up to 32 independently accessible buffers.
+pub trait DramBufferPolicy: dram_storage::Storage + 'static {}
+impl DramBufferPolicy for () {}
+impl<T: Copy + Default + Send + 'static, const COUNT: usize> DramBufferPolicy
+    for DramBuffers<T, COUNT>
+{
+}
+
+impl DramStorage for () {
+    const ENABLED: bool = false;
+    const MAX_COUNT: usize = 0;
+    fn bytes(_: usize, _: impl FnMut(usize) -> usize) -> Option<u32> {
+        Some(0)
+    }
+    unsafe fn initialize(
+        _: *mut u8,
+        _: u32,
+        _: usize,
+        _: impl FnMut(usize) -> usize,
+    ) -> Option<Self> {
+        Some(())
+    }
+}
+
+impl<T, const COUNT: usize> DramBuffers<T, COUNT> {
+    fn layout(
+        count: usize,
+        mut length: impl FnMut(usize) -> usize,
+    ) -> Option<([usize; COUNT], usize, u32)> {
+        if !(1..=COUNT).contains(&count) || COUNT > u32::BITS as usize || size_of::<T>() == 0 {
+            return None;
+        }
+        let mut ends = [0; COUNT];
+        let mut total = 0usize;
+        for (index, end) in ends.iter_mut().take(count).enumerate() {
+            let length = length(index);
+            if length == 0 {
+                return None;
+            }
+            total = total.checked_add(length)?;
+            *end = total;
+        }
+        let bytes = core::alloc::Layout::array::<T>(total).ok()?.size();
+        Some((ends, total, u32::try_from(bytes).ok()?))
+    }
+}
+
+impl<T: Copy + Default + Send, const COUNT: usize> DramStorage for DramBuffers<T, COUNT> {
+    const ENABLED: bool = true;
+    const MAX_COUNT: usize = COUNT;
+
+    fn bytes(count: usize, length: impl FnMut(usize) -> usize) -> Option<u32> {
+        Some(Self::layout(count, length)?.2)
+    }
+
+    unsafe fn initialize(
+        memory: *mut u8,
+        available: u32,
+        count: usize,
+        length: impl FnMut(usize) -> usize,
+    ) -> Option<Self> {
+        let (ends, total, bytes) = Self::layout(count, length)?;
+        if bytes > available || memory.is_null() || memory as usize % align_of::<T>() != 0 {
+            return None;
+        }
+        let elements = memory.cast::<T>();
+        let initial = T::default();
+        for index in 0..total {
+            // The checked allocation is aligned and exclusive. Write directly
+            // into DRAM, including for types whose default is not all-zero bits.
+            unsafe { elements.add(index).write(initial) };
+        }
+        Some(Self {
+            elements,
+            ends,
+            count,
+            busy: AtomicU32::new(0),
+        })
+    }
 }
 
 /// Borrowed data remains reserved until the host consumes it. Firmware consumes
@@ -168,6 +313,52 @@ mod tests {
     ) {
     }
     unsafe extern "C" fn complete(_: *mut core::ffi::c_void) {}
+
+    #[test]
+    fn a_worker_buffer_excludes_only_its_own_span() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct Entry(u16);
+        impl Default for Entry {
+            fn default() -> Self {
+                Self(13)
+            }
+        }
+        type Buffers = DramBuffers<Entry, 4>;
+        let mut dram = [Entry(255); 13];
+        let lengths = |i| [2, 4, 6][i];
+        assert_eq!(Buffers::bytes(3, lengths), Some(24));
+        assert_eq!(Buffers::bytes(5, lengths), None);
+        assert_eq!(DramBuffers::<Entry, 33>::bytes(3, |_| 1), None);
+        assert_eq!(Buffers::bytes(0, lengths), None);
+        assert_eq!(Buffers::bytes(2, |_| 0), None);
+        let memory = dram.as_mut_ptr().cast::<u8>();
+        assert!(unsafe { Buffers::initialize(memory, 23, 3, lengths) }.is_none());
+        let buffers = unsafe { Buffers::initialize(memory, 24, 3, lengths) }.unwrap();
+        let entered = std::sync::Barrier::new(2);
+        let finish = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                buffers
+                    .with(1, |samples| {
+                        assert_eq!(samples, [Entry(13); 4]);
+                        samples.fill(Entry(3));
+                        entered.wait();
+                        finish.wait();
+                    })
+                    .unwrap();
+            });
+            entered.wait();
+            assert_eq!(buffers.with(1, |_| ()), None);
+            assert_eq!(buffers.with(3, |_| ()), None);
+            buffers.with(0, |samples| samples.fill(Entry(5))).unwrap();
+            assert_eq!(buffers.with(2, |samples| samples[0]), Some(Entry(13)));
+            finish.wait();
+        });
+        assert_eq!(buffers.with(0, |samples| samples[0]), Some(Entry(5)));
+        assert_eq!(buffers.with(1, |samples| samples[0]), Some(Entry(3)));
+        assert_eq!(dram[12], Entry(255));
+    }
+
     #[test]
     fn reservation_excludes_another_thread_and_publishes_worker_writes() {
         let mut memory = MaybeUninit::<SharedSlot<u32>>::uninit();

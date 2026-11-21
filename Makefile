@@ -3,7 +3,23 @@ RUST_TARGET := thumbv7em-none-eabihf
 API_SOURCES := $(wildcard distingnt-api/src/*.rs distingnt-api/src/api/*.rs distingnt-sys/src/*.rs distingnt-sys/shims/*.cpp distingnt-sys/tools/*.py distingNT_API/include/distingnt/*.h) distingnt-api/Cargo.toml distingnt-sys/Cargo.toml
 .DELETE_ON_ERROR:
 
-all: $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o
+all: $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o plugins/kicklab.o
+
+plugins/kicklab.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml kicklab/Cargo.toml $(wildcard kicklab/src/*.rs) distingnt-sys/build.rs $(API_SOURCES)
+	@mkdir -p $(dir $@)
+	cargo build -p kicklab --target $(RUST_TARGET) --profile plugin
+	python3 distingnt-sys/tools/link_plugin.py target/$(RUST_TARGET)/plugin/libkicklab.a $@ --dram-callees
+	python3 tools/check_plugin.py $@
+
+# Same device filename so an existing KickLab instance can load this build.
+kicklab-profile:
+	@mkdir -p plugins/profile
+	cargo build -p kicklab --target $(RUST_TARGET) --profile plugin --features $(KICKLAB_PROFILE_FEATURES)
+	python3 distingnt-sys/tools/link_plugin.py target/$(RUST_TARGET)/plugin/libkicklab.a plugins/profile/kicklab.o --dram-callees
+	python3 tools/check_plugin.py plugins/profile/kicklab.o
+
+.PHONY: kicklab-profile
+KICKLAB_PROFILE_FEATURES ?= profiling
 
 plugins/wavesmith.o: Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml wavesmith/Cargo.toml $(wildcard wavesmith/src/*.rs) distingnt-sys/build.rs $(API_SOURCES)
 	@mkdir -p $(dir $@)
@@ -33,7 +49,7 @@ $(OUTPUT): Makefile tools/check_plugin.py Cargo.toml .cargo/config.toml distingn
 	python3 tools/check_plugin.py $@
 
 clean:
-	rm -f $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o plugins/wavesmith-profile.o
+	rm -f $(OUTPUT) plugins/rust-window-comparator.o plugins/wavesmith.o plugins/wavesmith-profile.o plugins/kicklab.o plugins/profile/kicklab.o
 	rm -rf target
 
 .PHONY: all clean
@@ -52,6 +68,8 @@ test:
 	cargo test -p monosynth --lib
 	cargo test -p wavesmith --lib
 	cargo test -p wavesmith --lib --features profiling
+	cargo test -p kicklab --lib
+	cargo test -p kicklab --lib --features profiling
 	cargo test -p distingnt-sys --lib
 	cargo test -p distingnt-api --lib
 	cargo test -p distingnt-api --doc

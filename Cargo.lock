@@ -14,6 +14,14 @@ name = "distingnt-sys"
 version = "0.1.0"
 
 [[package]]
+name = "kicklab"
+version = "0.1.0"
+dependencies = [
+ "distingnt-api",
+ "distingnt-sys",
+]
+
+[[package]]
 name = "monosynth"
 version = "0.1.0"
 dependencies = [

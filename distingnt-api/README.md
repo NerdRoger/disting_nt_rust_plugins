@@ -81,9 +81,13 @@ allocation; zero bytes permit a null host allocation. These hooks run during
 scan/loading, separately from per-instance construction. Disabled hooks remain
 None and compile away, as in the existing comparator and synth.
 
-The initialization slice is callback-scoped and cannot be stored as a permanent
-reference. Persistent shared-DRAM/table access from later callbacks still needs
-a dedicated safe resource adapter; these hooks alone do not provide one.
+The initialization slice is callback-scoped. To read initialized DRAM in a
+worker, opt in with a factory-owned `SharedStaticDram<Self>` descriptor in
+`SHARED_STATIC_DRAM`. The registration publishes the allocation only after
+`initialise` returns. `audio_worker_with_static_dram` receives an immutable
+view scoped to that call. Both views support checked numeric element access.
+The firmware must keep the allocation live and immutable through all callbacks
+for that loaded factory and drain workers before reinitialization or teardown.
 
 Every one of the current C++ factory's 18 callback endpoints is available through
 `Plugin`. Required framework callbacks are registered automatically; optional
@@ -227,7 +231,7 @@ through `Plugin::initialize_shared_resources` and `RegionInitializer`. The
 framework requests one aligned SRAM slot with an atomic ownership flag and
 persistent SysEx request. It does not put a large object on the stack or allocate
 from a heap. Ordinary state/region allocations remain separate and accessible.
-Plugins that do not opt in retain their original RAM layout and audio path.
+The shared object and its descriptor are allocated only for plugins that opt in.
 
 `Context::with_shared_resources` grants closure-scoped exclusive access and
 returns Busy instead of waiting when another execution context owns the slot.
@@ -239,7 +243,19 @@ reports Disabled without submission; firmware allocates a nonzero worker stack
 separately. One job or transfer may be pending per instance. Keep the worker
 payload general: no waveform, voice, or particular buffering model is imposed.
 Worker callbacks cannot access unsynchronized ordinary state, live parameters,
-setters or host audio buffers. Put data shared with a worker in this region.
+setters or host audio buffers.
+
+For independently shared DRAM, use
+`SharedResources<MyData, (), DramBuffers<MyElement, COUNT>>`. The plugin
+chooses the element type and maximum buffer count. The actual count defaults to
+that maximum and can be set per instance via `dram_buffer_count`. Buffers
+default to the common length from `dram_buffer_len`. Override
+`dram_buffer_len_at` to request variable lengths.
+Elements are initialized to `MyElement::default()`. Normal callbacks use
+`Context::dram_buffers()`, and the worker receives the same buffers through
+`Plugin::audio_worker_with_dram`. Each buffer has its own closure-scoped
+reservation. Plugins without a DRAM policy allocate no buffer memory or
+descriptor. The plugin decides what each buffer holds and when to publish it.
 
 `Context::send_large_sysex(destination)` reserves that same object through
 completion. `Plugin::large_sysex_chunk(&mut MyData)` returns a `SysExChunk` whose
