@@ -333,7 +333,7 @@ class Device:
         self.send(0x46, self.algorithm, *encode16(index), *encode16(value))
 
     def parameters(self, model="pitch-sweep"):
-        if self.request(0x40, self.algorithm)[:4] != b"KLab":
+        if self.request(0x40, self.algorithm)[:4] != b"ATkl":
             raise ValueError("Selected algorithm is not KickLab")
         count = decode16(self.request(0x42, self.algorithm))
         values = self.request(0x44, self.algorithm)

@@ -830,7 +830,7 @@ impl Plugin for KickLab {
     type StateMemory = Sram;
     type ExtraRegions = Resources;
 
-    const GUID: u32 = multichar(b'K', b'L', b'a', b'b');
+    const GUID: u32 = multichar(b'A', b'T', b'k', b'l');
     const NAME: &'static CStr = c"KickLab";
     const DESCRIPTION: &'static CStr = c"Layered kick drum prototype";
     const TAGS: u32 = TAG_INSTRUMENT;
