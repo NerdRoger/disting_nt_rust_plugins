@@ -566,7 +566,7 @@ fn confirmed_randomize_runs_once_and_rearms_after_reset() {
 }
 
 #[test]
-fn confirmed_global_randomize_selects_models_and_preserves_layer_switches() {
+fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
     CYCLES.with(|cycles| cycles.set(1));
     let mut host = Host::uninitialized(4);
     let action = RANDOMIZE_LAYERS;
@@ -591,18 +591,18 @@ fn confirmed_global_randomize_selects_models_and_preserves_layer_switches() {
     assert_eq!(unsafe { CStr::from_ptr(text.as_ptr()) }, c"Randomize?");
     assert_eq!(AUDIO_WRITES.with(Cell::get), writes);
 
-    for layer in 0..4 {
-        let base = model_index(layer);
-        host.values[base + LAYER_SOLO] = i16::from(layer == 1);
-        host.values[base + LAYER_MUTE] = i16::from(layer == 0);
-        host.values[base + LAYER_RANDOMIZE] = i16::from(layer == 2);
-    }
+    host.values[model_index(2) + LAYER_RANDOMIZE] = 1;
     let original = host.values.clone();
     let mut expected_seed = 1;
     for (defer, expected) in [
         (false, [(0, 1), (8, 7), (9, 1), (11, 1)]),
         (true, [(0, 67), (4, 22), (10, 55), (6, 8)]),
     ] {
+        for layer in 0..4 {
+            let base = model_index(layer);
+            host.values[base + LAYER_SOLO] = 1;
+            host.values[base + LAYER_MUTE] = 1;
+        }
         DEFER_MODEL_NOTIFICATION.with(|pending| pending.set(defer));
         REENTER_RANDOMIZE.with(|pending| pending.set(Some(action)));
         host.set(action, 1);
@@ -619,9 +619,12 @@ fn confirmed_global_randomize_selects_models_and_preserves_layer_switches() {
             assert_eq!(host.values[base + LAYER_LEVEL], level);
             assert_eq!(random_value(&mut expected_seed, 0, 12), model);
             assert_eq!(random_value(&mut expected_seed, 0, 100), level);
-            for offset in [LAYER_RANDOMIZE, LAYER_SOLO, LAYER_MUTE] {
-                assert_eq!(host.values[base + offset], original[base + offset]);
-            }
+            assert_eq!(host.values[base + LAYER_SOLO], 0);
+            assert_eq!(host.values[base + LAYER_MUTE], 0);
+            assert_eq!(
+                host.values[base + LAYER_RANDOMIZE],
+                original[base + LAYER_RANDOMIZE]
+            );
             let controls = Model::from_value(model).controls();
             let visible = if model == 0 {
                 1

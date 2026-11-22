@@ -644,6 +644,12 @@ fn randomize_layers(context: &mut Callback<'_, Audio>) {
         let [min, max] = LEVEL.range;
         let level = random_value(&mut context.state_mut().random_seed, min, max);
         context.parameters().set(base + LAYER_LEVEL, level);
+        for offset in [LAYER_SOLO, LAYER_MUTE] {
+            let parameter = base + offset;
+            if context.read_parameters().value(parameter) == Some(1) {
+                context.parameters().set(parameter, 0);
+            }
+        }
         if let Some(&model) = context.state().models.get(layer) {
             randomize_model_controls(context, base, model);
         }
