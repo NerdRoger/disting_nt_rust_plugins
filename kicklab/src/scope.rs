@@ -4,7 +4,7 @@ use distingnt_api::api::{
     drawing::{Alignment, Canvas, Shape, TextSize},
     math::exp2,
     plugin::RegionInitializer,
-    text::format_float,
+    text::{format_float, format_integer},
 };
 
 const WIDTH: usize = 254;
@@ -63,7 +63,7 @@ impl Scope {
         self.peak = peak_dbfs(peak);
     }
 
-    pub fn draw(&self, mut canvas: Canvas<'_>) {
+    pub fn draw(&self, mut canvas: Canvas<'_>, buffers_used: i32, buffer_waits: i32) {
         canvas.shape(Shape::Rectangle, 0, TOP, 255, 63, 0);
         canvas.shape(Shape::Line, LEFT, TOP, RIGHT, TOP, LIMIT_COLOUR);
         canvas.shape(Shape::Line, LEFT, BOTTOM, RIGHT, BOTTOM, LIMIT_COLOUR);
@@ -103,6 +103,16 @@ impl Scope {
             value => format_peak(&mut buffer, value).unwrap_or(c"Peak: -- dBFS"),
         };
         canvas.text(LEFT, FOOTER_Y, peak, 15, Alignment::Left, TextSize::Tiny);
+        let buffers = format_buffer_usage(&mut buffer, buffers_used, buffer_waits)
+            .unwrap_or(c"Buffers - Used: --  Waits: --");
+        canvas.text(
+            128,
+            FOOTER_Y,
+            buffers,
+            15,
+            Alignment::Centre,
+            TextSize::Tiny,
+        );
         canvas.text(
             RIGHT,
             FOOTER_Y,
@@ -112,6 +122,20 @@ impl Scope {
             TextSize::Tiny,
         );
     }
+}
+
+fn format_buffer_usage(buffer: &mut [u8; 64], used: i32, waits: i32) -> Option<&CStr> {
+    const PREFIX: &[u8] = b"Buffers - Used: ";
+    const WAIT_LABEL: &[u8] = b"  Waits: ";
+    let (prefix, rest) = buffer.split_at_mut(PREFIX.len());
+    prefix.copy_from_slice(PREFIX);
+    let digits = format_integer(rest, used)?;
+    let (label, rest) = rest
+        .get_mut(digits..)?
+        .split_at_mut_checked(WAIT_LABEL.len())?;
+    label.copy_from_slice(WAIT_LABEL);
+    format_integer(rest, waits)?;
+    CStr::from_bytes_until_nul(buffer).ok()
 }
 
 fn displacement(sample: f32) -> i8 {

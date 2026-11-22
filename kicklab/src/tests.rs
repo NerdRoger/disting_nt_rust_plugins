@@ -389,6 +389,15 @@ fn two_output_buffers_wait_for_a_playing_tail_before_reusing_its_slot() {
     host.set(level, 60);
     host.step([0.0; 4]);
     assert!(WORK.with(Cell::get).is_none());
+    for _ in 0..16 {
+        host.step([0.0; 4]);
+        assert!(WORK.with(Cell::get).is_none());
+    }
+    assert!(!unsafe { factory().draw.unwrap()(host.base) });
+    let labels = DRAW_LABELS.with_borrow_mut(core::mem::take);
+    assert_eq!(labels[1], "Buffers - Used: 2  Waits: 1");
+    // Keep the current waveform playing after the first tail releases its slot.
+    host.step([5.0; 4]);
     for _ in 0..1000 {
         host.step([0.0; 4]);
         if WORK.with(Cell::get).is_some() {
@@ -396,6 +405,12 @@ fn two_output_buffers_wait_for_a_playing_tail_before_reusing_its_slot() {
         }
     }
     assert_eq!(host.complete(), 0);
+    host.set(level, 50);
+    host.step([0.0; 4]);
+    assert!(WORK.with(Cell::get).is_none());
+    assert!(!unsafe { factory().draw.unwrap()(host.base) });
+    let labels = DRAW_LABELS.with_borrow_mut(core::mem::take);
+    assert_eq!(labels[1], "Buffers - Used: 2  Waits: 2");
 }
 
 #[test]
@@ -1155,7 +1170,10 @@ fn scope_draws_the_published_peak_with_a_fixed_time_axis() {
         assert!(!unsafe { factory().draw.unwrap()(host.base) });
         DRAW_LABELS.with_borrow_mut(core::mem::take)
     };
-    assert_eq!(draw(), ["Peak: -inf dBFS", "1000 ms"]);
+    assert_eq!(
+        draw(),
+        ["Peak: -inf dBFS", "Buffers - Used: 0  Waits: 0", "1000 ms"]
+    );
     assert_eq!(WAVE_ENDS.with(Cell::get), 0);
     let base = host.base;
     host.set(GAIN, 120);
@@ -1165,7 +1183,7 @@ fn scope_draws_the_published_peak_with_a_fixed_time_axis() {
     assert!(!unsafe { factory().draw.unwrap()(base) });
     assert_eq!(
         DRAW_LABELS.with_borrow_mut(core::mem::take),
-        ["Peak: 0.0 dBFS", "1000 ms"]
+        ["Peak: 0.0 dBFS", "Buffers - Used: 1  Waits: 0", "1000 ms"]
     );
     assert!(WAVE_SEGMENTS.with(Cell::get) > 0);
     assert!(WAVE_ENDS.with(Cell::get) > 0);

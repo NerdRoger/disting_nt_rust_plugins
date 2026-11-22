@@ -469,10 +469,12 @@ struct State {
     rate: u32,
     parameter_setup: ParameterSetup,
     dirty: bool,
+    waiting_for_buffer: bool,
     randomizing: u16, // One bit per layer, followed by the global action.
     output_buffers: u8,
     random_seed: u32,
     in_flight: Option<usize>,
+    buffer_usage: playback::BufferUsage,
     player: Player,
     scope: Scope,
     #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
@@ -745,12 +747,17 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
         context.state_mut().meter.wait_for_worker(_frames);
         return;
     }
-    let state = context.state();
+    let state = context.state_mut();
     let Some(slot) = state.player.free_buffer(usize::from(state.output_buffers)) else {
+        if !state.waiting_for_buffer {
+            state.waiting_for_buffer = true;
+            state.buffer_usage.record_wait();
+        }
         #[cfg(feature = "profiling")]
-        context.state_mut().meter.wait_for_buffer(_frames);
+        state.meter.wait_for_buffer(_frames);
         return;
     };
+    state.waiting_for_buffer = false;
     #[cfg(feature = "profiling")]
     let submit_started = cpu_cycle_count();
     let mut job = Job {
@@ -909,6 +916,7 @@ impl Plugin for KickLab {
                 rate: rate,
                 parameter_setup: ParameterSetup::New,
                 dirty: true,
+                waiting_for_buffer: false,
                 randomizing: 0,
                 output_buffers: output_buffer_count(specs)? as u8,
                 random_seed: distingnt_api::api::cpu_cycle_count() | 1,
@@ -920,7 +928,8 @@ impl Plugin for KickLab {
             },
             regions {
                 player: |player| Player::initialize(player, rate),
-                scope: Scope::initialize
+                scope: Scope::initialize,
+                buffer_usage: playback::BufferUsage::initialize
             }
         );
         Some(())
@@ -1137,7 +1146,12 @@ impl Plugin for KickLab {
     }
 
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {
-        context.state().scope.draw(canvas);
+        let state = context.state();
+        state.scope.draw(
+            canvas,
+            state.buffer_usage.peak(),
+            state.buffer_usage.waits(),
+        );
         false
     }
 
@@ -1152,6 +1166,10 @@ impl Plugin for KickLab {
         let output = parameters.value(OUTPUT).and_then(bus_index);
         let replace = parameters.value(OUTPUT_MODE) == Some(1);
         let mut player = context.state().player;
+        let mut occupied = player.occupied_buffers();
+        if let Some(slot) = context.state().in_flight {
+            occupied |= 1 << slot;
+        }
         let mut diagnostics = playback::PlaybackDiagnostics::default();
         player.play(
             context.dram_buffers(),
@@ -1162,7 +1180,13 @@ impl Plugin for KickLab {
             replace,
             &mut diagnostics,
         );
-        context.state_mut().player = player;
+        let state = context.state_mut();
+        state.player = player;
+        // A trigger only reuses the published waveform. Playback can release
+        // slots within this block, so measure occupancy before playing it.
+        state
+            .buffer_usage
+            .observe(occupied.count_ones() as usize, frames, state.rate);
         #[cfg(feature = "profiling")]
         {
             let elapsed = cpu_cycle_count().wrapping_sub(start);

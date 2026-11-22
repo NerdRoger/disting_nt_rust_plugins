@@ -1,9 +1,87 @@
 use distingnt_api::api::plugin::RegionInitializer;
 
-use crate::WaveBuffers;
+use crate::{WaveBuffers, MAX_OUTPUT_BUFFERS};
 
 const VOICES: usize = 8;
 pub const OUTPUT_VOLTS: f32 = 5.0;
+const BUFFER_WINDOW_SECONDS: u32 = 5;
+const WAIT_BUCKETS_PER_SECOND: u32 = 20;
+// Retain the current partial bucket so a wait is never dropped early.
+const WAIT_BUCKETS: usize = (BUFFER_WINDOW_SECONDS * WAIT_BUCKETS_PER_SECOND + 1) as usize;
+
+#[derive(Clone, Copy)]
+pub struct BufferUsage {
+    frame: u64,
+    expires_at: [u64; MAX_OUTPUT_BUFFERS + 1],
+    wait_buckets: [u16; WAIT_BUCKETS],
+    wait_bucket: usize,
+    wait_bucket_frames: u32,
+    waits: i32,
+}
+
+impl BufferUsage {
+    #[cfg(test)]
+    pub const EMPTY: Self = Self {
+        frame: 0,
+        expires_at: [0; MAX_OUTPUT_BUFFERS + 1],
+        wait_buckets: [0; WAIT_BUCKETS],
+        wait_bucket: 0,
+        wait_bucket_frames: 0,
+        waits: 0,
+    };
+
+    pub fn initialize(destination: &mut RegionInitializer<'_, Self>) {
+        distingnt_api::initialize_region!(
+            destination,
+            BufferUsage {
+                frame: 0,
+                wait_bucket: 0,
+                wait_bucket_frames: 0,
+                waits: 0,
+            },
+            arrays {
+                expires_at: |_| 0,
+                wait_buckets: |_| 0
+            }
+        );
+    }
+
+    pub fn observe(&mut self, used: usize, frames: usize, rate: u32) {
+        self.frame += frames as u64;
+        // Keep the latest observation for each distinct count. A lower count
+        // can take over immediately when a higher one ages out of the window.
+        if let Some(expiry) = self.expires_at.get_mut(used) {
+            *expiry = self.frame + u64::from(rate) * u64::from(BUFFER_WINDOW_SECONDS);
+        }
+        let bucket_frames = rate.div_ceil(WAIT_BUCKETS_PER_SECOND).max(1);
+        self.wait_bucket_frames += frames as u32;
+        while self.wait_bucket_frames >= bucket_frames {
+            self.wait_bucket_frames -= bucket_frames;
+            self.wait_bucket = (self.wait_bucket + 1) % WAIT_BUCKETS;
+            if let Some(expired) = self.wait_buckets.get_mut(self.wait_bucket) {
+                self.waits -= i32::from(core::mem::take(expired));
+            }
+        }
+    }
+
+    pub fn record_wait(&mut self) {
+        if let Some(bucket) = self.wait_buckets.get_mut(self.wait_bucket) {
+            *bucket += 1;
+            self.waits += 1;
+        }
+    }
+
+    pub fn waits(&self) -> i32 {
+        self.waits
+    }
+
+    pub fn peak(&self) -> i32 {
+        self.expires_at
+            .iter()
+            .rposition(|&expiry| expiry > self.frame)
+            .unwrap_or(0) as i32
+    }
+}
 
 #[derive(Default)]
 pub struct PlaybackDiagnostics {
@@ -91,14 +169,18 @@ impl Player {
     }
 
     pub fn free_buffer(&self, output_buffers: usize) -> Option<usize> {
-        (0..output_buffers).find(|&slot| {
-            !(self.current.active() && self.current.slot == slot
-                || self.fading.active() && self.fading.slot == slot
-                || self
-                    .voices
-                    .iter()
-                    .any(|voice| voice.active() && voice.slot == slot))
-        })
+        let slot = (!self.occupied_buffers()).trailing_zeros() as usize;
+        (slot < output_buffers).then_some(slot)
+    }
+
+    pub fn occupied_buffers(&self) -> u16 {
+        let mut slots = 0;
+        for hit in self.voices.iter().chain([&self.current, &self.fading]) {
+            if hit.active() {
+                slots |= 1 << hit.slot;
+            }
+        }
+        slots
     }
 
     fn trigger(&mut self) {
@@ -230,6 +312,35 @@ impl Player {
 mod tests {
     use super::*;
     use crate::DEFAULT_OUTPUT_BUFFERS;
+
+    #[test]
+    fn buffer_usage_keeps_lower_peaks_after_a_higher_one_expires() {
+        let mut usage = BufferUsage::EMPTY;
+        assert_eq!(usage.peak(), 0);
+        usage.observe(4, 12, 100);
+        usage.observe(2, 499, 100);
+        assert_eq!(usage.peak(), 4);
+        usage.observe(2, 1, 100);
+        assert_eq!(usage.peak(), 2);
+        usage.observe(0, 500, 100);
+        assert_eq!(usage.peak(), 0);
+    }
+
+    #[test]
+    fn buffer_waits_expire_independently_after_five_seconds() {
+        let mut usage = BufferUsage::EMPTY;
+        usage.record_wait();
+        usage.observe(2, 17, 100);
+        usage.record_wait();
+        usage.observe(2, 483, 100);
+        assert_eq!(usage.waits(), 2);
+        usage.observe(2, 5, 100);
+        assert_eq!(usage.waits(), 1);
+        usage.observe(2, 15, 100);
+        assert_eq!(usage.waits(), 0);
+        usage.record_wait();
+        assert_eq!(usage.waits(), 1);
+    }
 
     #[test]
     fn current_and_generations_of_tails_can_pin_every_buffer() {
