@@ -38,17 +38,24 @@ impl Scope {
         );
     }
 
-    pub fn capture(&mut self, samples: &[f32], rate: u32) {
+    pub fn capture(&mut self, samples: &mut [f32], rate: u32, mut finish: impl FnMut(&mut f32)) {
         let plot_frames = rate as usize;
         let mut peak = 0.0_f32;
         for (x, column) in self.columns.iter_mut().enumerate() {
             let start = (x * plot_frames / WIDTH).min(samples.len());
             let end = ((x + 1) * plot_frames / WIDTH).min(samples.len());
-            let mut min = samples.get(start).copied().unwrap_or(0.0);
-            let mut max = min;
-            for &sample in samples.get(start..end).unwrap_or_default() {
-                min = min.min(sample);
-                max = max.max(sample);
+            let slice = samples.get_mut(start..end).unwrap_or_default();
+            let Some((first, rest)) = slice.split_first_mut() else {
+                *column = [0, 0];
+                continue;
+            };
+            finish(first);
+            let mut min = *first;
+            let mut max = *first;
+            for sample in rest {
+                finish(sample);
+                min = min.min(*sample);
+                max = max.max(*sample);
             }
             peak = peak.max(min.abs()).max(max.abs());
             *column = [displacement(max), displacement(min)];
@@ -155,8 +162,9 @@ mod tests {
             peak: SILENT,
         };
         scope.capture(
-            &[0.1, -1.0, 0.8, 0.1, -0.2, -0.7, -0.1, -0.4],
+            &mut [0.1, -1.0, 0.8, 0.1, -0.2, -0.7, -0.1, -0.4],
             (WIDTH * 4) as u32,
+            |_| {},
         );
         assert_eq!(scope.columns[0], [15, -19]);
         assert_eq!(scope.columns[1], [-2, -13]);

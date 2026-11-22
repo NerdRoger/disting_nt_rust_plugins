@@ -9,6 +9,8 @@ pub struct RenderTiming {
     pub synthesis: [Option<u32>; crate::MAX_LAYERS],
     pub lowpass: Option<u32>,
     pub gain_and_peak: Option<u32>,
+    pub mix: u32,
+    pub scope: Option<u32>,
     pub grains: [GrainTiming; crate::MAX_LAYERS],
 }
 #[derive(Clone, Copy, Default)]
@@ -21,6 +23,8 @@ pub const NO_RENDER_TIMING: RenderTiming = RenderTiming {
     synthesis: [None; crate::MAX_LAYERS],
     lowpass: None,
     gain_and_peak: None,
+    mix: 0,
+    scope: None,
     grains: [GrainTiming {
         accumulation: None,
         shaping: None,
@@ -41,7 +45,9 @@ const OUTSIDE_CALLBACK: usize = 10;
 pub const TELEMETRY_SEND: usize = 11;
 const GRAIN_ACCUMULATION: usize = 12;
 const GRAIN_SHAPING: usize = 13;
-pub(crate) const FUNCTIONS: [&[u8]; 14] = [
+const MIX: usize = 14;
+const SCOPE: usize = 15;
+pub(crate) const FUNCTIONS: [&[u8]; 16] = [
     b"KickLab::step",
     b"KickLab::process_render",
     b"KickLab::render::render",
@@ -56,6 +62,8 @@ pub(crate) const FUNCTIONS: [&[u8]; 14] = [
     b"KickLab::profiling_midi_send",
     b"KickLab::render::grain_accumulation",
     b"KickLab::render::grain_shaping",
+    b"KickLab::render::mix_layers",
+    b"KickLab::render::scope",
 ];
 const FUNCTION_COUNT: usize = FUNCTIONS.len();
 const METADATA_PACKETS: usize = 1 + FUNCTION_COUNT;
@@ -204,6 +212,7 @@ impl Meter {
     pub fn record_render(&mut self, timing: RenderTiming) {
         if let Some(cycles) = timing.total {
             self.record(RENDER, cycles);
+            self.record(MIX, timing.mix);
         }
         for cycles in timing.synthesis.into_iter().flatten() {
             self.record(SYNTHESIS, cycles);
@@ -213,6 +222,9 @@ impl Meter {
         }
         if let Some(cycles) = timing.gain_and_peak {
             self.record(GAIN_AND_PEAK, cycles);
+        }
+        if let Some(cycles) = timing.scope {
+            self.record(SCOPE, cycles);
         }
         for grain in timing.grains {
             if let Some(cycles) = grain.accumulation {

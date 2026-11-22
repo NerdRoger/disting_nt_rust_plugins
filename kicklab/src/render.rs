@@ -59,6 +59,12 @@ impl CachedLayer {
     };
 }
 
+struct MixInput {
+    slot: usize,
+    end: usize,
+    level: f32,
+}
+
 distingnt_api::nt_dram_section! {
 pub fn render(
     job: &Job,
@@ -67,6 +73,7 @@ pub fn render(
     samples: &mut [f32],
     tables: Option<Lookup<'_>>,
     _timing: &mut RenderTiming,
+    scope: &mut crate::Scope,
 ) -> Option<usize> {
     let rate = job.rate;
     let cutoff = (job.cutoff as f32).min(rate as f32 * 0.45);
@@ -80,6 +87,7 @@ pub fn render(
             .count() == 1;
     let mut peak = 1.0f32;
     let mut length = 0;
+    let mut pending: Option<MixInput> = None;
     for (index, (layer, cached)) in job.layers.iter().zip(cached_layers).enumerate() {
         if !layer.audible(solo_active) {
             continue;
@@ -88,8 +96,6 @@ pub fn render(
         let end = milliseconds(rate, patch.controls[1] as usize * 3 + 10)
             .div_ceil(2)
             .min(samples.len());
-        let mix = samples.get_mut(..end)?;
-        let overlap = length.min(end);
         // Layer caches start after the output pool. The cache holds post-drive,
         // pre-level samples; the sample rate is fixed for this instance.
         let slot = layer_slot(usize::from(job.output_buffers), index);
@@ -141,6 +147,9 @@ pub fn render(
                 store_patch(&mut cached.patch, patch);
             }
             if fuse_mix {
+                #[cfg(feature = "profiling")]
+                let start = cpu_cycle_count();
+                let mix = samples.get_mut(..end)?;
                 if layer.level == 1.0 {
                     for (mixed, &sample) in mix.iter_mut().zip(waveform.iter()) {
                         let scaled = (0.0 + sample) * gain;
@@ -154,22 +163,47 @@ pub fn render(
                         peak = peak.max(scaled.abs());
                     }
                 }
-                return Some(());
-            }
-            let (mix_overlap, mix_new) = mix.split_at_mut_checked(overlap)?;
-            let (layer_overlap, layer_new) = waveform.split_at_checked(overlap)?;
-            for (mixed, &sample) in mix_overlap.iter_mut().zip(layer_overlap) {
-                *mixed += sample * layer.level;
-            }
-            for (mixed, &sample) in mix_new.iter_mut().zip(layer_new) {
-                // Match accumulation into a cleared buffer, including signed zero.
-                *mixed = 0.0 + sample * layer.level;
+                #[cfg(feature = "profiling")]
+                {
+                    _timing.mix += cpu_cycle_count().wrapping_sub(start);
+                }
             }
             Some(())
         })??;
-        length = length.max(end);
+        if fuse_mix {
+            length = end;
+            continue;
+        }
+        let input = MixInput { slot, end, level: layer.level };
+        if let Some(first) = pending.take() {
+            #[cfg(feature = "profiling")]
+            let start = cpu_cycle_count();
+            let end = first.end.max(input.end);
+            mix_pair(buffers, samples.get_mut(..end)?, length, first, input)?;
+            length = length.max(end);
+            #[cfg(feature = "profiling")]
+            {
+                _timing.mix += cpu_cycle_count().wrapping_sub(start);
+            }
+        } else {
+            pending = Some(input);
+        }
+    }
+    if let Some(input) = pending {
+        #[cfg(feature = "profiling")]
+        let start = cpu_cycle_count();
+        let mix = samples.get_mut(..input.end)?;
+        buffers.with(input.slot, |wave| {
+            mix_single(mix, wave.get(..input.end)?, length, input.level)
+        })??;
+        length = length.max(input.end);
+        #[cfg(feature = "profiling")]
+        {
+            _timing.mix += cpu_cycle_count().wrapping_sub(start);
+        }
     }
     if length == 0 {
+        scope.capture(&mut [], rate, |_| {});
         return Some(0);
     }
     if cutoff > 0.0 {
@@ -182,17 +216,21 @@ pub fn render(
         #[cfg(feature = "profiling")]
         let start = cpu_cycle_count();
         let cycles = cutoff / rate as f32;
+        let fade = if end < requested_end {
+            milliseconds(rate, RELEASE_FADE_MS).min(end)
+        } else {
+            0
+        };
         peak = match drive {
             Some(boost) => {
-                let ceiling = lowpass(mix, cycles, 1.0);
-                apply_master_drive(mix, boost, ceiling, gain)
+                let undriven_peak = lowpass(mix, cycles, 1.0);
+                MasterDrive::new(boost, undriven_peak, gain).apply(mix);
+                1.0
             }
             None => lowpass(mix, cycles, gain),
         };
-        if end < requested_end {
-            // The filter can still ring after the layer release. Fade its
-            // output if the remaining filter tail would run past the cap.
-            let fade = milliseconds(rate, RELEASE_FADE_MS).min(end);
+        if fade != 0 {
+            // Fade the filter tail if it would run past the cap.
             let scale = (fade as f32).recip();
             for (remaining, sample) in mix.iter_mut().rev().take(fade).enumerate() {
                 *sample *= remaining as f32 * scale;
@@ -210,8 +248,8 @@ pub fn render(
     // the peak while writing. An unfiltered multi-layer mix needs this pass.
     if cutoff == 0.0 && !fuse_mix {
         if let Some(boost) = drive {
-            let ceiling = mix.iter().fold(1.0_f32, |peak, sample| peak.max(sample.abs()));
-            peak = apply_master_drive(mix, boost, ceiling, gain);
+            let undriven_peak = mix.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            MasterDrive::new(boost, undriven_peak, gain).apply(mix);
         } else if gain == 1.0 {
             for sample in &*mix {
                 peak = peak.max(sample.abs());
@@ -223,17 +261,66 @@ pub fn render(
             }
         }
     }
-    if peak > 1.0 {
-        let trim = peak.recip();
-        for sample in mix {
-            *sample *= trim;
-        }
-    }
     #[cfg(feature = "profiling")]
     {
         _timing.gain_and_peak = Some(cpu_cycle_count().wrapping_sub(start));
     }
+    #[cfg(feature = "profiling")]
+    let start = cpu_cycle_count();
+    if peak > 1.0 {
+        let trim = peak.recip();
+        scope.capture(mix, rate, |sample| *sample *= trim);
+    } else {
+        scope.capture(mix, rate, |_| {});
+    }
+    #[cfg(feature = "profiling")]
+    {
+        _timing.scope = Some(cpu_cycle_count().wrapping_sub(start));
+    }
     Some(length)
+}
+
+fn mix_pair(
+    buffers: &WaveBuffers,
+    mix: &mut [f32],
+    length: usize,
+    a: MixInput,
+    b: MixInput,
+) -> Option<()> {
+    buffers.with(a.slot, |a_wave| {
+        buffers.with(b.slot, |b_wave| {
+            let a_wave = a_wave.get(..a.end)?;
+            let b_wave = b_wave.get(..b.end)?;
+            let shared = a.end.min(b.end);
+            let (both, tail) = mix.split_at_mut_checked(shared)?;
+            let overlap = length.min(shared);
+            let (old, new) = both.split_at_mut_checked(overlap)?;
+            let (a_old, a_new) = a_wave.get(..shared)?.split_at_checked(overlap)?;
+            let (b_old, b_new) = b_wave.get(..shared)?.split_at_checked(overlap)?;
+            // Accumulate the first layer before the second to preserve rounding.
+            for ((mixed, &a_sample), &b_sample) in old.iter_mut().zip(a_old).zip(b_old) {
+                *mixed = (*mixed + a_sample * a.level) + b_sample * b.level;
+            }
+            for ((mixed, &a_sample), &b_sample) in new.iter_mut().zip(a_new).zip(b_new) {
+                *mixed = (0.0 + a_sample * a.level) + b_sample * b.level;
+            }
+            let (longer, level) = if a.end > b.end { (a_wave, a.level) } else { (b_wave, b.level) };
+            mix_single(tail, longer.get(shared..)?, length.saturating_sub(shared), level)
+        })?
+    })?
+}
+
+fn mix_single(mix: &mut [f32], wave: &[f32], length: usize, level: f32) -> Option<()> {
+    let overlap = length.min(mix.len());
+    let (old, new) = mix.split_at_mut_checked(overlap)?;
+    let (wave_old, wave_new) = wave.split_at_checked(overlap)?;
+    for (mixed, &sample) in old.iter_mut().zip(wave_old) {
+        *mixed += sample * level;
+    }
+    for (mixed, &sample) in new.iter_mut().zip(wave_new) {
+        *mixed = 0.0 + sample * level;
+    }
+    Some(())
 }
 }
 
@@ -243,16 +330,35 @@ fn store_patch(destination: &mut LayerPatch, source: &LayerPatch) {
     *destination = *source;
 }
 
-fn apply_master_drive(samples: &mut [f32], boost: f32, ceiling: f32, gain: f32) -> f32 {
-    // The ceiling is at least the undriven peak, so engaging Drive at a low
-    // setting only clips the excess introduced by the drive boost.
-    let mut peak = 1.0_f32;
-    for sample in samples {
-        let scaled = (*sample * boost).max(-ceiling).min(ceiling) * gain;
-        *sample = scaled;
-        peak = peak.max(scaled.abs());
+struct MasterDrive {
+    boost: f32,
+    ceiling: f32,
+    gain: f32,
+}
+
+impl MasterDrive {
+    fn new(boost: f32, undriven_peak: f32, gain: f32) -> Self {
+        let ceiling = undriven_peak.max(1.0);
+        // Boost and clipping are monotonic in magnitude, so the undriven
+        // peak also determines the driven peak and the final safety trim.
+        let driven_peak = (undriven_peak * boost).min(ceiling) * gain;
+        let gain = if driven_peak > 1.0 {
+            gain * driven_peak.recip()
+        } else {
+            gain
+        };
+        Self {
+            boost,
+            ceiling,
+            gain,
+        }
     }
-    peak
+
+    fn apply(&self, samples: &mut [f32]) {
+        for sample in samples {
+            *sample = (*sample * self.boost).max(-self.ceiling).min(self.ceiling) * self.gain;
+        }
+    }
 }
 
 fn lowpass(samples: &mut [f32], cycles: f32, gain: f32) -> f32 {
@@ -266,7 +372,7 @@ fn lowpass(samples: &mut [f32], cycles: f32, gain: f32) -> f32 {
     let a2 = (1.0 - root_two_k + squared) * norm;
     let mut z1 = 0.0;
     let mut z2 = 0.0;
-    let mut peak = 1.0f32;
+    let mut peak = 0.0_f32;
     for sample in samples {
         let output = *sample * b0 + z1;
         z1 = *sample * b1 - output * a1 + z2;

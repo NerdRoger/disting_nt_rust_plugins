@@ -1114,6 +1114,32 @@ fn first_drive_step_preserves_the_peak_of_a_hot_mix() {
 }
 
 #[test]
+fn master_drive_applies_safety_trim_after_clipping() {
+    let mut host = Host::new(4);
+    for layer in 1..4 {
+        host.set(model_index(layer), 1);
+    }
+    host.set(GAIN, -130);
+    host.step([0.0; 4]);
+    let clean = host.complete();
+    let reference: Vec<_> = (0..36_240).map(|frame| host.sample(clean, frame)).collect();
+    let peak = reference
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.3);
+    host.step([0.0; 4]);
+    host.set(MASTER_DRIVE, 120);
+    host.set(GAIN, 60);
+    host.step([0.0; 4]);
+    let driven = host.complete();
+    let boost = distingnt_api::api::math::exp2(12.0 * (core::f32::consts::LOG2_10 / 20.0));
+    for (frame, sample) in reference.into_iter().enumerate() {
+        let actual = host.sample(driven, frame);
+        assert!((actual - (sample * boost / peak).clamp(-1.0, 1.0)).abs() < 1e-6);
+    }
+}
+
+#[test]
 fn scope_draws_the_published_peak_with_a_fixed_time_axis() {
     let mut host = Host::new(1);
     let draw = || {

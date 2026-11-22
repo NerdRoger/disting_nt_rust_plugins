@@ -1101,10 +1101,8 @@ impl Plugin for KickLab {
                     samples,
                     tables,
                     &mut timing,
+                    &mut work.scope,
                 );
-                if let Some(waveform) = length.and_then(|length| samples.get(..length)) {
-                    work.scope.capture(waveform, work.job.rate);
-                }
                 #[cfg(feature = "profiling")]
                 {
                     timing.total = Some(cpu_cycle_count().wrapping_sub(start));
