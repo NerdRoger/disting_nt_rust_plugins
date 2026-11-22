@@ -248,6 +248,7 @@ impl Host {
             (((buffers + layers) as usize) * render::max_frames(48_000)
                 + layers as usize * render::layer_cache_frames(48_000))
                 * 4
+                + usize::from(layers as usize >= MIN_TILED_LAYERS) * MIX_TILE_FRAMES * 4
         );
         let mut sram = vec![0; (req.sram as usize).div_ceil(8)];
         let mut dram = vec![f32::NAN; req.dram as usize / 4];
@@ -765,6 +766,12 @@ fn mix_applies_layer_levels_to_cached_waveforms() {
         host.sample(original_mix, frame),
         cached.iter().map(|sample| sample * 0.1).sum::<f32>()
     );
+    for frame in [MIX_TILE_FRAMES - 1, MIX_TILE_FRAMES, MIX_TILE_FRAMES + 1] {
+        let expected = (0..3)
+            .map(|layer| host.sample(host.layer_slot(layer), frame) * 0.1)
+            .sum::<f32>();
+        assert_eq!(host.sample(original_mix, frame), expected);
+    }
     let modal_tail = host.sample(host.layer_slot(1), 7500) * 0.1;
     assert_ne!(modal_tail, 0.0);
     assert_eq!(host.sample(original_mix, 7500), modal_tail);

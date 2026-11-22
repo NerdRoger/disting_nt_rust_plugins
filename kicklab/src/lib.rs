@@ -414,6 +414,7 @@ struct Job {
     drive: f32,
     cutoff: i16,
     output_buffers: u8,
+    layer_count: u8,
 }
 impl Job {
     const EMPTY: Self = Self {
@@ -423,6 +424,7 @@ impl Job {
         drive: 0.0,
         cutoff: 0,
         output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
+        layer_count: 0,
     };
 
     fn initialize(destination: &mut RegionInitializer<'_, Self>) {
@@ -434,6 +436,7 @@ impl Job {
                 drive: 0.0,
                 cutoff: 0,
                 output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
+                layer_count: 0,
             },
             arrays {
                 layers: |_| Layer::OFF
@@ -478,7 +481,9 @@ struct State {
 
 struct KickLab;
 static TABLE_DRAM: SharedStaticDram<KickLab> = SharedStaticDram::new();
-type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + 2 * MAX_LAYERS }>;
+const MIX_TILE_FRAMES: usize = 512;
+const MIN_TILED_LAYERS: usize = 3;
+type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + 2 * MAX_LAYERS + 1 }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
 
@@ -751,6 +756,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     let mut job = Job {
         rate: state.rate,
         output_buffers: state.output_buffers,
+        layer_count: state.layers as u8,
         ..Job::EMPTY
     };
     let parameters = context.read_parameters();
@@ -865,7 +871,9 @@ impl Plugin for KickLab {
 
     fn dram_buffer_count(specs: &[i32]) -> usize {
         match (output_buffer_count(specs), layer_count(specs)) {
-            (Some(output_buffers), Some(layers)) => layer_slot(output_buffers, layers),
+            (Some(output_buffers), Some(layers)) => {
+                layer_slot(output_buffers, layers) + usize::from(layers >= MIN_TILED_LAYERS)
+            }
             _ => 0,
         }
     }
@@ -874,6 +882,11 @@ impl Plugin for KickLab {
         let Some(output_buffers) = output_buffer_count(specs) else {
             return 0;
         };
+        if layer_count(specs).is_some_and(|layers| {
+            layers >= MIN_TILED_LAYERS && slot == layer_slot(output_buffers, layers)
+        }) {
+            return MIX_TILE_FRAMES;
+        }
         if slot >= output_buffers && (slot - output_buffers) % 2 == 1 {
             render::layer_cache_frames(rate)
         } else {
@@ -1094,15 +1107,25 @@ impl Plugin for KickLab {
             .with(slot as usize, |samples| {
                 #[cfg(feature = "profiling")]
                 let start = cpu_cycle_count();
-                let length = render::render(
-                    &work.job,
-                    &mut work.cached_layers,
-                    buffers,
-                    samples,
-                    tables,
-                    &mut timing,
-                    &mut work.scope,
-                );
+                let mut render = |tile: &mut [f32]| {
+                    render::render(
+                        &work.job,
+                        &mut work.cached_layers,
+                        buffers,
+                        samples,
+                        tables,
+                        &mut timing,
+                        &mut work.scope,
+                        tile,
+                    )
+                };
+                let layers = usize::from(work.job.layer_count);
+                let length = if layers >= MIN_TILED_LAYERS {
+                    let tile_slot = layer_slot(usize::from(work.job.output_buffers), layers);
+                    buffers.with(tile_slot, render).flatten()
+                } else {
+                    render(&mut [])
+                };
                 #[cfg(feature = "profiling")]
                 {
                     timing.total = Some(cpu_cycle_count().wrapping_sub(start));

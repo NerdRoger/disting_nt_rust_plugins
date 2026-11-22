@@ -11,7 +11,7 @@ use crate::lookup::{self, Lookup};
 use crate::profile::{GrainTiming, RenderTiming};
 use crate::{
     layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
-    PITCH_CLICK_MAX_DECAY_TENTHS_MS,
+    MIN_TILED_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
 #[cfg(feature = "profiling")]
 use distingnt_api::api::cpu_cycle_count;
@@ -59,6 +59,7 @@ impl CachedLayer {
     };
 }
 
+#[derive(Clone, Copy)]
 struct MixInput {
     slot: usize,
     end: usize,
@@ -74,20 +75,20 @@ pub fn render(
     tables: Option<Lookup<'_>>,
     _timing: &mut RenderTiming,
     scope: &mut crate::Scope,
+    tile: &mut [f32],
 ) -> Option<usize> {
     let rate = job.rate;
     let cutoff = (job.cutoff as f32).min(rate as f32 * 0.45);
     let gain = db_gain(job.gain);
     let drive = (job.drive > 0.0).then(|| db_gain(job.drive));
     let solo_active = job.layers.iter().any(|layer| layer.patch.model != Model::Off && layer.solo);
-    let fuse_mix = cutoff == 0.0 && drive.is_none()
-        && job.layers.iter()
-            .filter(|layer| layer.audible(solo_active))
-            .take(2)
-            .count() == 1;
+    let audible_layers = job.layers.iter().filter(|layer| layer.audible(solo_active)).count();
+    let fuse_mix = cutoff == 0.0 && drive.is_none() && audible_layers == 1;
+    let use_tile = audible_layers >= MIN_TILED_LAYERS && !tile.is_empty();
     let mut peak = 1.0f32;
     let mut length = 0;
     let mut pending: Option<MixInput> = None;
+    let mut inputs = [None; MAX_LAYERS];
     for (index, (layer, cached)) in job.layers.iter().zip(cached_layers).enumerate() {
         if !layer.audible(solo_active) {
             continue;
@@ -175,6 +176,11 @@ pub fn render(
             continue;
         }
         let input = MixInput { slot, end, level: layer.level };
+        if use_tile {
+            *inputs.get_mut(index)? = Some(input);
+            length = length.max(end);
+            continue;
+        }
         if let Some(first) = pending.take() {
             #[cfg(feature = "profiling")]
             let start = cpu_cycle_count();
@@ -205,6 +211,15 @@ pub fn render(
     if length == 0 {
         scope.capture(&mut [], rate, |_| {});
         return Some(0);
+    }
+    if use_tile {
+        #[cfg(feature = "profiling")]
+        let start = cpu_cycle_count();
+        mix_tiles(buffers, samples.get_mut(..length)?, tile, &inputs)?;
+        #[cfg(feature = "profiling")]
+        {
+            _timing.mix += cpu_cycle_count().wrapping_sub(start);
+        }
     }
     if cutoff > 0.0 {
         let tail = (rate as f32 * (3.0 / cutoff).max(0.005)) as usize + 1;
@@ -319,6 +334,35 @@ fn mix_single(mix: &mut [f32], wave: &[f32], length: usize, level: f32) -> Optio
     }
     for (mixed, &sample) in new.iter_mut().zip(wave_new) {
         *mixed = 0.0 + sample * level;
+    }
+    Some(())
+}
+
+fn mix_tiles(
+    buffers: &WaveBuffers,
+    samples: &mut [f32],
+    tile: &mut [f32],
+    inputs: &[Option<MixInput>; MAX_LAYERS],
+) -> Option<()> {
+    let width = core::num::NonZeroUsize::new(tile.len())?;
+    let mut start = 0;
+    for dest in samples.chunks_mut(width.get()) {
+        // Each layer covers a prefix. Write its new frames directly and
+        // accumulate over the frames already written by earlier layers.
+        let mut written = 0;
+        for input in inputs.iter().flatten() {
+            let frames = input.end.saturating_sub(start).min(dest.len());
+            if frames == 0 {
+                continue;
+            }
+            let sum = tile.get_mut(..frames)?;
+            buffers.with(input.slot, |wave| {
+                mix_single(sum, wave.get(start..start + frames)?, written, input.level)
+            })??;
+            written = written.max(frames);
+        }
+        dest.copy_from_slice(tile.get(..dest.len())?);
+        start += dest.len();
     }
     Some(())
 }
