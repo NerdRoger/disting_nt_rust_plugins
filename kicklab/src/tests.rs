@@ -636,7 +636,7 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
     CYCLES.with(|cycles| cycles.set(1));
     let mut host = Host::uninitialized(MAX_LAYERS as i32);
     let action = RANDOMIZE_LAYERS;
-    assert_eq!(host.page(0), (0, 6, (0..GLOBALS as u8).collect::<Vec<_>>()));
+    assert_eq!(host.page(0), (0, 7, (0..GLOBALS as u8).collect::<Vec<_>>()));
     let def = unsafe { *(*host.base).parameters.add(action) };
     assert_eq!(unsafe { CStr::from_ptr(def.name) }, c"Randomize Layers");
     assert_eq!(
@@ -1044,6 +1044,72 @@ fn single_layer_master_gain_preserves_peak_normalization() {
                 host.sample(dry, frame) * gain * peak.recip()
             );
         }
+    }
+}
+
+#[test]
+fn master_drive_clips_after_lowpass_and_before_gain() {
+    for cutoff in [CUTOFF_OFF, 44] {
+        let mut host = Host::new(1);
+        let names = [c"Low-pass", c"Master Drive", c"Master Gain"];
+        for (index, name) in (CUTOFF..=GAIN).zip(names) {
+            let definition = unsafe { *(*host.base).parameters.add(index) };
+            assert_eq!(unsafe { CStr::from_ptr(definition.name) }, name);
+        }
+        host.set(CUTOFF, cutoff);
+        host.set(model_index(0) + LAYER_LEVEL, 70);
+        host.step([0.0; 4]);
+        let clean = host.complete();
+        let reference: Vec<_> = (0..8000).map(|frame| host.sample(clean, frame)).collect();
+        host.step([0.0; 4]);
+
+        host.set(MASTER_DRIVE, 180);
+        host.set(GAIN, -60);
+        host.step([0.0; 4]);
+        let driven = host.complete();
+        let boost = distingnt_api::api::math::exp2(18.0 * (core::f32::consts::LOG2_10 / 20.0));
+        let gain = distingnt_api::api::math::exp2(-6.0 * (core::f32::consts::LOG2_10 / 20.0));
+        assert!(reference.iter().any(|sample| (*sample * boost).abs() > 1.0));
+        for (frame, sample) in reference.into_iter().enumerate() {
+            assert_eq!(
+                host.sample(driven, frame),
+                (sample * boost).clamp(-1.0, 1.0) * gain
+            );
+        }
+    }
+}
+
+#[test]
+fn first_drive_step_preserves_the_peak_of_a_hot_mix() {
+    let boost = distingnt_api::api::math::exp2(0.1 * (core::f32::consts::LOG2_10 / 20.0));
+    let gain = distingnt_api::api::math::exp2(-13.0 * (core::f32::consts::LOG2_10 / 20.0));
+    for cutoff in [CUTOFF_OFF, 80] {
+        let mut host = Host::new(4);
+        for layer in 1..4 {
+            host.set(model_index(layer), 1);
+        }
+        host.set(CUTOFF, cutoff);
+        host.set(GAIN, -130);
+        host.step([0.0; 4]);
+        let clean = host.complete();
+        // The Pitch Sweep body is 500 ms, giving a 755 ms render before
+        // the optional short filter tail.
+        let reference: Vec<_> = (0..36_240).map(|frame| host.sample(clean, frame)).collect();
+        let peak = reference
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak > gain && peak < 1.0);
+        host.step([0.0; 4]);
+        host.set(MASTER_DRIVE, 1);
+        host.step([0.0; 4]);
+        let driven = host.complete();
+        let mut peak_after = 0.0_f32;
+        for (frame, sample) in reference.into_iter().enumerate() {
+            let actual = host.sample(driven, frame);
+            peak_after = peak_after.max(actual.abs());
+            assert!((actual - (sample * boost).clamp(-peak, peak)).abs() < 1e-6);
+        }
+        assert_eq!(peak_after, peak);
     }
 }
 

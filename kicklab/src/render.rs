@@ -71,8 +71,9 @@ pub fn render(
     let rate = job.rate;
     let cutoff = (job.cutoff as f32).min(rate as f32 * 0.45);
     let gain = db_gain(job.gain);
+    let drive = (job.drive > 0.0).then(|| db_gain(job.drive));
     let solo_active = job.layers.iter().any(|layer| layer.patch.model != Model::Off && layer.solo);
-    let fuse_mix = cutoff == 0.0
+    let fuse_mix = cutoff == 0.0 && drive.is_none()
         && job.layers.iter()
             .filter(|layer| layer.audible(solo_active))
             .take(2)
@@ -180,7 +181,14 @@ pub fn render(
         length = end;
         #[cfg(feature = "profiling")]
         let start = cpu_cycle_count();
-        peak = lowpass(mix, cutoff / rate as f32, gain);
+        let cycles = cutoff / rate as f32;
+        peak = match drive {
+            Some(boost) => {
+                let ceiling = lowpass(mix, cycles, 1.0);
+                apply_master_drive(mix, boost, ceiling, gain)
+            }
+            None => lowpass(mix, cycles, gain),
+        };
         if end < requested_end {
             // The filter can still ring after the layer release. Fade its
             // output if the remaining filter tail would run past the cap.
@@ -201,7 +209,10 @@ pub fn render(
     // The filter and the single-layer mix already applied gain and tracked
     // the peak while writing. An unfiltered multi-layer mix needs this pass.
     if cutoff == 0.0 && !fuse_mix {
-        if gain == 1.0 {
+        if let Some(boost) = drive {
+            let ceiling = mix.iter().fold(1.0_f32, |peak, sample| peak.max(sample.abs()));
+            peak = apply_master_drive(mix, boost, ceiling, gain);
+        } else if gain == 1.0 {
             for sample in &*mix {
                 peak = peak.max(sample.abs());
             }
@@ -230,6 +241,18 @@ pub fn render(
 #[inline(never)]
 fn store_patch(destination: &mut LayerPatch, source: &LayerPatch) {
     *destination = *source;
+}
+
+fn apply_master_drive(samples: &mut [f32], boost: f32, ceiling: f32, gain: f32) -> f32 {
+    // The ceiling is at least the undriven peak, so engaging Drive at a low
+    // setting only clips the excess introduced by the drive boost.
+    let mut peak = 1.0_f32;
+    for sample in samples {
+        let scaled = (*sample * boost).max(-ceiling).min(ceiling) * gain;
+        *sample = scaled;
+        peak = peak.max(scaled.abs());
+    }
+    peak
 }
 
 fn lowpass(samples: &mut [f32], cycles: f32, gain: f32) -> f32 {

@@ -49,11 +49,12 @@ const MAX_OUTPUT_BUFFERS: usize = 10;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
-const GAIN: usize = 3;
-const CUTOFF: usize = 4;
+const CUTOFF: usize = 3;
+const MASTER_DRIVE: usize = 4;
+const GAIN: usize = 5;
 const CUTOFF_OFF: i16 = 101;
-const RANDOMIZE_LAYERS: usize = 5;
-const GLOBALS: usize = 6;
+const RANDOMIZE_LAYERS: usize = 6;
+const GLOBALS: usize = 7;
 const CONTROLS: usize = 10;
 // Each layer has a fixed-width parameter block in page order.
 const LAYER_RANDOMIZE: usize = 1;
@@ -410,6 +411,7 @@ struct Job {
     layers: [Layer; MAX_LAYERS],
     rate: u32,
     gain: f32,
+    drive: f32,
     cutoff: i16,
     output_buffers: u8,
 }
@@ -418,6 +420,7 @@ impl Job {
         layers: [Layer::OFF; MAX_LAYERS],
         rate: 0,
         gain: 0.0,
+        drive: 0.0,
         cutoff: 0,
         output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
     };
@@ -428,6 +431,7 @@ impl Job {
             Job {
                 rate: 0,
                 gain: 0.0,
+                drive: 0.0,
                 cutoff: 0,
                 output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
             },
@@ -686,7 +690,7 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
         randomize_layer(context, layer);
         return;
     }
-    if !(GAIN as i32..model_index(layers) as i32).contains(&parameter) {
+    if !(CUTOFF as i32..model_index(layers) as i32).contains(&parameter) {
         return;
     }
     #[cfg(feature = "profiling-no-click-rebuild")]
@@ -751,6 +755,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     };
     let parameters = context.read_parameters();
     job.gain = parameters.scaled(GAIN).unwrap_or(0.0);
+    job.drive = parameters.scaled(MASTER_DRIVE).unwrap_or(0.0);
     job.cutoff = cutoff_hz(parameters.value(CUTOFF).unwrap_or(CUTOFF_OFF));
     for (layer, (snapshot, &model)) in job
         .layers
@@ -934,7 +939,7 @@ impl Plugin for KickLab {
     }
 
     fn metadata(specs: &[i32], metadata: &mut Metadata<'_>) -> Option<()> {
-        let routing = [
+        let globals = [
             definition(
                 c"Trigger",
                 0,
@@ -952,7 +957,6 @@ impl Plugin for KickLab {
                 SCALING_NONE,
             ),
             definition(c"Output Mode", 0, 1, 1, UNIT_OUTPUT_MODE, SCALING_NONE),
-            definition(c"Master Gain", -360, 120, 0, UNIT_DB, SCALING_10),
             definition(
                 c"Low-pass",
                 0,
@@ -961,15 +965,15 @@ impl Plugin for KickLab {
                 UNIT_HAS_STRINGS,
                 SCALING_NONE,
             ),
+            definition(c"Master Drive", 0, 240, 0, UNIT_DB, SCALING_10),
+            definition(c"Master Gain", -360, 120, 0, UNIT_DB, SCALING_10),
+            definition(c"Randomize Layers", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE),
         ];
-        for (index, item) in routing.into_iter().enumerate() {
+        for (index, item) in globals.into_iter().enumerate() {
             metadata.set_parameter(index, item)?;
         }
-        metadata.set_parameter(
-            RANDOMIZE_LAYERS,
-            definition(c"Randomize Layers", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE),
-        )?;
-        metadata.add_page(c"KickLab", 0, &[0, 1, 2, 3, 4, RANDOMIZE_LAYERS as u8])?;
+        let indices: [u8; GLOBALS] = core::array::from_fn(|index| index as u8);
+        metadata.add_page(c"KickLab", 0, &indices)?;
         let layers = layer_count(specs)?;
         for (layer, &name) in LAYER_NAMES.iter().enumerate().take(layers) {
             let base = model_index(layer);
