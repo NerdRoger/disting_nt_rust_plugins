@@ -22,6 +22,11 @@ std::thread_local! {
     static AUDIO_WRITES: Cell<usize> = const { Cell::new(0) };
     static REENTER_RANDOMIZE: Cell<Option<usize>> = const { Cell::new(None) };
     static DEFER_MODEL_NOTIFICATION: Cell<bool> = const { Cell::new(false) };
+    static DRAW_LABELS: std::cell::RefCell<Vec<std::string::String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+    static WAVE_SEGMENTS: Cell<usize> = const { Cell::new(0) };
+    static WAVE_ENDS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[no_mangle]
@@ -94,6 +99,52 @@ unsafe extern "C" fn NT_intToString(buffer: *mut c_char, value: i32) -> i32 {
     ptr::copy_nonoverlapping(text.as_ptr(), buffer.cast(), text.len());
     buffer.add(text.len()).write(0);
     text.len() as i32
+}
+
+#[no_mangle]
+unsafe extern "C" fn NT_floatToString(buffer: *mut c_char, value: f32, decimals: i32) -> i32 {
+    let text = std::format!("{value:.precision$}", precision = decimals as usize);
+    ptr::copy_nonoverlapping(text.as_ptr(), buffer.cast(), text.len());
+    buffer.add(text.len()).write(0);
+    text.len() as i32
+}
+
+#[no_mangle]
+unsafe extern "C" fn NT_drawText(_: i32, _: i32, text: *const c_char, _: i32, _: u8, _: u8) {
+    let text = CStr::from_ptr(text).to_str().unwrap();
+    DRAW_LABELS.with_borrow_mut(|labels| {
+        labels.push(text.into());
+    });
+}
+
+#[no_mangle]
+extern "C" fn NT_drawShapeI(kind: u8, x0: i32, y0: i32, x1: i32, y1: i32, colour: i32) {
+    assert!((0..=255).contains(&x0) && (0..=255).contains(&x1));
+    assert!((12..=63).contains(&y0) && (12..=63).contains(&y1));
+    if colour == 1 {
+        assert_eq!(kind, SHAPE_LINE);
+        assert_eq!((x0, x1), (1, 254));
+        assert!(matches!(y0, 12 | 50) && y0 == y1);
+    }
+    if colour == 8 {
+        assert_eq!(kind, if x0 == x1 { SHAPE_POINT } else { SHAPE_LINE });
+        assert_eq!(y0, y1);
+        WAVE_ENDS.with(|count| count.set(count.get() + 1));
+    } else if colour == 15 {
+        let shape = if x0 != x1 {
+            SHAPE_RECTANGLE
+        } else if y0 == y1 {
+            SHAPE_POINT
+        } else {
+            SHAPE_LINE
+        };
+        assert_eq!(kind, shape);
+        assert!((1..=254).contains(&x0));
+        assert!((12..=50).contains(&y0) && (y0..=50).contains(&y1));
+        if y0 != y1 {
+            WAVE_SEGMENTS.with(|count| count.set(count.get() + 1));
+        }
+    }
 }
 
 #[no_mangle]
@@ -994,6 +1045,31 @@ fn single_layer_master_gain_preserves_peak_normalization() {
             );
         }
     }
+}
+
+#[test]
+fn scope_draws_the_published_peak_with_a_fixed_time_axis() {
+    let mut host = Host::new(1);
+    let draw = || {
+        WAVE_SEGMENTS.with(|count| count.set(0));
+        WAVE_ENDS.with(|count| count.set(0));
+        assert!(!unsafe { factory().draw.unwrap()(host.base) });
+        DRAW_LABELS.with_borrow_mut(core::mem::take)
+    };
+    assert_eq!(draw(), ["Peak: -inf dBFS", "1000 ms"]);
+    assert_eq!(WAVE_ENDS.with(Cell::get), 0);
+    let base = host.base;
+    host.set(GAIN, 120);
+    host.step([0.0; 4]);
+    host.complete();
+    host.step([0.0; 4]);
+    assert!(!unsafe { factory().draw.unwrap()(base) });
+    assert_eq!(
+        DRAW_LABELS.with_borrow_mut(core::mem::take),
+        ["Peak: 0.0 dBFS", "1000 ms"]
+    );
+    assert!(WAVE_SEGMENTS.with(Cell::get) > 0);
+    assert!(WAVE_ENDS.with(Cell::get) > 0);
 }
 
 #[cfg(feature = "profiling")]

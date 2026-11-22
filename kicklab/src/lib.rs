@@ -7,6 +7,7 @@ mod playback;
 #[cfg(feature = "profiling")]
 mod profile;
 mod render;
+mod scope;
 #[cfg(not(feature = "profiling"))]
 mod profile {
     #[derive(Clone, Copy)]
@@ -27,8 +28,9 @@ use distingnt_api::{
     api::{
         audio::bus_index,
         background::DramBuffers,
+        drawing::Canvas,
         metadata::{Definition, EnumStrings},
-        parameters::{scaled_value, Audio, ReadOnly},
+        parameters::{scaled_value, Audio, ReadOnly, Ui},
         plugin::{
             Configuration, Context, Metadata, Plugin, RegionInitializer, SharedResources,
             SharedStaticDram, Specification, StaticDramView, StaticMemory, StaticRequirements,
@@ -38,6 +40,7 @@ use distingnt_api::{
     *,
 };
 use playback::Player;
+use scope::Scope;
 
 const MAX_LAYERS: usize = 8;
 const MIN_OUTPUT_BUFFERS: usize = 2;
@@ -442,6 +445,7 @@ struct RenderWork {
     cached_layers: [render::CachedLayer; MAX_LAYERS],
     length: Option<usize>,
     timing: profile::RenderTiming,
+    scope: Scope,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,6 +467,7 @@ struct State {
     random_seed: u32,
     in_flight: Option<usize>,
     player: Player,
+    scope: Scope,
     #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
     meter: profile::Meter,
 }
@@ -699,13 +704,10 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
 
 fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     if let Some(slot) = context.state().in_flight {
-        if let Ok((length, _timing)) =
-            context.with_shared_resources(|work| (work.length, work.timing))
-        {
-            let state = context.state_mut();
+        let _ = context.with_shared_state(|state, work| {
             #[cfg(feature = "profiling")]
-            state.meter.record_render(_timing);
-            if let Some(length) = length {
+            state.meter.record_render(work.timing);
+            if let Some(length) = work.length {
                 #[cfg(feature = "profiling-hold-playback")]
                 let publish = !state.player.has_waveform();
                 #[cfg(not(feature = "profiling-hold-playback"))]
@@ -714,6 +716,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
                     #[cfg(feature = "profiling")]
                     let start = cpu_cycle_count();
                     state.player.publish(slot, length);
+                    state.scope = work.scope;
                     #[cfg(feature = "profiling")]
                     state
                         .meter
@@ -723,7 +726,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
                 state.dirty = true;
             }
             state.in_flight = None;
-        }
+        });
     }
     if context.state().parameter_setup != ParameterSetup::Ready || !context.state().dirty {
         return;
@@ -816,6 +819,7 @@ impl Plugin for KickLab {
     const PARAMETER_TEXT: bool = true;
     const AUDIO_WORKER_STACK_SIZE: u32 = 2048;
     const INITIALIZATION_IN_DRAM: bool = true;
+    const DRAWING_IN_DRAM: bool = true;
     const STATIC_INITIALIZATION: bool = true;
     const SHARED_STATIC_DRAM: Option<&'static SharedStaticDram<Self>> = Some(&TABLE_DRAM);
     const SPECIFICATIONS: &'static [Specification] = &[
@@ -897,7 +901,8 @@ impl Plugin for KickLab {
                 models: |_| Model::Off
             },
             regions {
-                player: |player| Player::initialize(player, rate)
+                player: |player| Player::initialize(player, rate),
+                scope: Scope::initialize
             }
         );
         Some(())
@@ -921,7 +926,8 @@ impl Plugin for KickLab {
                 cached_layers: |_| render::CachedLayer::EMPTY
             },
             regions {
-                job: Job::initialize
+                job: Job::initialize,
+                scope: Scope::initialize
             }
         );
         Some(())
@@ -1092,6 +1098,9 @@ impl Plugin for KickLab {
                     tables,
                     &mut timing,
                 );
+                if let Some(waveform) = length.and_then(|length| samples.get(..length)) {
+                    work.scope.capture(waveform, work.job.rate);
+                }
                 #[cfg(feature = "profiling")]
                 {
                     timing.total = Some(cpu_cycle_count().wrapping_sub(start));
@@ -1100,6 +1109,11 @@ impl Plugin for KickLab {
             })
             .flatten();
         work.timing = timing;
+    }
+
+    fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {
+        context.state().scope.draw(canvas);
+        false
     }
 
     fn step(context: &mut Callback<'_, Audio>, buses: &mut [f32], frames: usize) {
