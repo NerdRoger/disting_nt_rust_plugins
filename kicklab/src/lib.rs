@@ -211,157 +211,153 @@ const fn percent(name: &'static CStr, initial: i16) -> Control {
 
 const PITCH_CLICK_MAX_DECAY_TENTHS_MS: i16 = 450;
 const PITCH_SWEEP: [Control; 9] = [
-    tune(c"Tail Tune", 500),
-    decay(460),
-    drive(20),
-    depth(24),
-    time(24),
-    Control::new(c"Sweep Curve", -100, 100, 0, UNIT_PERCENT, SCALING_NONE),
-    percent(c"Click Level", 24),
-    Control::new(c"Click Tone", 1100, 10_000, 5500, UNIT_HZ, SCALING_NONE),
+    tune(c"Tail Tune", 900),
+    decay(500),
+    drive(164),
+    depth(10),
+    time(50),
+    Control::new(c"Sweep Curve", -100, 100, 15, UNIT_PERCENT, SCALING_NONE),
+    percent(c"Click Level", 20),
+    Control::new(c"Click Tone", 1100, 10_000, 3000, UNIT_HZ, SCALING_NONE),
     Control::new(
         c"Click Decay",
         10,
         PITCH_CLICK_MAX_DECAY_TENTHS_MS,
-        60,
+        160,
         UNIT_MS,
         SCALING_10,
     ),
 ];
-const FIRST_LAYER_PITCH_SWEEP: [i16; PITCH_SWEEP.len()] = [
-    900,  // Tail Tune
-    500,  // Body Decay
-    164,  // Drive
-    10,   // Sweep Depth
-    50,   // Sweep Time
-    15,   // Sweep Curve
-    20,   // Click Level
-    3000, // Click Tone
-    160,  // Click Decay
-];
 const MODAL_DRUM: [Control; 8] = [
-    tune(c"Tail Tune", 570),
-    decay(350),
-    drive(10),
-    percent(c"Upper Modes", 62),
-    percent(c"Damping", 44),
-    percent(c"Strike Position", 50),
-    percent(c"Beater Level", 60),
-    percent(c"Beater Hardness", 45),
+    tune(c"Tail Tune", 1100),
+    decay(400),
+    drive(150),
+    percent(c"Upper Modes", 60),
+    percent(c"Damping", 20),
+    percent(c"Strike Position", 25),
+    percent(c"Beater Level", 50),
+    percent(c"Beater Hardness", 25),
 ];
 const BIT_LOGIC: [Control; 10] = [
-    tune(c"Base Tune", 480),
-    decay(370),
-    drive(30),
-    depth(25),
-    time(32),
-    Control::new(c"Ramp Ratio", 100, 600, 205, UNIT_NONE, SCALING_100),
-    Control::new(c"Sample Clock", 500, 15_000, 3560, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Ramp Bits", 3, 12, 5, UNIT_NONE, SCALING_NONE),
-    Control::new(c"Logic Operation", 0, 3, 0, UNIT_ENUM, SCALING_NONE),
-    Control::new(c"Tone Cutoff", 160, 8500, 1600, UNIT_HZ, SCALING_NONE),
+    tune(c"Base Tune", 950),
+    decay(750),
+    drive(120),
+    depth(19),
+    time(100),
+    Control::new(c"Ramp Ratio", 100, 600, 160, UNIT_NONE, SCALING_100),
+    Control::new(c"Sample Clock", 500, 15_000, 1000, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Ramp Bits", 3, 12, 6, UNIT_NONE, SCALING_NONE),
+    Control::new(c"Logic Operation", 0, 3, 1, UNIT_ENUM, SCALING_NONE),
+    Control::new(c"Tone Cutoff", 160, 8500, 3300, UNIT_HZ, SCALING_NONE),
 ];
 const GRAIN_SIZE_MAX_MS: i16 = 100;
 const GRAIN_CLOUD: [Control; 10] = [
-    tune(c"Tail Tune", 550),
-    decay(470),
-    depth(20),
-    time(70),
+    tune(c"Tail Tune", 1100),
+    decay(790),
+    depth(18),
+    time(123),
     Control::new(
         c"Grain Size",
         5,
         GRAIN_SIZE_MAX_MS,
-        29,
+        5,
         UNIT_MS,
         SCALING_NONE,
     ),
-    Control::new(c"Grain Rate", 18, 220, 107, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Density Envelope", -30, 30, 0, UNIT_NONE, SCALING_10),
-    Control::new(c"Pitch Spread", 0, 240, 48, UNIT_SEMITONES, SCALING_10),
-    percent(c"Timing Jitter", 35),
-    drive(40),
+    Control::new(c"Grain Rate", 18, 220, 170, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Density Envelope", -30, 30, 13, UNIT_NONE, SCALING_10),
+    Control::new(c"Pitch Spread", 0, 240, 60, UNIT_SEMITONES, SCALING_10),
+    percent(c"Timing Jitter", 83),
+    drive(100),
 ];
 const HARD_SYNC: [Control; 8] = [
-    tune(c"Tail Tune", 510),
-    decay(410),
-    depth(21),
-    time(34),
-    Control::new(c"Sync Bend", 0, 120, 55, UNIT_NONE, SCALING_10),
-    Control::new(c"Sync Decay", 5, 500, 110, UNIT_MS, SCALING_NONE),
-    Control::new(c"Tail Ratio", 100, 600, 100, UNIT_NONE, SCALING_100),
-    drive(50),
+    tune(c"Tail Tune", 950),
+    decay(725),
+    depth(36),
+    time(160),
+    Control::new(c"Sync Bend", 0, 120, 17, UNIT_NONE, SCALING_10),
+    Control::new(c"Sync Decay", 5, 500, 100, UNIT_MS, SCALING_NONE),
+    Control::new(c"Tail Ratio", 100, 600, 220, UNIT_NONE, SCALING_100),
+    drive(150),
 ];
 const RESONATOR: [Control; 9] = [
-    tune(c"Tail Tune", 530),
-    decay(820),
-    depth(13),
-    time(12),
-    Control::new(c"Tail Pitch Drift", 0, 60, 15, UNIT_SEMITONES, SCALING_10),
-    percent(c"Excitation", 65),
-    Control::new(c"Exciter Width", 20, 300, 50, UNIT_MS, SCALING_100),
-    Control::new(c"Tone Cutoff", 180, 8000, 2000, UNIT_HZ, SCALING_NONE),
-    drive(10),
+    tune(c"Tail Tune", 375),
+    decay(1000),
+    depth(24),
+    time(40),
+    Control::new(c"Tail Pitch Drift", 0, 60, 35, UNIT_SEMITONES, SCALING_10),
+    percent(c"Excitation", 50),
+    Control::new(c"Exciter Width", 20, 300, 200, UNIT_MS, SCALING_100),
+    Control::new(c"Tone Cutoff", 180, 8000, 5500, UNIT_HZ, SCALING_NONE),
+    drive(150),
 ];
 const TWO_OPERATOR_FM: [Control; 9] = [
-    tune(c"Tail Tune", 490),
-    decay(420),
-    depth(24),
-    time(22),
-    Control::new(c"FM Amount", 0, 900, 320, UNIT_NONE, SCALING_100),
-    Control::new(c"Modulator Ratio", 50, 1600, 345, UNIT_NONE, SCALING_100),
-    Control::new(c"FM Decay", 2, 400, 78, UNIT_MS, SCALING_NONE),
-    Control::new(c"Modulator Sweep", -24, 36, 0, UNIT_SEMITONES, SCALING_NONE),
-    drive(30),
+    tune(c"Tail Tune", 870),
+    decay(926),
+    depth(42),
+    time(32),
+    Control::new(c"FM Amount", 0, 900, 162, UNIT_NONE, SCALING_100),
+    Control::new(c"Modulator Ratio", 50, 1600, 1008, UNIT_NONE, SCALING_100),
+    Control::new(c"FM Decay", 2, 400, 307, UNIT_MS, SCALING_NONE),
+    Control::new(
+        c"Modulator Sweep",
+        -24,
+        36,
+        -23,
+        UNIT_SEMITONES,
+        SCALING_NONE,
+    ),
+    drive(65),
 ];
 const NOISE_SWEEP: [Control; 8] = [
-    tune(c"Tail Center", 580),
-    decay(260),
-    depth(41),
-    time(27),
-    Control::new(c"Filter Q", 5, 120, 41, UNIT_NONE, SCALING_10),
-    Control::new(c"Q Sweep", -30, 30, 0, UNIT_NONE, SCALING_10),
-    percent(c"Grain", 12),
-    drive(40),
+    tune(c"Tail Center", 941),
+    decay(483),
+    depth(46),
+    time(125),
+    Control::new(c"Filter Q", 5, 120, 87, UNIT_NONE, SCALING_10),
+    Control::new(c"Q Sweep", -30, 30, -25, UNIT_NONE, SCALING_10),
+    percent(c"Grain", 79),
+    drive(150),
 ];
 const RING_MOD: [Control; 9] = [
-    tune(c"Tail Tune", 520),
-    decay(420),
-    depth(17),
-    time(32),
-    Control::new(c"Lower Osc Ratio", 50, 900, 350, UNIT_NONE, SCALING_100),
-    percent(c"Clang Level", 65),
-    Control::new(c"Clang Decay", 2, 600, 102, UNIT_MS, SCALING_NONE),
-    Control::new(c"Clang Pitch Env", -24, 24, 0, UNIT_SEMITONES, SCALING_NONE),
-    drive(30),
+    tune(c"Tail Tune", 500),
+    decay(750),
+    depth(10),
+    time(93),
+    Control::new(c"Lower Osc Ratio", 50, 900, 485, UNIT_NONE, SCALING_100),
+    percent(c"Clang Level", 90),
+    Control::new(c"Clang Decay", 2, 600, 425, UNIT_MS, SCALING_NONE),
+    Control::new(c"Clang Pitch Env", -24, 24, 3, UNIT_SEMITONES, SCALING_NONE),
+    drive(180),
 ];
 const WAVEFOLD: [Control; 9] = [
-    tune(c"Tail Tune", 490),
-    decay(430),
-    depth(16),
-    time(28),
-    Control::new(c"Fold Amount", 0, 100, 42, UNIT_NONE, SCALING_10),
-    Control::new(c"Fold Decay", 2, 650, 158, UNIT_MS, SCALING_NONE),
-    Control::new(c"Fold Bias", -80, 80, 26, UNIT_PERCENT, SCALING_NONE),
-    percent(c"Clean Sub Blend", 0),
-    drive(10),
+    tune(c"Tail Tune", 960),
+    decay(730),
+    depth(24),
+    time(135),
+    Control::new(c"Fold Amount", 0, 100, 80, UNIT_NONE, SCALING_10),
+    Control::new(c"Fold Decay", 2, 650, 493, UNIT_MS, SCALING_NONE),
+    Control::new(c"Fold Bias", -80, 80, 78, UNIT_PERCENT, SCALING_NONE),
+    percent(c"Clean Sub Blend", 15),
+    drive(105),
 ];
 const DELAY_DRUM: [Control; 7] = [
-    tune(c"Tail Tune", 640),
-    decay(520),
-    Control::new(c"Loop Cutoff", 250, 8500, 1700, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Strike Mix", 0, 200, 100, UNIT_PERCENT, SCALING_NONE),
-    Control::new(c"Strike Width", 5, 200, 57, UNIT_MS, SCALING_10),
-    Control::new(c"Strike Tone", 200, 8500, 2600, UNIT_HZ, SCALING_NONE),
-    drive(50),
+    tune(c"Tail Tune", 700),
+    decay(970),
+    Control::new(c"Loop Cutoff", 250, 8500, 5200, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Strike Mix", 0, 200, 53, UNIT_PERCENT, SCALING_NONE),
+    Control::new(c"Strike Width", 5, 200, 91, UNIT_MS, SCALING_10),
+    Control::new(c"Strike Tone", 200, 8500, 3000, UNIT_HZ, SCALING_NONE),
+    drive(125),
 ];
 const SPECTRAL_PULSE: [Control; 7] = [
-    tune(c"Tail Tune", 540),
-    Control::new(c"Body Decay", 70, 850, 345, UNIT_MS, SCALING_NONE),
-    percent(c"Snap Level", 75),
-    Control::new(c"Snap Center", 180, 3800, 720, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Snap Bandwidth", 5, 100, 38, UNIT_PERCENT, SCALING_NONE),
-    Control::new(c"Dispersion", 0, 200, 12, UNIT_MS, SCALING_10),
-    drive(20),
+    tune(c"Tail Tune", 1040),
+    Control::new(c"Body Decay", 70, 850, 735, UNIT_MS, SCALING_NONE),
+    percent(c"Snap Level", 100),
+    Control::new(c"Snap Center", 180, 3800, 1549, UNIT_HZ, SCALING_NONE),
+    Control::new(c"Snap Bandwidth", 5, 100, 50, UNIT_PERCENT, SCALING_NONE),
+    Control::new(c"Dispersion", 0, 200, 191, UNIT_MS, SCALING_10),
+    drive(120),
 ];
 const UNUSED: Definition = definition(c"Unused", 0, 0, 0, UNIT_NONE, SCALING_NONE);
 const LEVEL: Control = percent(c"Level", 100);
@@ -986,13 +982,9 @@ impl Plugin for KickLab {
                     Definition::new(name, 0, 1, 0, UNIT_ENUM, SCALING_NONE, Some(OFF_ON.table()))?;
                 metadata.set_parameter(base + offset, toggle)?;
             }
-            let defaults = if layer == 0 {
-                FIRST_LAYER_PITCH_SWEEP.as_slice()
-            } else {
-                &[]
-            };
+            let controls = Model::from_value(default_model).controls();
             for slot in 0..CONTROLS {
-                let initial = defaults.get(slot).copied().unwrap_or(0);
+                let initial = controls.get(slot).map_or(0, |control| control.initial);
                 // Start with bounds that admit the stored raw values of any model.
                 metadata.set_parameter(
                     base + LAYER_FIRST_CONTROL + slot,

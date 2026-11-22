@@ -350,20 +350,24 @@ fn a_new_instance_starts_with_the_captured_pitch_sweep_patch_on_layer_one() {
     let mut host = Host::new(2);
     let first = model_index(0);
     let second = model_index(1);
-    let controls = first + LAYER_FIRST_CONTROL;
-    assert_eq!(&host.values[first..controls], &[1, 0, 100, 0, 0]);
+    let defaults = [900, 500, 164, 10, 50, 15, 20, 3000, 160];
     assert_eq!(
-        &host.values[controls..controls + PITCH_SWEEP.len()],
-        &[900, 500, 164, 10, 50, 15, 20, 3000, 160]
+        &host.values[first..first + LAYER_FIRST_CONTROL],
+        &[1, 0, 100, 0, 0]
+    );
+    let first_controls = first + LAYER_FIRST_CONTROL;
+    assert_eq!(
+        &host.values[first_controls..first_controls + defaults.len()],
+        &defaults
     );
     assert_eq!(host.values[second], 0);
 
-    host.set(second, 1);
-    for (slot, control) in PITCH_SWEEP.iter().enumerate() {
-        assert_eq!(
-            host.values[second + LAYER_FIRST_CONTROL + slot],
-            control.initial
-        );
+    host.set(first_controls, 450);
+    host.set(first, 2);
+    for base in [first, second] {
+        host.set(base, 1);
+        let controls = base + LAYER_FIRST_CONTROL;
+        assert_eq!(&host.values[controls..controls + defaults.len()], &defaults);
     }
 }
 
@@ -409,8 +413,11 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
         &host.values[first + LAYER_SOLO..=first + LAYER_MUTE],
         &[1, 1]
     );
-    assert_eq!(host.values[first + LAYER_FIRST_CONTROL], 570);
-    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 5], 50);
+    let controls = first + LAYER_FIRST_CONTROL;
+    assert_eq!(
+        &host.values[controls..controls + MODAL_DRUM.len()],
+        &[1100, 400, 150, 60, 20, 25, 50, 25]
+    );
     assert_eq!(host.page(1).1, 13);
     assert_eq!(
         &host.page(1).2[..5],
@@ -425,7 +432,10 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
     host.set(first, 0);
     assert_eq!(host.page(1), (1, 1, vec![first as u8]));
     host.set(first, 3);
-    assert_eq!(host.values[first + LAYER_FIRST_CONTROL + 5], 205);
+    assert_eq!(
+        &host.values[controls..controls + BIT_LOGIC.len()],
+        &[950, 750, 120, 19, 100, 160, 1000, 6, 1, 3300]
+    );
     assert_eq!(host.page(1).1, 15);
 }
 
@@ -787,9 +797,10 @@ fn grain_cloud_fits_the_existing_layer_page_and_restores_its_values() {
     host.set(model, 0);
     assert_eq!(host.page(layer + 1), (1, 1, vec![model as u8]));
     host.set(model, 4);
-    for (offset, control) in GRAIN_CLOUD.iter().enumerate() {
-        assert_eq!(host.values[first_control + offset], control.initial);
-    }
+    assert_eq!(
+        &host.values[first_control..first_control + GRAIN_CLOUD.len()],
+        &[1100, 790, 18, 123, 5, 170, 13, 60, 83, 100]
+    );
 }
 
 #[test]
@@ -801,6 +812,7 @@ fn hard_sync_switches_to_eight_controls_without_moving_mix_or_randomize() {
     host.set(model + LAYER_LEVEL, 78);
     host.set(solo, 1);
     host.set(model, 5);
+    let first_control = model + LAYER_FIRST_CONTROL;
 
     let mut name = [0; PARAMETER_STRING_SIZE];
     unsafe {
@@ -818,18 +830,14 @@ fn hard_sync_switches_to_eight_controls_without_moving_mix_or_randomize() {
         )
     );
     for (offset, control) in HARD_SYNC.iter().enumerate() {
-        let definition = unsafe {
-            *(*host.base)
-                .parameters
-                .add(model + LAYER_FIRST_CONTROL + offset)
-        };
+        let definition = unsafe { *(*host.base).parameters.add(first_control + offset) };
         assert_eq!(unsafe { CStr::from_ptr(definition.name) }, control.name);
         assert_eq!([definition.min, definition.max], control.range);
-        assert_eq!(
-            host.values[model + LAYER_FIRST_CONTROL + offset],
-            control.initial
-        );
     }
+    assert_eq!(
+        &host.values[first_control..first_control + HARD_SYNC.len()],
+        &[950, 725, 36, 160, 17, 100, 220, 150]
+    );
     host.step([0.0; 4]);
     let rendered = host.complete();
     assert!(host.sample(rendered, 761).abs() > 0.001);
