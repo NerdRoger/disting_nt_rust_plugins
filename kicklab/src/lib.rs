@@ -39,7 +39,7 @@ use distingnt_api::{
 };
 use playback::Player;
 
-const MAX_LAYERS: usize = 4;
+const MAX_LAYERS: usize = 8;
 const MIN_OUTPUT_BUFFERS: usize = 2;
 const DEFAULT_OUTPUT_BUFFERS: usize = 6;
 const MAX_OUTPUT_BUFFERS: usize = 10;
@@ -59,8 +59,12 @@ const LAYER_SOLO: usize = 3;
 const LAYER_MUTE: usize = 4;
 const LAYER_FIRST_CONTROL: usize = 5;
 const LAYER_FIELDS: usize = LAYER_FIRST_CONTROL + CONTROLS;
-const LAYER_NAMES: [&CStr; MAX_LAYERS] = [c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4"];
-const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [b"L1: ", b"L2: ", b"L3: ", b"L4: "];
+const LAYER_NAMES: [&CStr; MAX_LAYERS] = [
+    c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4", c"Layer 5", c"Layer 6", c"Layer 7", c"Layer 8",
+];
+const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [
+    b"L1: ", b"L2: ", b"L3: ", b"L4: ", b"L5: ", b"L6: ", b"L7: ", b"L8: ",
+];
 const MODEL_NAMES: [&CStr; 13] = [
     c"Off",
     c"Pitch Sweep",
@@ -454,7 +458,7 @@ struct State {
     rate: u32,
     parameter_setup: ParameterSetup,
     dirty: bool,
-    randomizing: u8,
+    randomizing: u16, // One bit per layer, followed by the global action.
     output_buffers: u8,
     random_seed: u32,
     in_flight: Option<usize>,
@@ -819,7 +823,7 @@ impl Plugin for KickLab {
             name: c"Max Layers",
             min: 1,
             max: MAX_LAYERS as i32,
-            default: 2,
+            default: 1,
             kind: TYPE_GENERIC,
         },
         Specification {

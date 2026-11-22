@@ -337,7 +337,8 @@ class Device:
             raise ValueError("Selected algorithm is not KickLab")
         count = decode16(self.request(0x42, self.algorithm))
         values = self.request(0x44, self.algorithm)
-        valid_counts = (18, 22, 30, 37, 42, 52, 54, 55, 56, 57, 58, 60, 62, 64, 66, 67)
+        valid_counts = (18, 22, 30, 37, 42, 52, 54, 55, 56, 57, 58, 60, 62, 64, 66, 67,
+                        82, 97, 112, 127)
         if count not in valid_counts or len(values) != count * 3:
             raise ValueError("Unexpected KickLab parameter layout")
         params = {}

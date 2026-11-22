@@ -288,6 +288,7 @@ impl Drop for Host {
 
 #[test]
 fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages() {
+    let last_layer = MAX_LAYERS - 1;
     assert_eq!(
         KickLab::SPECIFICATIONS[1].default,
         DEFAULT_OUTPUT_BUFFERS as i32
@@ -301,10 +302,10 @@ fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages()
         DEFAULT_OUTPUT_BUFFERS,
         MAX_OUTPUT_BUFFERS,
     ] {
-        let mut host = Host::with_specs([4, count as i32]);
+        let mut host = Host::with_specs([MAX_LAYERS as i32, count as i32]);
         host.notify(TRIGGER);
-        host.set(model_index(3), 1);
-        let pages: Vec<_> = (0..=4).map(|page| host.page(page)).collect();
+        host.set(model_index(last_layer), 1);
+        let pages: Vec<_> = (0..=MAX_LAYERS).map(|page| host.page(page)).collect();
         if let Some(reference) = &reference_pages {
             assert_eq!(&pages, reference);
         } else {
@@ -312,7 +313,7 @@ fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages()
         }
         host.step([0.0; 4]);
         assert_eq!(host.complete(), 0);
-        let cache = host.layer_slot(3);
+        let cache = host.layer_slot(last_layer);
         assert!((1..128).any(|frame| host.sample(cache, frame).abs() > 0.001));
     }
 }
@@ -441,6 +442,10 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
 
 #[test]
 fn common_controls_have_stable_ordinals_at_every_layer_count() {
+    let spec = &KickLab::SPECIFICATIONS[0];
+    assert_eq!((spec.min, spec.max, spec.default), (1, 8, 1));
+    assert!(KickLab::configuration(&[0, DEFAULT_OUTPUT_BUFFERS as i32]).is_none());
+    assert!(KickLab::configuration(&[9, DEFAULT_OUTPUT_BUFFERS as i32]).is_none());
     for count in 1..=MAX_LAYERS {
         let mut host = Host::new(count as i32);
         host.step([0.0; 4]);
@@ -505,13 +510,13 @@ fn common_controls_have_stable_ordinals_at_every_layer_count() {
 
 #[test]
 fn confirmed_randomize_runs_once_and_rearms_after_reset() {
-    let mut host = Host::uninitialized(2);
-    let base = model_index(1);
+    let mut host = Host::uninitialized(MAX_LAYERS as i32);
+    let base = model_index(MAX_LAYERS - 1);
     let action = base + LAYER_RANDOMIZE;
     host.values[base] = 3;
     host.values[base + LAYER_LEVEL] = 37;
-    host.values[model_index(1) + LAYER_SOLO] = 1;
-    host.values[model_index(1) + LAYER_MUTE] = 1;
+    host.values[base + LAYER_SOLO] = 1;
+    host.values[base + LAYER_MUTE] = 1;
     host.values[action] = 1;
     let original = host.values.clone();
     host.notify(action);
@@ -578,7 +583,7 @@ fn confirmed_randomize_runs_once_and_rearms_after_reset() {
 #[test]
 fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
     CYCLES.with(|cycles| cycles.set(1));
-    let mut host = Host::uninitialized(4);
+    let mut host = Host::uninitialized(MAX_LAYERS as i32);
     let action = RANDOMIZE_LAYERS;
     assert_eq!(host.page(0), (0, 6, (0..GLOBALS as u8).collect::<Vec<_>>()));
     let def = unsafe { *(*host.base).parameters.add(action) };
@@ -604,11 +609,8 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
     host.values[model_index(2) + LAYER_RANDOMIZE] = 1;
     let original = host.values.clone();
     let mut expected_seed = 1;
-    for (defer, expected) in [
-        (false, [(0, 1), (8, 7), (9, 1), (11, 1)]),
-        (true, [(0, 67), (4, 22), (10, 55), (6, 8)]),
-    ] {
-        for layer in 0..4 {
+    for defer in [false, true] {
+        for layer in 0..MAX_LAYERS {
             let base = model_index(layer);
             host.values[base + LAYER_SOLO] = 1;
             host.values[base + LAYER_MUTE] = 1;
@@ -623,12 +625,12 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
         assert_eq!(AUDIO_WRITES.with(Cell::get), writes);
         assert_eq!(host.values[..action], original[..action]);
 
-        for (layer, (model, level)) in expected.into_iter().enumerate() {
+        for layer in 0..MAX_LAYERS {
             let base = model_index(layer);
+            let model = random_value(&mut expected_seed, 0, 12);
+            let level = random_value(&mut expected_seed, 0, 100);
             assert_eq!(host.values[base], model);
             assert_eq!(host.values[base + LAYER_LEVEL], level);
-            assert_eq!(random_value(&mut expected_seed, 0, 12), model);
-            assert_eq!(random_value(&mut expected_seed, 0, 100), level);
             assert_eq!(host.values[base + LAYER_SOLO], 0);
             assert_eq!(host.values[base + LAYER_MUTE], 0);
             assert_eq!(
