@@ -677,6 +677,7 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
     host.values[model_index(2) + LAYER_RANDOMIZE] = 1;
     let original = host.values.clone();
     let mut expected_seed = 1;
+    let mut saw_off_before_active = false;
     for defer in [false, true] {
         for layer in 0..MAX_LAYERS {
             let base = model_index(layer);
@@ -693,10 +694,28 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
         assert_eq!(AUDIO_WRITES.with(Cell::get), writes);
         assert_eq!(host.values[..action], original[..action]);
 
-        for layer in 0..MAX_LAYERS {
+        let rolls: Vec<_> = (0..MAX_LAYERS)
+            .map(|_| {
+                let model = random_value(&mut expected_seed, 0, 12);
+                let level = random_value(&mut expected_seed, 0, 100);
+                let values = Model::from_value(model)
+                    .controls()
+                    .iter()
+                    .map(|control| {
+                        random_value(&mut expected_seed, control.range[0], control.range[1])
+                    })
+                    .collect::<Vec<_>>();
+                (model, level, values)
+            })
+            .collect();
+        saw_off_before_active |= rolls
+            .windows(2)
+            .any(|pair| pair[0].0 == 0 && pair[1].0 != 0);
+        let active = rolls.iter().filter(|roll| roll.0 != 0);
+        let off = rolls.iter().rev().filter(|roll| roll.0 == 0);
+        for (layer, (model, level, values)) in active.chain(off).enumerate() {
             let base = model_index(layer);
-            let model = random_value(&mut expected_seed, 0, 12);
-            let level = random_value(&mut expected_seed, 0, 100);
+            let (model, level) = (*model, *level);
             assert_eq!(host.values[base], model);
             assert_eq!(host.values[base + LAYER_LEVEL], level);
             assert_eq!(host.values[base + LAYER_SOLO], 0);
@@ -715,12 +734,11 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
                 host.page(layer + 1).2,
                 (base as u8..(base + visible) as u8).collect::<Vec<_>>()
             );
-            for (offset, control) in controls.iter().enumerate() {
+            for (offset, (control, &value)) in controls.iter().zip(values).enumerate() {
                 let i = base + LAYER_FIRST_CONTROL + offset;
                 let def = unsafe { *(*host.base).parameters.add(i) };
                 assert_eq!(unsafe { CStr::from_ptr(def.name) }, control.name);
-                let [min, max] = control.range;
-                assert_eq!(host.values[i], random_value(&mut expected_seed, min, max));
+                assert_eq!(host.values[i], value);
             }
         }
         host.step([0.0; 4]);
@@ -728,6 +746,7 @@ fn confirmed_global_randomize_selects_models_and_clears_layer_switches() {
         host.step([0.0; 4]);
         assert!(WORK.with(Cell::get).is_none());
     }
+    assert!(saw_off_before_active);
 }
 
 #[test]

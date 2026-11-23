@@ -705,13 +705,24 @@ fn randomize_layers(context: &mut Callback<'_, Audio>) {
         return;
     }
     context.state_mut().randomizing |= request;
-    for layer in 0..context.state().layers {
-        let base = model_index(layer);
+    let layers = context.state().layers;
+    let mut next_active = 0;
+    let mut off_start = layers;
+    for _ in 0..layers {
         let model_value = random_value(
             &mut context.state_mut().random_seed,
             0,
             (MODEL_NAMES.len() - 1) as i16,
         );
+        let layer = if model_value == 0 {
+            off_start -= 1;
+            off_start
+        } else {
+            let layer = next_active;
+            next_active += 1;
+            layer
+        };
+        let base = model_index(layer);
         if context.read_parameters().value(base) != Some(model_value) {
             context.parameters().set(base, model_value);
             // Refresh definitions even when the host defers its notification.
