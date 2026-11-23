@@ -79,6 +79,7 @@ const BUILD: u32 = build_id(&[
     include_bytes!("profile.rs"),
     include_bytes!("playback.rs"),
     include_bytes!("render.rs"),
+    include_bytes!("render_plan.rs"),
     include_bytes!("scope.rs"),
     include_bytes!("extra_models.rs"),
     include_bytes!("spectral.rs"),

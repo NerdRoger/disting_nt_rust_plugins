@@ -5,6 +5,7 @@ mod extra_models;
 mod spectral;
 
 use core::f32::consts::{LOG2_E, PI, TAU};
+use distingnt_api::api::cpu_cycle_count;
 use distingnt_api::api::math::exp2;
 
 use crate::lookup::{self, Lookup};
@@ -13,8 +14,6 @@ use crate::{
     layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
     MIN_TILED_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
-#[cfg(feature = "profiling")]
-use distingnt_api::api::cpu_cycle_count;
 
 const RELEASE_FADE_MS: usize = 5;
 
@@ -42,6 +41,7 @@ pub fn layer_cache_frames(rate: u32) -> usize {
 pub struct CachedLayer {
     patch: LayerPatch,
     transient_shape: TransientShape,
+    prepared_grains: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,7 +56,31 @@ impl CachedLayer {
     pub const EMPTY: Self = Self {
         patch: LayerPatch::OFF,
         transient_shape: TransientShape::Empty,
+        prepared_grains: false,
     };
+
+    fn cached_grain_frames(&self, size_ms: f32) -> Option<usize> {
+        match self.transient_shape {
+            TransientShape::GrainCloud {
+                size_ms: saved,
+                raw_frames,
+            } if saved == size_ms => Some(raw_frames),
+            _ => None,
+        }
+    }
+
+    fn can_reuse_grains(&self, patch: &LayerPatch, frames: usize) -> bool {
+        self.patch.model == Model::GrainCloud
+            && self.patch.controls[0] == patch.controls[0]
+            && self.patch.controls[2..9] == patch.controls[2..9]
+            && self
+                .cached_grain_frames(patch.controls[4])
+                .is_some_and(|raw| raw >= frames)
+    }
+
+    pub fn discard_prepared_grains(&mut self) {
+        self.prepared_grains = false;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -66,261 +90,102 @@ struct MixInput {
     level: f32,
 }
 
+#[path = "render_plan.rs"]
+mod render_plan;
+pub(super) use render_plan::SLICE_CYCLES;
+pub use render_plan::{RenderPlan, RenderStatus};
+
 distingnt_api::nt_dram_section! {
-pub fn render(
-    job: &Job,
-    cached_layers: &mut [CachedLayer; MAX_LAYERS],
+fn render_cached_layer(
+    patch: &LayerPatch,
+    rate: u32,
+    _index: usize,
+    input: MixInput,
+    cached: &mut CachedLayer,
     buffers: &WaveBuffers,
-    samples: &mut [f32],
     tables: Option<Lookup<'_>>,
     _timing: &mut RenderTiming,
-    scope: &mut crate::Scope,
-    tile: &mut [f32],
-) -> Option<usize> {
-    let rate = job.rate;
-    let cutoff = (job.cutoff as f32).min(rate as f32 * 0.45);
-    let gain = db_gain(job.gain);
-    let drive = (job.drive > 0.0).then(|| db_gain(job.drive));
-    let solo_active = job.layers.iter().any(|layer| layer.patch.model != Model::Off && layer.solo);
-    let audible_layers = job.layers.iter().filter(|layer| layer.audible(solo_active)).count();
-    let fuse_mix = cutoff == 0.0 && drive.is_none() && audible_layers == 1;
-    let use_tile = audible_layers >= MIN_TILED_LAYERS && !tile.is_empty();
-    let mut peak = 1.0f32;
-    let mut length = 0;
-    let mut pending: Option<MixInput> = None;
-    let mut inputs = [None; MAX_LAYERS];
-    for (index, (layer, cached)) in job.layers.iter().zip(cached_layers).enumerate() {
-        if !layer.audible(solo_active) {
-            continue;
+) -> Option<()> {
+    let slot = input.slot;
+    buffers.with(slot, |cache| {
+        let waveform = cache.get_mut(..input.end)?;
+    if cached.patch != *patch {
+        if cached.patch.model != patch.model {
+            cached.transient_shape = TransientShape::Empty;
         }
-        let patch = &layer.patch;
-        let end = milliseconds(rate, patch.controls[1] as usize * 3 + 10)
-            .div_ceil(2)
-            .min(samples.len());
-        // Layer caches start after the output pool. The cache holds post-drive,
-        // pre-level samples; the sample rate is fixed for this instance.
-        let slot = layer_slot(usize::from(job.output_buffers), index);
-        buffers.with(slot, |cache| {
-            let waveform = cache.get_mut(..end)?;
-            if cached.patch != *patch {
-                if cached.patch.model != patch.model {
-                    cached.transient_shape = TransientShape::Empty;
-                }
-                #[cfg(feature = "profiling")]
-                let start = cpu_cycle_count();
-                match patch.model {
-                    Model::Off => {}
-                    Model::PitchSweep => buffers.with(slot + 1, |layer_cache| {
-                        pitch_sweep(patch, cached, rate, waveform, layer_cache, tables)
-                    })??,
-                    Model::ModalDrum => buffers.with(slot + 1, |layer_cache| {
-                        modal_drum(patch, cached, rate, waveform, layer_cache, tables)
-                    })??,
-                    Model::BitLogic => bit_logic(patch, rate, waveform, tables),
-                    Model::GrainCloud => {
-                        let mut timing = GrainTiming::default();
-                        buffers.with(slot + 1, |layer_cache| {
-                            grain_cloud(patch, cached, rate, waveform, layer_cache, tables, &mut timing)
-                        })??;
-                        #[cfg(feature = "profiling")]
-                        if let Some(result) = _timing.grains.get_mut(index) {
-                            *result = timing;
-                        }
-                    }
-                    Model::HardSync => hard_sync(patch, rate, waveform, tables),
-                    Model::Resonator => extra_models::resonator(patch, rate, waveform, tables),
-                    Model::TwoOperatorFm => extra_models::two_operator_fm(patch, rate, waveform, tables),
-                    Model::NoiseSweep => extra_models::noise_sweep(patch, rate, waveform, tables),
-                    Model::RingMod => extra_models::ring_mod(patch, rate, waveform, tables),
-                    Model::Wavefold => extra_models::wavefold(patch, rate, waveform, tables),
-                    Model::DelayDrum => buffers.with(slot + 1, |layer_cache| {
-                        extra_models::delay_drum(patch, rate, waveform, layer_cache, tables)
-                    })??,
-                    Model::SpectralPulse => spectral::spectral_pulse(patch, rate, waveform, tables),
-                }
+        #[cfg(feature = "profiling")]
+        let start = cpu_cycle_count();
+        #[cfg(feature = "profiling")]
+            let prepared_cycles = _timing.grains.get(_index).and_then(|grain| grain.accumulation);
+        match patch.model {
+            Model::Off => {}
+            Model::PitchSweep => buffers.with(slot + 1, |layer_cache| {
+                pitch_sweep(patch, cached, rate, waveform, layer_cache, tables)
+            })??,
+            Model::ModalDrum => buffers.with(slot + 1, |layer_cache| {
+                modal_drum(patch, cached, rate, waveform, layer_cache, tables)
+            })??,
+            Model::BitLogic => bit_logic(patch, rate, waveform, tables),
+            Model::GrainCloud => {
+                let mut timing = GrainTiming::default();
                 #[cfg(feature = "profiling")]
                 {
-                    let elapsed = cpu_cycle_count().wrapping_sub(start);
-                    if let Some(timing) = _timing.synthesis.get_mut(index) {
-                        *timing = Some(elapsed);
-                    }
+                    timing.accumulation = prepared_cycles;
                 }
-                store_patch(&mut cached.patch, patch);
-            }
-            if fuse_mix {
+                buffers.with(slot + 1, |layer_cache| {
+                    grain_cloud(patch, cached, rate, waveform, layer_cache, tables, &mut timing)
+                })??;
                 #[cfg(feature = "profiling")]
-                let start = cpu_cycle_count();
-                let mix = samples.get_mut(..end)?;
-                if layer.level == 1.0 {
-                    for (mixed, &sample) in mix.iter_mut().zip(waveform.iter()) {
-                        let scaled = (0.0 + sample) * gain;
-                        *mixed = scaled;
-                        peak = peak.max(scaled.abs());
-                    }
-                } else {
-                    for (mixed, &sample) in mix.iter_mut().zip(waveform.iter()) {
-                        let scaled = (0.0 + sample * layer.level) * gain;
-                        *mixed = scaled;
-                        peak = peak.max(scaled.abs());
-                    }
-                }
-                #[cfg(feature = "profiling")]
-                {
-                    _timing.mix += cpu_cycle_count().wrapping_sub(start);
+                    if let Some(result) = _timing.grains.get_mut(_index) {
+                    *result = timing;
                 }
             }
-            Some(())
-        })??;
-        if fuse_mix {
-            length = end;
-            continue;
-        }
-        let input = MixInput { slot, end, level: layer.level };
-        if use_tile {
-            *inputs.get_mut(index)? = Some(input);
-            length = length.max(end);
-            continue;
-        }
-        if let Some(first) = pending.take() {
-            #[cfg(feature = "profiling")]
-            let start = cpu_cycle_count();
-            let end = first.end.max(input.end);
-            mix_pair(buffers, samples.get_mut(..end)?, length, first, input)?;
-            length = length.max(end);
-            #[cfg(feature = "profiling")]
-            {
-                _timing.mix += cpu_cycle_count().wrapping_sub(start);
-            }
-        } else {
-            pending = Some(input);
-        }
-    }
-    if let Some(input) = pending {
-        #[cfg(feature = "profiling")]
-        let start = cpu_cycle_count();
-        let mix = samples.get_mut(..input.end)?;
-        buffers.with(input.slot, |wave| {
-            mix_single(mix, wave.get(..input.end)?, length, input.level)
-        })??;
-        length = length.max(input.end);
-        #[cfg(feature = "profiling")]
-        {
-            _timing.mix += cpu_cycle_count().wrapping_sub(start);
-        }
-    }
-    if length == 0 {
-        scope.capture(&mut [], rate, |_| {});
-        return Some(0);
-    }
-    if use_tile {
-        #[cfg(feature = "profiling")]
-        let start = cpu_cycle_count();
-        mix_tiles(buffers, samples.get_mut(..length)?, tile, &inputs)?;
-        #[cfg(feature = "profiling")]
-        {
-            _timing.mix += cpu_cycle_count().wrapping_sub(start);
-        }
-    }
-    if cutoff > 0.0 {
-        let tail = (rate as f32 * (3.0 / cutoff).max(0.005)) as usize + 1;
-        let requested_end = length + tail;
-        let end = requested_end.min(samples.len());
-        let mix = samples.get_mut(..end)?;
-        mix.iter_mut().skip(length).for_each(|sample| *sample = 0.0);
-        length = end;
-        #[cfg(feature = "profiling")]
-        let start = cpu_cycle_count();
-        let cycles = cutoff / rate as f32;
-        let fade = if end < requested_end {
-            milliseconds(rate, RELEASE_FADE_MS).min(end)
-        } else {
-            0
-        };
-        peak = match drive {
-            Some(boost) => {
-                let undriven_peak = lowpass(mix, cycles, 1.0);
-                MasterDrive::new(boost, undriven_peak, gain).apply(mix);
-                1.0
-            }
-            None => lowpass(mix, cycles, gain),
-        };
-        if fade != 0 {
-            // Fade the filter tail if it would run past the cap.
-            let scale = (fade as f32).recip();
-            for (remaining, sample) in mix.iter_mut().rev().take(fade).enumerate() {
-                *sample *= remaining as f32 * scale;
-            }
+            Model::HardSync => hard_sync(patch, rate, waveform, tables),
+            Model::Resonator => extra_models::resonator(patch, rate, waveform, tables),
+            Model::TwoOperatorFm => extra_models::two_operator_fm(patch, rate, waveform, tables),
+            Model::NoiseSweep => extra_models::noise_sweep(patch, rate, waveform, tables),
+            Model::RingMod => extra_models::ring_mod(patch, rate, waveform, tables),
+            Model::Wavefold => extra_models::wavefold(patch, rate, waveform, tables),
+            Model::DelayDrum => buffers.with(slot + 1, |layer_cache| {
+                extra_models::delay_drum(patch, rate, waveform, layer_cache, tables)
+            })??,
+            Model::SpectralPulse => spectral::spectral_pulse(patch, rate, waveform, tables),
         }
         #[cfg(feature = "profiling")]
         {
-            _timing.lowpass = Some(cpu_cycle_count().wrapping_sub(start));
-        }
-    }
-    let mix = samples.get_mut(..length)?;
-    #[cfg(feature = "profiling")]
-    let start = cpu_cycle_count();
-    // The filter and the single-layer mix already applied gain and tracked
-    // the peak while writing. An unfiltered multi-layer mix needs this pass.
-    if cutoff == 0.0 && !fuse_mix {
-        if let Some(boost) = drive {
-            let undriven_peak = mix.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-            MasterDrive::new(boost, undriven_peak, gain).apply(mix);
-        } else if gain == 1.0 {
-            for sample in &*mix {
-                peak = peak.max(sample.abs());
-            }
-        } else {
-            for sample in &mut *mix {
-                *sample *= gain;
-                peak = peak.max(sample.abs());
+            let elapsed = cpu_cycle_count().wrapping_sub(start)
+                .saturating_add(prepared_cycles.unwrap_or(0));
+                if let Some(timing) = _timing.synthesis.get_mut(_index) {
+                *timing = Some(elapsed);
             }
         }
+        store_patch(&mut cached.patch, patch);
     }
-    #[cfg(feature = "profiling")]
-    {
-        _timing.gain_and_peak = Some(cpu_cycle_count().wrapping_sub(start));
-    }
-    #[cfg(feature = "profiling")]
-    let start = cpu_cycle_count();
-    if peak > 1.0 {
-        let trim = peak.recip();
-        scope.capture(mix, rate, |sample| *sample *= trim);
-    } else {
-        scope.capture(mix, rate, |_| {});
-    }
-    #[cfg(feature = "profiling")]
-    {
-        _timing.scope = Some(cpu_cycle_count().wrapping_sub(start));
-    }
-    Some(length)
+        Some(())
+    })?
 }
 
 fn mix_pair(
     buffers: &WaveBuffers,
     mix: &mut [f32],
-    length: usize,
+    start: usize,
     a: MixInput,
     b: MixInput,
 ) -> Option<()> {
     buffers.with(a.slot, |a_wave| {
         buffers.with(b.slot, |b_wave| {
-            let a_wave = a_wave.get(..a.end)?;
-            let b_wave = b_wave.get(..b.end)?;
-            let shared = a.end.min(b.end);
+            let a_end = a.end.saturating_sub(start).min(mix.len());
+            let b_end = b.end.saturating_sub(start).min(mix.len());
+            let a_wave = a_wave.get(start.min(a.end)..start.min(a.end) + a_end)?;
+            let b_wave = b_wave.get(start.min(b.end)..start.min(b.end) + b_end)?;
+            let shared = a_end.min(b_end);
             let (both, tail) = mix.split_at_mut_checked(shared)?;
-            let overlap = length.min(shared);
-            let (old, new) = both.split_at_mut_checked(overlap)?;
-            let (a_old, a_new) = a_wave.get(..shared)?.split_at_checked(overlap)?;
-            let (b_old, b_new) = b_wave.get(..shared)?.split_at_checked(overlap)?;
             // Accumulate the first layer before the second to preserve rounding.
-            for ((mixed, &a_sample), &b_sample) in old.iter_mut().zip(a_old).zip(b_old) {
-                *mixed = (*mixed + a_sample * a.level) + b_sample * b.level;
-            }
-            for ((mixed, &a_sample), &b_sample) in new.iter_mut().zip(a_new).zip(b_new) {
+            for ((mixed, &a_sample), &b_sample) in both.iter_mut().zip(a_wave).zip(b_wave) {
                 *mixed = (0.0 + a_sample * a.level) + b_sample * b.level;
             }
-            let (longer, level) = if a.end > b.end { (a_wave, a.level) } else { (b_wave, b.level) };
-            mix_single(tail, longer.get(shared..)?, length.saturating_sub(shared), level)
+            let (longer, level) = if a_end > b_end { (a_wave, a.level) } else { (b_wave, b.level) };
+            mix_single(tail, longer.get(shared..)?, 0, level)
         })?
     })?
 }
@@ -338,33 +203,28 @@ fn mix_single(mix: &mut [f32], wave: &[f32], length: usize, level: f32) -> Optio
     Some(())
 }
 
-fn mix_tiles(
+fn mix_tile(
     buffers: &WaveBuffers,
-    samples: &mut [f32],
+    dest: &mut [f32],
     tile: &mut [f32],
+    start: usize,
     inputs: &[Option<MixInput>; MAX_LAYERS],
 ) -> Option<()> {
-    let width = core::num::NonZeroUsize::new(tile.len())?;
-    let mut start = 0;
-    for dest in samples.chunks_mut(width.get()) {
-        // Each layer covers a prefix. Write its new frames directly and
-        // accumulate over the frames already written by earlier layers.
-        let mut written = 0;
-        for input in inputs.iter().flatten() {
-            let frames = input.end.saturating_sub(start).min(dest.len());
-            if frames == 0 {
-                continue;
-            }
+    // Each layer covers a prefix of the tile. Only overlap is accumulated.
+    let mut written = 0;
+    for input in inputs.iter().flatten() {
+        let frames = input.end.saturating_sub(start).min(dest.len());
+        if frames != 0 {
             let sum = tile.get_mut(..frames)?;
             buffers.with(input.slot, |wave| {
                 mix_single(sum, wave.get(start..start + frames)?, written, input.level)
             })??;
             written = written.max(frames);
         }
-        dest.copy_from_slice(tile.get(..dest.len())?);
-        start += dest.len();
     }
+    dest.copy_from_slice(tile.get(..dest.len())?);
     Some(())
+
 }
 }
 
@@ -405,27 +265,45 @@ impl MasterDrive {
     }
 }
 
-fn lowpass(samples: &mut [f32], cycles: f32, gain: f32) -> f32 {
-    let k = sine(cycles * 0.5) / sine(0.25 + cycles * 0.5);
-    let squared = k * k;
-    let root_two_k = core::f32::consts::SQRT_2 * k;
-    let norm = (1.0 + root_two_k + squared).recip();
-    let b0 = squared * norm;
-    let b1 = 2.0 * b0;
-    let a1 = 2.0 * (squared - 1.0) * norm;
-    let a2 = (1.0 - root_two_k + squared) * norm;
-    let mut z1 = 0.0;
-    let mut z2 = 0.0;
-    let mut peak = 0.0_f32;
-    for sample in samples {
-        let output = *sample * b0 + z1;
-        z1 = *sample * b1 - output * a1 + z2;
-        z2 = *sample * b0 - output * a2;
-        let scaled = output * gain;
-        *sample = scaled;
-        peak = peak.max(scaled.abs());
+#[derive(Clone, Copy)]
+struct Lowpass {
+    b0: f32,
+    b1: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Lowpass {
+    fn new(cycles: f32) -> Self {
+        let k = sine(cycles * 0.5) / sine(0.25 + cycles * 0.5);
+        let squared = k * k;
+        let root_two_k = core::f32::consts::SQRT_2 * k;
+        let norm = (1.0 + root_two_k + squared).recip();
+        let b0 = squared * norm;
+        Self {
+            b0,
+            b1: 2.0 * b0,
+            a1: 2.0 * (squared - 1.0) * norm,
+            a2: (1.0 - root_two_k + squared) * norm,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
-    peak
+
+    fn apply(&mut self, samples: &mut [f32], gain: f32) -> f32 {
+        let mut peak = 0.0_f32;
+        for sample in samples {
+            let output = *sample * self.b0 + self.z1;
+            self.z1 = *sample * self.b1 - output * self.a1 + self.z2;
+            self.z2 = *sample * self.b0 - output * self.a2;
+            let scaled = output * gain;
+            *sample = scaled;
+            peak = peak.max(scaled.abs());
+        }
+        peak
+    }
 }
 
 fn db_gain(db: f32) -> f32 {
@@ -1072,17 +950,48 @@ fn render_modal_body<const N: usize>(
     Some(())
 }
 
-fn grain_schedule(layer: &LayerPatch, rate: u32) -> impl Iterator<Item = (usize, f32, f32)> {
+fn layer_frames(patch: &LayerPatch, rate: u32) -> usize {
+    milliseconds(rate, patch.controls[1] as usize * 3 + 10)
+        .div_ceil(2)
+        .min(max_frames(rate))
+}
+
+#[derive(Clone, Copy)]
+struct GrainSchedule {
+    next_time: f64,
+    seed: u32,
+    controls: [f32; 7],
+    rate: u32,
+}
+
+fn grain_schedule(layer: &LayerPatch, rate: u32) -> GrainSchedule {
     let [tune, _, sweep, sweep_time, _, density, density_depth, spread, jitter, _] = layer.controls;
-    let sweep_decay = decay_rate(sweep_time, rate);
-    let rate_hz = f64::from(rate);
-    let mut next_time = 0.0f64;
-    let mut seed = NOISE_SEED;
-    let mut random = move || f64::from(next_noise_bits(&mut seed)) / 2147483648.0 - 1.0;
-    core::iter::from_fn(move || {
-        let frame = (next_time * rate_hz) as usize;
-        let frame = frame + usize::from((frame as f64 / rate_hz) < next_time);
+    GrainSchedule {
+        next_time: 0.0,
+        seed: NOISE_SEED,
+        controls: [
+            tune,
+            sweep,
+            decay_rate(sweep_time, rate),
+            density,
+            density_depth,
+            spread,
+            jitter,
+        ],
+        rate,
+    }
+}
+
+impl Iterator for GrainSchedule {
+    type Item = (usize, f32, f32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let [tune, sweep, sweep_decay, density, density_depth, spread, jitter] = self.controls;
+        let rate_hz = f64::from(self.rate);
+        let frame = (self.next_time * rate_hz) as usize;
+        let frame = frame + usize::from((frame as f64 / rate_hz) < self.next_time);
         let sweep_level = exp2(frame as f32 * sweep_decay);
+        let mut random = || f64::from(next_noise_bits(&mut self.seed)) / 2147483648.0 - 1.0;
         let detune = random() as f32 * spread / 12.0;
         let frequency = tune * exp2(sweep / 12.0 * sweep_level) * exp2(detune);
         // The source phase is signed. Offset by one turn before calling sine.
@@ -1093,9 +1002,9 @@ fn grain_schedule(layer: &LayerPatch, rate: u32) -> impl Iterator<Item = (usize,
         let spacing = (1.0 + 0.4 * random() * f64::from(jitter) / 100.0) / f64::from(grain_rate);
         // Preserve the fractional launch time. Rounding each gap would
         // drift away from the web schedule over the course of the cloud.
-        next_time += spacing;
-        Some((frame, frequency / rate as f32, phase))
-    })
+        self.next_time += spacing;
+        Some((frame, frequency / self.rate as f32, phase))
+    }
 }
 
 fn accumulate_grain(samples: &mut [f32], window: &[f32], step: f32, phase: f32) {
@@ -1120,6 +1029,107 @@ fn accumulate_grain(samples: &mut [f32], window: &[f32], step: f32, phase: f32) 
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct GrainWork {
+    layer: usize,
+    schedule: Option<GrainSchedule>,
+}
+
+impl GrainWork {
+    pub const EMPTY: Self = Self {
+        layer: 0,
+        schedule: None,
+    };
+
+    #[inline(never)]
+    pub fn advance(
+        &mut self,
+        job: &Job,
+        cached: &mut [CachedLayer; MAX_LAYERS],
+        buffers: &WaveBuffers,
+        _timing: &mut RenderTiming,
+        slice_start: u32,
+    ) -> bool {
+        let solo = job
+            .layers
+            .iter()
+            .any(|layer| layer.patch.model != Model::Off && layer.solo);
+        while let (Some(layer), Some(cache)) =
+            (job.layers.get(self.layer), cached.get_mut(self.layer))
+        {
+            let patch = &layer.patch;
+            let frames = layer_frames(patch, job.rate);
+            if self.schedule.is_some()
+                || (layer.audible(solo)
+                    && patch.model == Model::GrainCloud
+                    && cache.patch != *patch
+                    && !cache.can_reuse_grains(patch, frames))
+            {
+                let slot = layer_slot(usize::from(job.output_buffers), self.layer);
+                #[cfg(feature = "profiling")]
+                let started = cpu_cycle_count();
+                let result = buffers
+                    .with(slot, |waveform| {
+                        buffers.with(slot + 1, |layer_cache| {
+                            let waveform = waveform.get_mut(..frames)?;
+                            let size_ms = patch.controls[4];
+                            let window =
+                                layer_cache.get_mut(..milliseconds(job.rate, size_ms as usize))?;
+                            if self.schedule.is_none() {
+                                if cache.cached_grain_frames(size_ms).is_none() {
+                                    make_grain_window(window, job.rate, size_ms);
+                                }
+                                // The cache holds raw samples until the final render shapes them.
+                                cache.patch = LayerPatch::OFF;
+                                cache.transient_shape = TransientShape::Empty;
+                                waveform.fill(0.0);
+                            }
+                            let schedule = self
+                                .schedule
+                                .get_or_insert_with(|| grain_schedule(patch, job.rate));
+                            for (frame, step, phase) in schedule {
+                                let Some(samples) = waveform
+                                    .get_mut(frame..)
+                                    .filter(|samples| !samples.is_empty())
+                                else {
+                                    break;
+                                };
+                                accumulate_grain(samples, window, step, phase);
+                                if cpu_cycle_count().wrapping_sub(slice_start) >= SLICE_CYCLES {
+                                    return Some(true);
+                                }
+                            }
+                            cache.prepared_grains = true;
+                            Some(false)
+                        })?
+                    })
+                    .flatten();
+                #[cfg(feature = "profiling")]
+                if let Some(grain) = _timing.grains.get_mut(self.layer) {
+                    let elapsed = cpu_cycle_count().wrapping_sub(started);
+                    grain.accumulation =
+                        Some(grain.accumulation.unwrap_or(0).saturating_add(elapsed));
+                }
+                if result == Some(true) {
+                    return true;
+                }
+                self.schedule = None;
+            }
+            self.layer += 1;
+        }
+        false
+    }
+}
+
+fn make_grain_window(window: &mut [f32], rate: u32, size_ms: f32) {
+    // sin(pi * progress)^2 is the Hann window.
+    let half_turn_per_frame = 500.0 / (rate as f32 * size_ms);
+    for (frame, weight) in window.iter_mut().enumerate() {
+        let height = sine(frame as f32 * half_turn_per_frame);
+        *weight = height * height;
+    }
+}
+
 fn grain_cloud(
     layer: &LayerPatch,
     cached: &mut CachedLayer,
@@ -1132,46 +1142,36 @@ fn grain_cloud(
     let [_, decay, _, _, size_ms, density, _, _, _, drive] = layer.controls;
     let (window, storage) =
         layer_cache.split_at_mut_checked(milliseconds(rate, size_ms as usize))?;
-    let cached_frames = match cached.transient_shape {
-        TransientShape::GrainCloud {
-            size_ms: saved,
-            raw_frames,
-        } if saved == size_ms => raw_frames,
-        _ => {
-            let half_turn_per_frame = 500.0 / (rate as f32 * size_ms);
-            for (frame, weight) in window.iter_mut().enumerate() {
-                // sin(pi * progress)^2 is the Hann window.
-                let height = sine(frame as f32 * half_turn_per_frame);
-                *weight = height * height;
-            }
-            0
-        }
-    };
+    let prepared = core::mem::take(&mut cached.prepared_grains);
+    if !prepared && cached.cached_grain_frames(size_ms).is_none() {
+        make_grain_window(window, rate, size_ms);
+    }
     // Body Decay and Drive are applied after the grain sum. A shorter
     // render can use the prefix of an already cached sum.
-    let reuse = cached_frames >= waveform.len()
-        && cached.patch.model == Model::GrainCloud
-        && cached.patch.controls[0] == layer.controls[0]
-        && cached.patch.controls[2..9] == layer.controls[2..9];
+    let reuse = !prepared && cached.can_reuse_grains(layer, waveform.len());
     let raw = storage.get_mut(..waveform.len());
     let reused = match raw {
         Some(raw) if reuse => Some(raw),
         available => {
-            #[cfg(feature = "profiling")]
-            let start = cpu_cycle_count();
-            waveform.fill(0.0);
-            for (start, step, phase) in grain_schedule(layer, rate) {
-                let Some(samples) = waveform.get_mut(start..) else {
-                    break;
-                };
-                if samples.is_empty() {
-                    break;
+            if !prepared {
+                #[cfg(feature = "profiling")]
+                let start = cpu_cycle_count();
+                waveform.fill(0.0);
+                for (start, step, phase) in grain_schedule(layer, rate) {
+                    let Some(samples) = waveform.get_mut(start..) else {
+                        break;
+                    };
+                    if samples.is_empty() {
+                        break;
+                    }
+                    accumulate_grain(samples, window, step, phase);
                 }
-                accumulate_grain(samples, window, step, phase);
-            }
-            #[cfg(feature = "profiling")]
-            {
-                _timing.accumulation = Some(cpu_cycle_count().wrapping_sub(start));
+                #[cfg(feature = "profiling")]
+                {
+                    let elapsed = cpu_cycle_count().wrapping_sub(start);
+                    _timing.accumulation =
+                        Some(_timing.accumulation.unwrap_or(0).saturating_add(elapsed));
+                }
             }
             let raw_frames = if let Some(raw) = available {
                 raw.copy_from_slice(waveform);

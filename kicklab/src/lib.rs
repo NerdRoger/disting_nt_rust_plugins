@@ -20,7 +20,6 @@ mod profile {
     pub const NO_RENDER_TIMING: RenderTiming = ();
 }
 
-#[cfg(feature = "profiling")]
 use distingnt_api::api::cpu_cycle_count;
 
 use core::ffi::{c_char, CStr};
@@ -448,11 +447,72 @@ impl Job {
 #[derive(Clone, Copy)]
 struct RenderWork {
     job: Job,
+    grains: render::GrainWork,
+    plan: Option<render::RenderPlan>,
+    pending: bool,
     // The worker alone uses these keys and the per-layer DRAM slots.
     cached_layers: [render::CachedLayer; MAX_LAYERS],
     length: Option<usize>,
     timing: profile::RenderTiming,
     scope: Scope,
+}
+
+impl RenderWork {
+    #[inline(never)]
+    fn prepare_plan(&mut self) {
+        // Plan construction can use its own frame before entering the renderer.
+        self.plan = Some(render::RenderPlan::new(
+            &self.job,
+            render::max_frames(self.job.rate),
+        ));
+    }
+
+    #[inline(never)]
+    fn advance_render(
+        &mut self,
+        slot: u32,
+        buffers: &WaveBuffers,
+        memory: StaticDramView<'_>,
+        start: u32,
+    ) {
+        let tables = lookup::Lookup::from_dram(memory);
+        let status = buffers
+            .with(slot as usize, |samples| {
+                let plan = self.plan.as_mut()?;
+                let mut render = |tile: &mut [f32]| {
+                    plan.advance(
+                        &self.job,
+                        &mut self.cached_layers,
+                        buffers,
+                        samples,
+                        tile,
+                        tables,
+                        &mut self.timing,
+                        &mut self.scope,
+                        start,
+                    )
+                };
+                let layers = usize::from(self.job.layer_count);
+                if layers >= MIN_TILED_LAYERS {
+                    let tile_slot = layer_slot(usize::from(self.job.output_buffers), layers);
+                    buffers.with(tile_slot, render).flatten()
+                } else {
+                    render(&mut [])
+                }
+            })
+            .flatten();
+        self.pending = matches!(status, Some(render::RenderStatus::Pending));
+        match status {
+            Some(render::RenderStatus::Complete(length)) => self.length = Some(length),
+            None => {
+                self.length = None;
+                for layer in &mut self.cached_layers {
+                    layer.discard_prepared_grains();
+                }
+            }
+            Some(render::RenderStatus::Pending) => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -715,7 +775,10 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
 
 fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     if let Some(slot) = context.state().in_flight {
-        let _ = context.with_shared_state(|state, work| {
+        let resume = context.with_shared_state(|state, work| {
+            if work.pending {
+                return true;
+            }
             #[cfg(feature = "profiling")]
             state.meter.record_render(work.timing);
             if let Some(length) = work.length {
@@ -737,7 +800,14 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
                 state.dirty = true;
             }
             state.in_flight = None;
+            false
         });
+        if resume == Ok(true) {
+            // The previous slice released the worker reservation. A full
+            // firmware queue leaves this slot in-flight for the next retry.
+            let _ = context.submit_audio_worker(slot as u32);
+            return;
+        }
     }
     if context.state().parameter_setup != ParameterSetup::Ready || !context.state().dirty {
         return;
@@ -799,7 +869,15 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
             *decoded = control.decode(value);
         }
     }
-    if context.with_shared_resources(|work| work.job = job).is_ok()
+    if context
+        .with_shared_resources(|work| {
+            work.job = job;
+            work.grains = render::GrainWork::EMPTY;
+            work.plan = None;
+            work.pending = false;
+            work.timing = profile::NO_RENDER_TIMING;
+        })
+        .is_ok()
         && context.submit_audio_worker(slot as u32).is_ok()
     {
         context.state_mut().in_flight = Some(slot);
@@ -947,6 +1025,9 @@ impl Plugin for KickLab {
             destination,
             RenderWork {
                 length: None,
+                grains: render::GrainWork::EMPTY,
+                plan: None,
+                pending: false,
                 timing: profile::NO_RENDER_TIMING,
             },
             arrays {
@@ -1104,45 +1185,35 @@ impl Plugin for KickLab {
         lookup::initialize(memory);
     }
 
+    distingnt_api::nt_dram_section! {
     fn audio_worker_with_static_dram(
         work: &mut RenderWork,
         slot: u32,
         buffers: &WaveBuffers,
         memory: StaticDramView<'_>,
     ) {
-        let tables = lookup::Lookup::from_dram(memory);
-        let mut timing = profile::NO_RENDER_TIMING;
-        work.length = buffers
-            .with(slot as usize, |samples| {
-                #[cfg(feature = "profiling")]
-                let start = cpu_cycle_count();
-                let mut render = |tile: &mut [f32]| {
-                    render::render(
-                        &work.job,
-                        &mut work.cached_layers,
-                        buffers,
-                        samples,
-                        tables,
-                        &mut timing,
-                        &mut work.scope,
-                        tile,
-                    )
-                };
-                let layers = usize::from(work.job.layer_count);
-                let length = if layers >= MIN_TILED_LAYERS {
-                    let tile_slot = layer_slot(usize::from(work.job.output_buffers), layers);
-                    buffers.with(tile_slot, render).flatten()
-                } else {
-                    render(&mut [])
-                };
-                #[cfg(feature = "profiling")]
-                {
-                    timing.total = Some(cpu_cycle_count().wrapping_sub(start));
-                }
-                length
-            })
-            .flatten();
-        work.timing = timing;
+        let start = cpu_cycle_count();
+        if work.plan.is_none() {
+            work.pending = work.grains.advance(
+                &work.job,
+                &mut work.cached_layers,
+                buffers,
+                &mut work.timing,
+                start,
+            );
+            if !work.pending {
+                work.prepare_plan();
+            }
+        }
+        if work.plan.is_some() {
+            work.advance_render(slot, buffers, memory, start);
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let elapsed = cpu_cycle_count().wrapping_sub(start);
+            work.timing.total = Some(work.timing.total.unwrap_or(0).saturating_add(elapsed));
+        }
+    }
     }
 
     fn draw(context: &mut Callback<'_, Ui>, canvas: Canvas<'_>) -> bool {

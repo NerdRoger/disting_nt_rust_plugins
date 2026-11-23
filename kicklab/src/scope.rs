@@ -28,6 +28,8 @@ pub struct Scope {
 }
 
 impl Scope {
+    pub const COLUMNS: usize = WIDTH;
+
     pub fn initialize(destination: &mut RegionInitializer<'_, Self>) {
         distingnt_api::initialize_region!(
             destination,
@@ -38,10 +40,30 @@ impl Scope {
         );
     }
 
-    pub fn capture(&mut self, samples: &mut [f32], rate: u32, mut finish: impl FnMut(&mut f32)) {
+    #[cfg(test)]
+    pub fn capture(&mut self, samples: &mut [f32], rate: u32, finish: impl FnMut(&mut f32)) {
+        let peak = self.capture_columns(samples, rate, 0..WIDTH, finish);
+        self.finish_capture(peak);
+    }
+
+    pub fn capture_columns(
+        &mut self,
+        samples: &mut [f32],
+        rate: u32,
+        columns: core::ops::Range<usize>,
+        mut finish: impl FnMut(&mut f32),
+    ) -> f32 {
         let plot_frames = rate as usize;
         let mut peak = 0.0_f32;
-        for (x, column) in self.columns.iter_mut().enumerate() {
+        let first_column = columns.start;
+        for (index, column) in self
+            .columns
+            .get_mut(columns)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let x = first_column + index;
             let start = (x * plot_frames / WIDTH).min(samples.len());
             let end = ((x + 1) * plot_frames / WIDTH).min(samples.len());
             let slice = samples.get_mut(start..end).unwrap_or_default();
@@ -60,6 +82,10 @@ impl Scope {
             peak = peak.max(min.abs()).max(max.abs());
             *column = [displacement(max), displacement(min)];
         }
+        peak
+    }
+
+    pub fn finish_capture(&mut self, peak: f32) {
         self.peak = peak_dbfs(peak);
     }
 
