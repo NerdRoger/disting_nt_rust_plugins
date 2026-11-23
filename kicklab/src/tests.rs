@@ -297,6 +297,10 @@ impl Host {
         }
     }
 
+    fn page_name(&self, page: usize) -> &CStr {
+        unsafe { CStr::from_ptr((*(*(*self.base).parameter_pages).pages.add(page)).name) }
+    }
+
     fn step(&mut self, trigger: [f32; 4]) -> [f32; 4] {
         let writes = AUDIO_WRITES.with(Cell::get);
         let page_updates = PAGE_UPDATES.with(Cell::get);
@@ -445,6 +449,8 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
     let mut host = Host::uninitialized(2);
     let first = model_index(0);
     let second = model_index(1);
+    assert_eq!(host.page_name(1), c"1-Pitch Sweep");
+    assert_eq!(host.page_name(2), c"2-Off");
     assert_eq!(
         unsafe { (*(*host.base).parameters.add(first)).unit },
         UNIT_CONFIRM
@@ -473,7 +479,8 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
         (1, 15, (first as u8..(first + LAYER_FIELDS) as u8).collect())
     );
     assert_eq!(host.page(2), (1, 1, vec![second as u8]));
-    assert_eq!(PAGE_UPDATES.with(Cell::get), 1);
+    assert_eq!(host.page_name(1), c"1-Bit Logic");
+    assert_eq!(PAGE_UPDATES.with(Cell::get), 2);
 
     host.set(first, 2);
     assert_eq!(host.values[first], 2);
@@ -500,12 +507,22 @@ fn model_controls_refresh_on_notification_and_preserve_restored_values() {
     );
     host.set(first, 0);
     assert_eq!(host.page(1), (1, 1, vec![first as u8]));
+    assert_eq!(host.page_name(1), c"1-Off");
     host.set(first, 3);
     assert_eq!(
         &host.values[controls..controls + BIT_LOGIC.len()],
         &[950, 750, 120, 19, 100, 160, 1000, 6, 1, 3300]
     );
     assert_eq!(host.page(1).1, 15);
+
+    host.set(second, 11);
+    assert_eq!(host.page_name(2), c"2-Delay Drum");
+    let page = host.page(2);
+    let page_updates = PAGE_UPDATES.with(Cell::get);
+    host.set(second, 12);
+    assert_eq!(host.page(2), page);
+    assert_eq!(host.page_name(2), c"2-Spect. Pulse");
+    assert_eq!(PAGE_UPDATES.with(Cell::get), page_updates + 1);
 }
 
 #[test]
@@ -999,12 +1016,12 @@ fn new_kick_models_use_the_existing_layer_page_and_worker() {
     host.set(solo, 1);
     for (id, name, controls) in [
         (6, c"Resonator", RESONATOR.as_slice()),
-        (7, c"Two-Operator FM", TWO_OPERATOR_FM.as_slice()),
+        (7, c"Two Op. FM", TWO_OPERATOR_FM.as_slice()),
         (8, c"Noise Sweep", NOISE_SWEEP.as_slice()),
         (9, c"Ring Mod", RING_MOD.as_slice()),
         (10, c"Wavefold", WAVEFOLD.as_slice()),
         (11, c"Delay Drum", DELAY_DRUM.as_slice()),
-        (12, c"Spectral Pulse", SPECTRAL_PULSE.as_slice()),
+        (12, c"Spect. Pulse", SPECTRAL_PULSE.as_slice()),
     ] {
         host.set(base, id);
         let mut text = [0; PARAMETER_STRING_SIZE];

@@ -8,8 +8,8 @@ in `NerdRoger/disting_nt_plugins`. Production plugins depend only on the safe AP
 - `window-comparator`: safe Rust Window Comparator plugin.
 - `wavesmith`: live segmented oscillator with 2–32 curved sections and an always-visible help footer; see [user guide](wavesmith/README.md) and [developer notes](wavesmith/Developer.md).
 - `kicklab`: kick drum with 1–8 layers (default 1) and Pitch Sweep, Modal Drum, Bit Logic, Grain Cloud,
-  Hard Sync, Resonator, Two-Operator FM, Noise Sweep, Ring Mod, Wavefold, Delay Drum,
-  and Spectral Pulse.
+  Hard Sync, Resonator, Two Op. FM, Noise Sweep, Ring Mod, Wavefold, Delay Drum,
+  and Spect. Pulse.
 - `monosynth`: Rust port of [Expert Sleepers' C++ monosynth example](https://github.com/expertsleepersltd/distingNT_API/blob/main/examples/monosynth.cpp), created as a Rust learning experiment.
 - `distingNT_API`: independent upstream Git submodule, pinned to `1780254aebc3c73b96c351a7b12c325d1f983402`.
 - `tools`: ABI, layering and loader validation.

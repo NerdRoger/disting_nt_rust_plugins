@@ -1049,6 +1049,26 @@ impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V
     /// Replace a page's visible indices within its original metadata allocation.
     /// The page's name, group, and backing address stay fixed.
     pub fn set_page_parameter_indices(&mut self, page: usize, indices: &[u8]) -> Option<()> {
+        self.update_page(page, None, indices)
+    }
+
+    /// Replace a page's title and visible indices with a single host refresh.
+    /// The page's group and backing address stay fixed.
+    pub fn set_named_page(
+        &mut self,
+        page: usize,
+        name: super::metadata::Name,
+        indices: &[u8],
+    ) -> Option<()> {
+        self.update_page(page, Some(name), indices)
+    }
+
+    fn update_page(
+        &mut self,
+        page: usize,
+        name: Option<super::metadata::Name>,
+        indices: &[u8],
+    ) -> Option<()> {
         let algorithm = self.algorithm_index()?;
         let (target, capacity) = self.page_span(page)?;
         let count = u8::try_from(indices.len()).ok()?;
@@ -1064,10 +1084,13 @@ impl<S: Copy, V: Copy, M: StateMemory<S>, E: ExtraRegionLayout> Context<'_, S, V
         // Publish all changes before notifying the host, which may reenter.
         unsafe {
             let destination = (*target).params.cast_mut();
-            if (*target).num_params != count
+            let name = name.map_or((*target).name, super::metadata::Name::as_ptr);
+            if (*target).name != name
+                || (*target).num_params != count
                 || slice::from_raw_parts(destination, indices.len()) != indices
             {
                 ptr::copy_nonoverlapping(indices.as_ptr(), destination, indices.len());
+                (*target).name = name;
                 (*target).num_params = count;
                 NT_updateParameterPages(algorithm);
             }

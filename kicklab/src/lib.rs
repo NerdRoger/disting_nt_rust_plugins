@@ -28,7 +28,7 @@ use distingnt_api::{
         audio::bus_index,
         background::DramBuffers,
         drawing::Canvas,
-        metadata::{Definition, EnumStrings},
+        metadata::{Definition, EnumStrings, Name},
         parameters::{scaled_value, Audio, ReadOnly, Ui},
         plugin::{
             Configuration, Context, Metadata, Plugin, RegionInitializer, SharedResources,
@@ -62,9 +62,6 @@ const LAYER_SOLO: usize = 3;
 const LAYER_MUTE: usize = 4;
 const LAYER_FIRST_CONTROL: usize = 5;
 const LAYER_FIELDS: usize = LAYER_FIRST_CONTROL + CONTROLS;
-const LAYER_NAMES: [&CStr; MAX_LAYERS] = [
-    c"Layer 1", c"Layer 2", c"Layer 3", c"Layer 4", c"Layer 5", c"Layer 6", c"Layer 7", c"Layer 8",
-];
 const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [
     b"L1: ", b"L2: ", b"L3: ", b"L4: ", b"L5: ", b"L6: ", b"L7: ", b"L8: ",
 ];
@@ -76,13 +73,55 @@ const MODEL_NAMES: [&CStr; 13] = [
     c"Grain Cloud",
     c"Hard Sync",
     c"Resonator",
-    c"Two-Operator FM",
+    c"Two Op. FM",
     c"Noise Sweep",
     c"Ring Mod",
     c"Wavefold",
     c"Delay Drum",
-    c"Spectral Pulse",
+    c"Spect. Pulse",
 ];
+const LAYER_PAGE_NAME_BYTES: usize = 15;
+static LAYER_PAGE_NAME_STORAGE: [[[u8; LAYER_PAGE_NAME_BYTES]; MODEL_NAMES.len()]; MAX_LAYERS] = {
+    let mut names = [[[0; LAYER_PAGE_NAME_BYTES]; MODEL_NAMES.len()]; MAX_LAYERS];
+    let mut layer = 0;
+    while layer < MAX_LAYERS {
+        let mut model = 0;
+        while model < MODEL_NAMES.len() {
+            let prefix = [b'1' + layer as u8, b'-'];
+            let name = MODEL_NAMES[model].to_bytes_with_nul();
+            let mut index = 0;
+            while index < prefix.len() {
+                names[layer][model][index] = prefix[index];
+                index += 1;
+            }
+            let mut index = 0;
+            while index < name.len() {
+                names[layer][model][prefix.len() + index] = name[index];
+                index += 1;
+            }
+            model += 1;
+        }
+        layer += 1;
+    }
+    names
+};
+static LAYER_PAGE_NAMES: [[Name; MODEL_NAMES.len()]; MAX_LAYERS] = {
+    let mut names = [[Name::new(c""); MODEL_NAMES.len()]; MAX_LAYERS];
+    let mut layer = 0;
+    while layer < MAX_LAYERS {
+        let mut model = 0;
+        while model < MODEL_NAMES.len() {
+            let Ok(name) = CStr::from_bytes_until_nul(&LAYER_PAGE_NAME_STORAGE[layer][model])
+            else {
+                panic!("layer page name must be NUL-terminated");
+            };
+            names[layer][model] = Name::new(name);
+            model += 1;
+        }
+        layer += 1;
+    }
+    names
+};
 static OPERATIONS: EnumStrings<4> = EnumStrings::new([c"XOR", c"AND", c"OR", c"Wrap Add"]);
 static OFF_ON: EnumStrings<2> = EnumStrings::new([c"Off", c"On"]);
 
@@ -631,8 +670,8 @@ fn update_model_controls(context: &mut Callback<'_, Audio>, layer: usize, restor
     } else {
         LAYER_FIRST_CONTROL + controls.len()
     };
-    if let Some(indices) = indices.get(..visible) {
-        context.set_page_parameter_indices(layer + 1, indices);
+    if let (Some(names), Some(indices)) = (LAYER_PAGE_NAMES.get(layer), indices.get(..visible)) {
+        context.set_named_page(layer + 1, names[model as usize], indices);
     }
 }
 
@@ -1089,9 +1128,10 @@ impl Plugin for KickLab {
         let indices: [u8; GLOBALS] = core::array::from_fn(|index| index as u8);
         metadata.add_page(c"KickLab", 0, &indices)?;
         let layers = layer_count(specs)?;
-        for (layer, &name) in LAYER_NAMES.iter().enumerate().take(layers) {
+        for (layer, names) in LAYER_PAGE_NAMES.iter().enumerate().take(layers) {
             let base = model_index(layer);
             let default_model = if layer == 0 { 1 } else { 0 };
+            let model = Model::from_value(default_model);
             metadata.set_parameter(
                 base,
                 definition(
@@ -1110,7 +1150,7 @@ impl Plugin for KickLab {
                     Definition::new(name, 0, 1, 0, UNIT_ENUM, SCALING_NONE, Some(OFF_ON.table()))?;
                 metadata.set_parameter(base + offset, toggle)?;
             }
-            let controls = Model::from_value(default_model).controls();
+            let controls = model.controls();
             for slot in 0..CONTROLS {
                 let initial = controls.get(slot).map_or(0, |control| control.initial);
                 // Start with bounds that admit the stored raw values of any model.
@@ -1127,7 +1167,7 @@ impl Plugin for KickLab {
                 )?;
             }
             let indices = layer_page_indices(layer);
-            metadata.add_page(name, 1, &indices)?;
+            metadata.add_named_page(names[model as usize], 1, &indices)?;
         }
         Some(())
     }

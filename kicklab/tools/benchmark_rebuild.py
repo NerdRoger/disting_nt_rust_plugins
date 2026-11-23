@@ -137,7 +137,7 @@ MODELS = {
         },
     ),
     "two-operator-fm": (
-        "Two-Operator FM", 7,
+        "Two Op. FM", 7,
         {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 490,
          "L1: Body Decay": 420, DRIVE: 30, "L1: Sweep Depth": 24, "L1: Sweep Time": 22,
          "L1: FM Amount": 320, "L1: Modulator Ratio": 345, "L1: FM Decay": 78,
@@ -212,7 +212,7 @@ MODELS = {
         },
     ),
     "spectral-pulse": (
-        "Spectral Pulse", 12,
+        "Spect. Pulse", 12,
         {"Trigger": 0, "Low-pass": LOWPASS_OFF, "Master Gain": 0, TUNE: 540,
          "L1: Body Decay": 345, DRIVE: 20, "L1: Snap Level": 75, "L1: Snap Center": 720,
          "L1: Snap Bandwidth": 38, "L1: Dispersion": 12},
