@@ -41,8 +41,8 @@ impl Scope {
     }
 
     #[cfg(test)]
-    pub fn capture(&mut self, samples: &mut [f32], rate: u32, finish: impl FnMut(&mut f32)) {
-        let peak = self.capture_columns(samples, rate, 0..WIDTH, finish);
+    pub fn capture(&mut self, samples: &mut [f32], rate: u32, mut finish: impl FnMut(&mut f32)) {
+        let peak = self.capture_columns(samples, rate, 0..WIDTH, |sample, _| finish(sample));
         self.finish_capture(peak);
     }
 
@@ -51,7 +51,7 @@ impl Scope {
         samples: &mut [f32],
         rate: u32,
         columns: core::ops::Range<usize>,
-        mut finish: impl FnMut(&mut f32),
+        mut finish: impl FnMut(&mut f32, usize),
     ) -> f32 {
         let plot_frames = rate as usize;
         let mut peak = 0.0_f32;
@@ -71,11 +71,11 @@ impl Scope {
                 *column = [0, 0];
                 continue;
             };
-            finish(first);
+            finish(first, start);
             let mut min = *first;
             let mut max = *first;
-            for sample in rest {
-                finish(sample);
+            for (index, sample) in rest.iter_mut().enumerate() {
+                finish(sample, start + index + 1);
                 min = min.min(*sample);
                 max = max.max(*sample);
             }

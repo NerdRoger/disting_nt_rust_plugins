@@ -1081,7 +1081,7 @@ fn one_second_cap_fades_and_finishes_all_models_and_the_filter_tail() {
             1000
         );
         let slot = host.complete();
-        assert!((47_760..47_999).any(|frame| host.sample(slot, frame).abs() > 0.000_001));
+        assert!((45_600..46_560).any(|frame| host.sample(slot, frame).abs() > 0.000_001));
         assert_eq!(host.sample(slot, 47_999), 0.0);
 
         host.step([5.0; 4]);
@@ -1210,6 +1210,34 @@ fn master_drive_applies_safety_trim_after_clipping() {
     for (frame, sample) in reference.into_iter().enumerate() {
         let actual = host.sample(driven, frame);
         assert!((actual - (sample * boost / peak).clamp(-1.0, 1.0)).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn final_taper_preserves_short_kicks_and_only_changes_the_capped_mix() {
+    for (decay, capped) in [(500, false), (940, true)] {
+        let mut host = Host::new(1);
+        let base = model_index(0);
+        host.set(GAIN, 0);
+        host.set(base + LAYER_LEVEL, 10);
+        host.set(base + LAYER_FIRST_CONTROL + 1, decay);
+        host.step([0.0; 4]);
+        let output = host.complete();
+        let layer = host.layer_slot(0);
+        for frame in 23_976..24_000 {
+            assert_eq!(host.sample(output, frame), host.sample(layer, frame) * 0.1);
+        }
+        let attenuation = if capped { 0.77 } else { 1.0 };
+        let mut has_tail = false;
+        for frame in 35_960..36_000 {
+            let dry = host.sample(layer, frame) * 0.1;
+            has_tail |= dry.abs() > 1e-6;
+            assert!(
+                (host.sample(output, frame) - dry * attenuation).abs() < dry.abs() * 0.006 + 1e-7
+            );
+        }
+        assert!(has_tail);
+        assert_eq!(host.sample(output, 47_999), 0.0);
     }
 }
 

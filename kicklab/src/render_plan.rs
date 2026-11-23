@@ -1,7 +1,7 @@
 use super::{
-    cpu_cycle_count, db_gain, layer_frames, layer_slot, milliseconds, mix_pair, mix_single,
-    mix_tile, render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput, Model,
-    RenderTiming, WaveBuffers, MAX_LAYERS, MIN_TILED_LAYERS, RELEASE_FADE_MS,
+    cpu_cycle_count, db_gain, layer_frames, layer_slot, mix_pair, mix_single, mix_tile,
+    render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput, Model,
+    RenderTiming, WaveBuffers, MAX_LAYERS, MIN_TILED_LAYERS,
 };
 use crate::Scope;
 
@@ -18,7 +18,6 @@ enum Stage {
     Filter,
     Peak,
     Drive,
-    Fade,
     Scope,
 }
 
@@ -38,7 +37,6 @@ pub struct RenderPlan {
     gain: f32,
     boost: Option<f32>,
     filter: Option<Lowpass>,
-    fade: usize,
     peak: f32,
     display_peak: f32,
 }
@@ -65,17 +63,12 @@ impl RenderPlan {
             }
         }
         let cutoff = f32::from(job.cutoff).min(job.rate as f32 * 0.45);
-        let (filter, length, fade) = if dry_length != 0 && cutoff > 0.0 {
+        let (filter, length) = if dry_length != 0 && cutoff > 0.0 {
             let tail = (job.rate as f32 * (3.0 / cutoff).max(0.005)) as usize + 1;
             let end = (dry_length + tail).min(max_frames);
-            let fade = if end < dry_length + tail {
-                milliseconds(job.rate, RELEASE_FADE_MS).min(end)
-            } else {
-                0
-            };
-            (Some(Lowpass::new(cutoff / job.rate as f32)), end, fade)
+            (Some(Lowpass::new(cutoff / job.rate as f32)), end)
         } else {
-            (None, dry_length, 0)
+            (None, dry_length)
         };
         Self {
             stage: if dry_length == 0 {
@@ -91,7 +84,6 @@ impl RenderPlan {
             gain: db_gain(job.gain),
             boost: (job.drive > 0.0).then(|| db_gain(job.drive)),
             filter,
-            fade,
             peak: 1.0,
             display_peak: 0.0,
         }
@@ -155,7 +147,7 @@ impl RenderPlan {
                         self.enter(if self.boost.is_some() {
                             Stage::Drive
                         } else {
-                            Stage::Fade
+                            Stage::Scope
                         });
                     }
                 }
@@ -188,37 +180,31 @@ impl RenderPlan {
                     self.position = end;
                     if end == self.length {
                         self.peak = 1.0;
-                        self.enter(if self.filter.is_some() {
-                            Stage::Fade
-                        } else {
-                            Stage::Scope
-                        });
+                        self.enter(Stage::Scope);
                     }
-                }
-                Stage::Fade => {
-                    if self.fade != 0 {
-                        let scale = (self.fade as f32).recip();
-                        for (remaining, sample) in samples
-                            .get_mut(..self.length)?
-                            .iter_mut()
-                            .rev()
-                            .take(self.fade)
-                            .enumerate()
-                        {
-                            *sample *= remaining as f32 * scale;
-                        }
-                    }
-                    self.enter(Stage::Scope);
                 }
                 Stage::Scope => {
                     let end = (self.position + SCOPE_COLUMNS).min(Scope::COLUMNS);
                     let mix = samples.get_mut(..self.length)?;
                     let range = self.position..end;
-                    let peak = if self.peak > 1.0 {
-                        let trim = self.peak.recip();
-                        scope.capture_columns(mix, job.rate, range, |sample| *sample *= trim)
+                    let trim = if self.peak > 1.0 {
+                        self.peak.recip()
                     } else {
-                        scope.capture_columns(mix, job.rate, range, |_| {})
+                        1.0
+                    };
+                    let taper = if end > Scope::COLUMNS / 2 {
+                        TailTaper::for_render(mix.len(), job.rate)
+                    } else {
+                        None
+                    };
+                    let peak = if let Some(taper) = taper {
+                        scope.capture_columns(mix, job.rate, range, |sample, frame| {
+                            *sample *= trim * taper.gain(frame);
+                        })
+                    } else if trim < 1.0 {
+                        scope.capture_columns(mix, job.rate, range, |sample, _| *sample *= trim)
+                    } else {
+                        scope.capture_columns(mix, job.rate, range, |_, _| {})
                     };
                     self.display_peak = self.display_peak.max(peak);
                     self.position = end;
@@ -327,11 +313,62 @@ impl RenderPlan {
                 timing.mix = timing.mix.saturating_add(cycles);
                 return;
             }
-            Stage::Filter | Stage::Fade => &mut timing.lowpass,
+            Stage::Filter => &mut timing.lowpass,
             Stage::Drive if self.filter.is_some() => &mut timing.lowpass,
             Stage::Peak | Stage::Drive => &mut timing.gain_and_peak,
             Stage::Scope => &mut timing.scope,
         };
         *field = Some(field.unwrap_or(0).saturating_add(cycles));
+    }
+}
+
+struct TailTaper {
+    start: usize,
+    last: usize,
+    step: f32,
+}
+
+impl TailTaper {
+    fn for_render(length: usize, rate: u32) -> Option<Self> {
+        if length != rate as usize || length < 3 {
+            return None;
+        }
+        let start = length / 2;
+        let last = length - 1;
+        Some(Self {
+            start,
+            last,
+            step: ((last - start) as f32).recip(),
+        })
+    }
+
+    fn gain(&self, frame: usize) -> f32 {
+        if frame >= self.last {
+            return 0.0;
+        }
+        let progress = frame.saturating_sub(self.start) as f32 * self.step;
+        // The cubic starts gently. Squaring its complement gives zero slope
+        // at the last sample as well as a zero amplitude.
+        let remaining = 1.0 - progress * progress * progress;
+        remaining * remaining
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TailTaper;
+
+    #[test]
+    fn full_length_taper_starts_at_half_a_second_and_ends_at_zero() {
+        for rate in [32_000, 44_100, 48_000, 96_000, 192_000] {
+            let frames = rate as usize;
+            assert!(TailTaper::for_render(frames - 1, rate).is_none());
+            let taper = TailTaper::for_render(frames, rate).unwrap();
+            assert_eq!(taper.gain(frames / 2 - 1), 1.0);
+            assert_eq!(taper.gain(frames / 2), 1.0);
+            assert!((taper.gain(frames * 3 / 4) - 0.765625).abs() < 0.0001);
+            assert!(taper.gain(frames - 2) < 0.000001);
+            assert_eq!(taper.gain(frames - 1), 0.0);
+        }
     }
 }
