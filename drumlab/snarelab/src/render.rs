@@ -14,7 +14,7 @@ use self::{
     punch::{body_duration, rim_duration, shape_punch, wires_duration},
     voice::Voice,
 };
-use crate::{layer_slot, lookup::Lookup, Job, LayerPatch, Model, Scope, WaveBuffers, MAX_LAYERS};
+use crate::{layer_slot, lookup::Lookup, Job, Layer, LayerPatch, Model, Scope, WaveBuffers, MAX_LAYERS};
 
 const MAX_MS: u32 = 750;
 const TAPER_MS: u32 = 650;
@@ -98,10 +98,7 @@ pub(super) struct RenderPlan {
 
 impl RenderPlan {
     pub(super) fn new(job: &Job, capacity: usize) -> Self {
-        let solo = job
-            .layers
-            .iter()
-            .any(|layer| layer.patch.model != Model::Off && layer.solo);
+        let solo = Layer::solo_active(&job.layers);
         let mut inputs = [None; MAX_LAYERS];
         let mut punch = [0.0; MAX_LAYERS];
         let mut has_punch = false;

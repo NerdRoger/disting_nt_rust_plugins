@@ -2,6 +2,8 @@
 #![no_std]
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+#[path = "../../layered-drums/layer.rs"]
+mod layer;
 #[path = "../../layered-drums/layer_page.rs"]
 mod layer_page;
 #[path = "../../layered-drums/lookup.rs"]
@@ -107,6 +109,10 @@ enum Model {
     Wavefold,
     DelayDrum,
     SpectralPulse,
+}
+
+impl layer::LayerModel for Model {
+    const OFF: Self = Self::Off;
 }
 
 impl Model {
@@ -363,40 +369,8 @@ const SPECTRAL_PULSE: [Control; 7] = [
 ];
 const UNUSED: Definition = definition(c"Unused", 0, 0, 0, UNIT_NONE, SCALING_NONE);
 
-#[derive(Clone, Copy, PartialEq)]
-struct LayerPatch {
-    model: Model,
-    controls: [f32; CONTROLS],
-}
-impl LayerPatch {
-    const OFF: Self = Self {
-        model: Model::Off,
-        controls: [0.0; CONTROLS],
-    };
-}
-
-#[derive(Clone, Copy)]
-struct Layer {
-    patch: LayerPatch,
-    level: f32,
-    solo: bool,
-    mute: bool,
-}
-impl Layer {
-    const OFF: Self = Self {
-        patch: LayerPatch::OFF,
-        level: 0.0,
-        solo: false,
-        mute: false,
-    };
-
-    fn audible(&self, solo_active: bool) -> bool {
-        self.patch.model != Model::Off
-            && !self.mute
-            && (!solo_active || self.solo)
-            && self.level != 0.0
-    }
-}
+type LayerPatch = layer::LayerPatch<Model, CONTROLS>;
+type Layer = layer::Layer<Model, CONTROLS>;
 
 #[derive(Clone, Copy)]
 struct Job {

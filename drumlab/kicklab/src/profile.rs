@@ -75,6 +75,7 @@ static NEXT_SESSION: AtomicU32 = AtomicU32::new(1);
 // Hash the sources used for this profiling build, including the worker facade.
 const BUILD: u32 = build_id(&[
     include_bytes!("lib.rs"),
+    include_bytes!("../../layered-drums/layer.rs"),
     include_bytes!("../../layered-drums/layer_page.rs"),
     include_bytes!("../../layered-drums/lookup.rs"),
     include_bytes!("profile.rs"),

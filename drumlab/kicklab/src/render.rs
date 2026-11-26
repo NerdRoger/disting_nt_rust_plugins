@@ -11,7 +11,7 @@ use distingnt_api::api::math::exp2;
 use crate::lookup::{self, Lookup};
 use crate::profile::{GrainTiming, RenderTiming};
 use crate::{
-    layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
+    layer_slot, Job, Layer, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
     MIN_TILED_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
 
@@ -882,10 +882,7 @@ impl GrainWork {
         _timing: &mut RenderTiming,
         slice_start: u32,
     ) -> bool {
-        let solo = job
-            .layers
-            .iter()
-            .any(|layer| layer.patch.model != Model::Off && layer.solo);
+        let solo = Layer::solo_active(&job.layers);
         while let (Some(layer), Some(cache)) =
             (job.layers.get(self.layer), cached.get_mut(self.layer))
         {

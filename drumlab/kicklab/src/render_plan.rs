@@ -4,7 +4,7 @@ use super::{
     render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput, Model,
     RenderTiming, WaveBuffers, MAX_LAYERS, MIN_TILED_LAYERS,
 };
-use crate::Scope;
+use crate::{Layer, Scope};
 
 // Roughly three milliseconds on the NT. Checks occur between complete units
 // of work so each slice releases all borrowed DRAM spans before returning.
@@ -44,10 +44,7 @@ pub struct RenderPlan {
 
 impl RenderPlan {
     pub fn new(job: &Job, max_frames: usize) -> Self {
-        let solo = job
-            .layers
-            .iter()
-            .any(|layer| layer.patch.model != Model::Off && layer.solo);
+        let solo = Layer::solo_active(&job.layers);
         let mut inputs = [None; MAX_LAYERS];
         let mut count = 0;
         let mut dry_length = 0;
