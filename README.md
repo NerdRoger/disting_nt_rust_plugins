@@ -7,9 +7,12 @@ in `NerdRoger/disting_nt_plugins`. Production plugins depend only on the safe AP
 - `distingnt-api`: safe Rust registration, host adapters and callback interfaces.
 - `window-comparator`: safe Rust Window Comparator plugin.
 - `wavesmith`: live segmented oscillator with 2–32 curved sections and an always-visible help footer; see [user guide](wavesmith/README.md) and [developer notes](wavesmith/Developer.md).
-- `kicklab`: kick drum with 1–8 layers (default 1) and Pitch Sweep, Modal Drum, Bit Logic, Grain Cloud,
-  Hard Sync, Resonator, Two Op. FM, Noise Sweep, Ring Mod, Wavefold, Delay Drum,
-  and Spect. Pulse.
+- [`drumlab`](drumlab) groups the drum plugins and their shared code.
+  - [`kicklab`](drumlab/kicklab) has 1–8 layers (default 1) and Pitch Sweep, Modal Drum, Bit Logic, Grain Cloud,
+    Hard Sync, Resonator, Two Op. FM, Noise Sweep, Ring Mod, Wavefold, Delay Drum,
+    and Spect. Pulse.
+  - [`snarelab`](drumlab/snarelab) has 2–5 layers (default 3), three body models, two wire models, and Rim Shot. Randomize Layers picks a body, wires, and an optional rim.
+  - [`layered-drums`](drumlab/layered-drums) contains the shared playback, scope, and DSP code.
 - `monosynth`: Rust port of [Expert Sleepers' C++ monosynth example](https://github.com/expertsleepersltd/distingNT_API/blob/main/examples/monosynth.cpp), created as a Rust learning experiment.
 - `distingNT_API`: independent upstream Git submodule, pinned to `1780254aebc3c73b96c351a7b12c325d1f983402`.
 - `tools`: ABI, layering and loader validation.
@@ -34,7 +37,7 @@ cargo fmt --all -- --check
 ```
 
 Build outputs are `plugins/wavesmith.o`, `plugins/rust-window-comparator.o`,
-`plugins/rusttest.o` (the monosynth), and `plugins/kicklab.o`. Cargo intermediates
+`plugins/rusttest.o` (the monosynth), `plugins/kicklab.o`, and `plugins/snarelab.o`. Cargo intermediates
 live in ignored `target/`. KickLab requires API-v15-capable firmware for background
 rendering. The other plugins require API-v14-capable firmware.
 

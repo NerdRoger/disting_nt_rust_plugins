@@ -163,7 +163,6 @@ impl Player {
         };
     }
 
-    #[cfg(feature = "profiling-hold-playback")]
     pub fn has_waveform(&self) -> bool {
         self.current.active()
     }
@@ -184,7 +183,7 @@ impl Player {
     }
 
     fn trigger(&mut self) {
-        if !self.current.active() {
+        if !self.has_waveform() {
             return;
         }
         if let Some(voice) = self.voices.iter_mut().find(|voice| !voice.active()) {

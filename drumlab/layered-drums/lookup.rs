@@ -1,4 +1,4 @@
-//! Waveform math shared by all KickLab instances on the loaded factory.
+//! Waveform math shared by instances of a drum plugin on the loaded factory.
 use core::f32::consts::LOG2_E;
 use core::mem::size_of;
 use distingnt_api::api::{
@@ -82,7 +82,7 @@ pub fn drive(tables: Option<Lookup<'_>>, value: f32) -> f32 {
 #[inline(never)]
 pub fn pitch_multiplier(tables: Option<Lookup<'_>>, octaves: f32) -> f32 {
     if let Some(tables) = tables {
-        // KickLab's pitch sweep is specified in 0..60 semitones. Using a
+        // The fast path spans 0..60 semitones. Using a
         // fractional octave table keeps interpolation error near f32 precision.
         if (0.0..=5.0).contains(&octaves) {
             let whole = octaves as u32;

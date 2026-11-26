@@ -1,3 +1,4 @@
+use super::drum_mix::TailTaper;
 use super::{
     cpu_cycle_count, db_gain, layer_frames, layer_slot, mix_pair, mix_single, mix_tile,
     render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput, Model,
@@ -193,7 +194,7 @@ impl RenderPlan {
                         1.0
                     };
                     let taper = if end > Scope::COLUMNS / 2 {
-                        TailTaper::for_render(mix.len(), job.rate)
+                        tail_taper(mix.len(), job.rate)
                     } else {
                         None
                     };
@@ -322,48 +323,23 @@ impl RenderPlan {
     }
 }
 
-struct TailTaper {
-    start: usize,
-    last: usize,
-    step: f32,
-}
-
-impl TailTaper {
-    fn for_render(length: usize, rate: u32) -> Option<Self> {
-        if length != rate as usize || length < 3 {
-            return None;
-        }
-        let start = length / 2;
-        let last = length - 1;
-        Some(Self {
-            start,
-            last,
-            step: ((last - start) as f32).recip(),
-        })
+fn tail_taper(length: usize, rate: u32) -> Option<TailTaper> {
+    if length != rate as usize || length < 3 {
+        return None;
     }
-
-    fn gain(&self, frame: usize) -> f32 {
-        if frame >= self.last {
-            return 0.0;
-        }
-        let progress = frame.saturating_sub(self.start) as f32 * self.step;
-        // The cubic starts gently. Squaring its complement gives zero slope
-        // at the last sample as well as a zero amplitude.
-        let remaining = 1.0 - progress * progress * progress;
-        remaining * remaining
-    }
+    Some(TailTaper::new(length / 2, length - 1))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TailTaper;
+    use super::tail_taper;
 
     #[test]
     fn full_length_taper_starts_at_half_a_second_and_ends_at_zero() {
         for rate in [32_000, 44_100, 48_000, 96_000, 192_000] {
             let frames = rate as usize;
-            assert!(TailTaper::for_render(frames - 1, rate).is_none());
-            let taper = TailTaper::for_render(frames, rate).unwrap();
+            assert!(tail_taper(frames - 1, rate).is_none());
+            let taper = tail_taper(frames, rate).unwrap();
             assert_eq!(taper.gain(frames / 2 - 1), 1.0);
             assert_eq!(taper.gain(frames / 2), 1.0);
             assert!((taper.gain(frames * 3 / 4) - 0.765625).abs() < 0.0001);

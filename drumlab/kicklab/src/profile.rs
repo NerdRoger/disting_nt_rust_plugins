@@ -75,20 +75,24 @@ static NEXT_SESSION: AtomicU32 = AtomicU32::new(1);
 // Hash the sources used for this profiling build, including the worker facade.
 const BUILD: u32 = build_id(&[
     include_bytes!("lib.rs"),
-    include_bytes!("lookup.rs"),
+    include_bytes!("../../layered-drums/layer_page.rs"),
+    include_bytes!("../../layered-drums/lookup.rs"),
     include_bytes!("profile.rs"),
-    include_bytes!("playback.rs"),
+    include_bytes!("../../layered-drums/playback.rs"),
+    include_bytes!("../../layered-drums/random.rs"),
     include_bytes!("render.rs"),
     include_bytes!("render_plan.rs"),
-    include_bytes!("scope.rs"),
+    include_bytes!("../../layered-drums/scope.rs"),
+    include_bytes!("../../layered-drums/mix.rs"),
+    include_bytes!("../../layered-drums/wave_math.rs"),
     include_bytes!("extra_models.rs"),
     include_bytes!("spectral.rs"),
     include_bytes!("../Cargo.toml"),
-    include_bytes!("../../Cargo.lock"),
-    include_bytes!("../../.cargo/config.toml"),
-    include_bytes!("../../distingnt-api/src/api/plugin.rs"),
-    include_bytes!("../../distingnt-api/src/api/background.rs"),
-    include_bytes!("../../distingnt-api/src/api/static_dram.rs"),
+    include_bytes!("../../../Cargo.lock"),
+    include_bytes!("../../../.cargo/config.toml"),
+    include_bytes!("../../../distingnt-api/src/api/plugin.rs"),
+    include_bytes!("../../../distingnt-api/src/api/background.rs"),
+    include_bytes!("../../../distingnt-api/src/api/static_dram.rs"),
 ]) ^ cfg!(feature = "profiling-hold-playback") as u32
     ^ ((cfg!(feature = "profiling-no-click-rebuild") as u32) << 1);
 

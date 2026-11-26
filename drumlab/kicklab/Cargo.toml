@@ -9,10 +9,10 @@ profiling-hold-playback = ["profiling"]
 profiling-no-click-rebuild = ["profiling-hold-playback"]
 
 [dependencies]
-distingnt-api = { path = "../distingnt-api" }
+distingnt-api = { path = "../../distingnt-api" }
 
 [lib]
 crate-type = ["staticlib", "rlib"]
 
 [dev-dependencies]
-distingnt-sys = { path = "../distingnt-sys" }
+distingnt-sys = { path = "../../distingnt-sys" }

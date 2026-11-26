@@ -1,0 +1,16 @@
+[package]
+name = "snarelab"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+profiling = []
+
+[dependencies]
+distingnt-api = { path = "../../distingnt-api" }
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dev-dependencies]
+distingnt-sys = { path = "../../distingnt-sys" }

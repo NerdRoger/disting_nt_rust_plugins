@@ -1,24 +1,18 @@
-//! Layered mono kick drum with confirmed model selection and rendered hits.
+//! Layered snare synthesis with background-rendered hits.
 #![no_std]
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+#[path = "../../layered-drums/layer_page.rs"]
+mod layer_page;
+#[path = "../../layered-drums/lookup.rs"]
 mod lookup;
+#[path = "../../layered-drums/playback.rs"]
 mod playback;
-#[cfg(feature = "profiling")]
-mod profile;
+#[path = "../../layered-drums/random.rs"]
+mod random;
 mod render;
+#[path = "../../layered-drums/scope.rs"]
 mod scope;
-#[cfg(not(feature = "profiling"))]
-mod profile {
-    #[derive(Clone, Copy)]
-    pub struct Meter;
-    impl Meter {
-        pub const EMPTY: Self = Self;
-    }
-    pub type RenderTiming = ();
-    pub type GrainTiming = ();
-    pub const NO_RENDER_TIMING: RenderTiming = ();
-}
 
 use distingnt_api::api::cpu_cycle_count;
 
@@ -28,7 +22,7 @@ use distingnt_api::{
         audio::bus_index,
         background::DramBuffers,
         drawing::Canvas,
-        metadata::{Definition, EnumStrings, Name},
+        metadata::{Definition, Name},
         parameters::{scaled_value, Audio, ReadOnly, Ui},
         plugin::{
             Configuration, Context, Metadata, Plugin, RegionInitializer, SharedResources,
@@ -38,125 +32,70 @@ use distingnt_api::{
     },
     *,
 };
+use layer_page::{
+    add_layer_controls, definition, page_name_storage, page_names, write_text, PageNameBytes,
+    LAYER_FIRST_CONTROL, LAYER_LEVEL, LAYER_MUTE, LAYER_RANDOMIZE, LAYER_SOLO,
+};
 use playback::Player;
+use random::random_value;
 use scope::Scope;
 
-const MAX_LAYERS: usize = 8;
+const MIN_LAYERS: usize = 2;
+const MAX_LAYERS: usize = 5;
 const MIN_OUTPUT_BUFFERS: usize = 2;
 const DEFAULT_OUTPUT_BUFFERS: usize = 6;
 const MAX_OUTPUT_BUFFERS: usize = 10;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
-const CUTOFF: usize = 3;
-const MASTER_DRIVE: usize = 4;
-const GAIN: usize = 5;
-const CUTOFF_OFF: i16 = 101;
-const RANDOMIZE_LAYERS: usize = 6;
-const GLOBALS: usize = 7;
+const MASTER_DRIVE: usize = 3;
+const GAIN: usize = 4;
+const RANDOMIZE_LAYERS: usize = 5;
+const GLOBALS: usize = 6;
+const LEGACY_CONTROLS: usize = 9;
 const CONTROLS: usize = 10;
-// Each layer has a fixed-width parameter block in page order.
-const LAYER_RANDOMIZE: usize = 1;
-const LAYER_LEVEL: usize = 2;
-const LAYER_SOLO: usize = 3;
-const LAYER_MUTE: usize = 4;
-const LAYER_FIRST_CONTROL: usize = 5;
-const LAYER_FIELDS: usize = LAYER_FIRST_CONTROL + CONTROLS;
-const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [
-    b"L1: ", b"L2: ", b"L3: ", b"L4: ", b"L5: ", b"L6: ", b"L7: ", b"L8: ",
-];
-const MODEL_NAMES: [&CStr; 13] = [
+const MAX_PAGE_FIELDS: usize = LAYER_FIRST_CONTROL + CONTROLS;
+const LAYER_FIELDS: usize = LAYER_FIRST_CONTROL + LEGACY_CONTROLS;
+const LAYER_PREFIXES: [&[u8]; MAX_LAYERS] = [b"L1: ", b"L2: ", b"L3: ", b"L4: ", b"L5: "];
+const MODEL_NAMES: [&CStr; 9] = [
     c"Off",
     c"Pitch Sweep",
-    c"Modal Drum",
-    c"Bit Logic",
-    c"Grain Cloud",
-    c"Hard Sync",
     c"Resonator",
-    c"Two Op. FM",
-    c"Noise Sweep",
-    c"Ring Mod",
-    c"Wavefold",
-    c"Delay Drum",
-    c"Spect. Pulse",
+    c"Modal Body",
+    c"Two-Stage",
+    c"Snare Wires",
+    c"Reson. Wires",
+    c"Sweep Wires",
+    c"Rim Shot",
 ];
-const LAYER_PAGE_NAME_BYTES: usize = 15;
-static LAYER_PAGE_NAME_STORAGE: [[[u8; LAYER_PAGE_NAME_BYTES]; MODEL_NAMES.len()]; MAX_LAYERS] = {
-    let mut names = [[[0; LAYER_PAGE_NAME_BYTES]; MODEL_NAMES.len()]; MAX_LAYERS];
-    let mut layer = 0;
-    while layer < MAX_LAYERS {
-        let mut model = 0;
-        while model < MODEL_NAMES.len() {
-            let prefix = [b'1' + layer as u8, b'-'];
-            let name = MODEL_NAMES[model].to_bytes_with_nul();
-            let mut index = 0;
-            while index < prefix.len() {
-                names[layer][model][index] = prefix[index];
-                index += 1;
-            }
-            let mut index = 0;
-            while index < name.len() {
-                names[layer][model][prefix.len() + index] = name[index];
-                index += 1;
-            }
-            model += 1;
-        }
-        layer += 1;
-    }
-    names
-};
-static LAYER_PAGE_NAMES: [[Name; MODEL_NAMES.len()]; MAX_LAYERS] = {
-    let mut names = [[Name::new(c""); MODEL_NAMES.len()]; MAX_LAYERS];
-    let mut layer = 0;
-    while layer < MAX_LAYERS {
-        let mut model = 0;
-        while model < MODEL_NAMES.len() {
-            let Ok(name) = CStr::from_bytes_until_nul(&LAYER_PAGE_NAME_STORAGE[layer][model])
-            else {
-                panic!("layer page name must be NUL-terminated");
-            };
-            names[layer][model] = Name::new(name);
-            model += 1;
-        }
-        layer += 1;
-    }
-    names
-};
-static OPERATIONS: EnumStrings<4> = EnumStrings::new([c"XOR", c"AND", c"OR", c"Wrap Add"]);
-static OFF_ON: EnumStrings<2> = EnumStrings::new([c"Off", c"On"]);
-
+static LAYER_PAGE_NAME_STORAGE: [[PageNameBytes; MODEL_NAMES.len()]; MAX_LAYERS] =
+    page_name_storage(&MODEL_NAMES);
+static LAYER_PAGE_NAMES: [[Name; MODEL_NAMES.len()]; MAX_LAYERS] =
+    page_names(&LAYER_PAGE_NAME_STORAGE);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Model {
     Off,
     PitchSweep,
-    ModalDrum,
-    BitLogic,
-    GrainCloud,
-    HardSync,
     Resonator,
-    TwoOperatorFm,
-    NoiseSweep,
-    RingMod,
-    Wavefold,
-    DelayDrum,
-    SpectralPulse,
+    Modal,
+    TwoStage,
+    Wires,
+    ResonantWires,
+    SweepWires,
+    Rim,
 }
 
 impl Model {
     fn from_value(value: i16) -> Self {
         match value {
             1 => Self::PitchSweep,
-            2 => Self::ModalDrum,
-            3 => Self::BitLogic,
-            4 => Self::GrainCloud,
-            5 => Self::HardSync,
-            6 => Self::Resonator,
-            7 => Self::TwoOperatorFm,
-            8 => Self::NoiseSweep,
-            9 => Self::RingMod,
-            10 => Self::Wavefold,
-            11 => Self::DelayDrum,
-            12 => Self::SpectralPulse,
+            2 => Self::Resonator,
+            3 => Self::Modal,
+            4 => Self::TwoStage,
+            5 => Self::Wires,
+            6 => Self::ResonantWires,
+            7 => Self::SweepWires,
+            8 => Self::Rim,
             _ => Self::Off,
         }
     }
@@ -165,30 +104,15 @@ impl Model {
         match self {
             Self::Off => &[],
             Self::PitchSweep => &PITCH_SWEEP,
-            Self::ModalDrum => &MODAL_DRUM,
-            Self::BitLogic => &BIT_LOGIC,
-            Self::GrainCloud => &GRAIN_CLOUD,
-            Self::HardSync => &HARD_SYNC,
             Self::Resonator => &RESONATOR,
-            Self::TwoOperatorFm => &TWO_OPERATOR_FM,
-            Self::NoiseSweep => &NOISE_SWEEP,
-            Self::RingMod => &RING_MOD,
-            Self::Wavefold => &WAVEFOLD,
-            Self::DelayDrum => &DELAY_DRUM,
-            Self::SpectralPulse => &SPECTRAL_PULSE,
+            Self::Modal => &MODAL,
+            Self::Wires => &WIRES,
+            Self::SweepWires => &SWEEP_WIRES,
+            Self::Rim => &RIM,
+            Self::TwoStage => &TWO_STAGE,
+            Self::ResonantWires => &RESONANT_WIRES,
         }
     }
-}
-
-const fn definition(
-    name: &'static CStr,
-    min: i16,
-    max: i16,
-    initial: i16,
-    unit: u8,
-    scale: u8,
-) -> Definition {
-    Definition::new(name, min, max, initial, unit, scale, None).unwrap()
 }
 
 #[derive(Clone, Copy)]
@@ -198,6 +122,7 @@ struct Control {
     initial: i16,
     unit: u8,
     scale: u8,
+    step: i16,
 }
 
 impl Control {
@@ -208,6 +133,7 @@ impl Control {
         initial: i16,
         unit: u8,
         scale: u8,
+        step: i16,
     ) -> Self {
         Self {
             name,
@@ -215,11 +141,11 @@ impl Control {
             initial,
             unit,
             scale,
+            step,
         }
     }
 
     fn definition(self) -> Option<Definition> {
-        let enums = (self.unit == UNIT_ENUM).then(|| OPERATIONS.table());
         Definition::new(
             self.name,
             self.range[0],
@@ -227,7 +153,7 @@ impl Control {
             self.initial,
             self.unit,
             self.scale,
-            enums,
+            None,
         )
     }
 
@@ -236,178 +162,135 @@ impl Control {
     }
 }
 
-const fn tune(name: &'static CStr, initial: i16) -> Control {
-    Control::new(name, 250, 1200, initial, UNIT_HZ, SCALING_10)
+const fn hz(name: &'static CStr, min: i16, max: i16, initial: i16, step: i16) -> Control {
+    Control::new(name, min, max, initial, UNIT_HZ, SCALING_NONE, step)
 }
-const fn decay(initial: i16) -> Control {
-    Control::new(c"Body Decay", 45, 1000, initial, UNIT_MS, SCALING_NONE)
-}
-const fn drive(initial: i16) -> Control {
-    Control::new(c"Drive", 0, 240, initial, UNIT_DB, SCALING_10)
-}
-const fn depth(initial: i16) -> Control {
-    Control::new(c"Sweep Depth", 0, 60, initial, UNIT_SEMITONES, SCALING_NONE)
-}
-const fn time(initial: i16) -> Control {
-    Control::new(c"Sweep Time", 1, 200, initial, UNIT_MS, SCALING_NONE)
+const fn ms(name: &'static CStr, min: i16, max: i16, initial: i16) -> Control {
+    Control::new(name, min, max, initial, UNIT_MS, SCALING_NONE, 1)
 }
 const fn percent(name: &'static CStr, initial: i16) -> Control {
-    Control::new(name, 0, 100, initial, UNIT_PERCENT, SCALING_NONE)
+    Control::new(name, 0, 100, initial, UNIT_PERCENT, SCALING_NONE, 1)
 }
-
-const PITCH_CLICK_MAX_DECAY_TENTHS_MS: i16 = 450;
-const PITCH_SWEEP: [Control; 9] = [
-    tune(c"Tail Tune", 900),
-    decay(500),
-    drive(164),
-    depth(10),
-    time(50),
-    Control::new(c"Sweep Curve", -100, 100, 15, UNIT_PERCENT, SCALING_NONE),
-    percent(c"Click Level", 20),
-    Control::new(c"Click Tone", 1100, 10_000, 3000, UNIT_HZ, SCALING_NONE),
+const fn drive(initial: i16) -> Control {
+    Control::new(c"Drive", 0, 180, initial, UNIT_DB, SCALING_10, 1)
+}
+const fn head(initial: i16) -> Control {
+    hz(c"Head Pitch", 110, 430, initial, 1)
+}
+const fn decay(initial: i16) -> Control {
+    ms(c"Body Decay", 25, 500, initial)
+}
+const fn depth(initial: i16) -> Control {
     Control::new(
-        c"Click Decay",
-        10,
-        PITCH_CLICK_MAX_DECAY_TENTHS_MS,
-        160,
-        UNIT_MS,
-        SCALING_10,
-    ),
-];
-const MODAL_DRUM: [Control; 8] = [
-    tune(c"Tail Tune", 1100),
-    decay(400),
-    drive(150),
-    percent(c"Upper Modes", 60),
-    percent(c"Damping", 20),
-    percent(c"Strike Position", 25),
-    percent(c"Beater Level", 50),
-    percent(c"Beater Hardness", 25),
-];
-const BIT_LOGIC: [Control; 10] = [
-    tune(c"Base Tune", 950),
-    decay(750),
-    drive(120),
-    depth(19),
-    time(100),
-    Control::new(c"Ramp Ratio", 100, 600, 160, UNIT_NONE, SCALING_100),
-    Control::new(c"Sample Clock", 500, 15_000, 1000, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Ramp Bits", 3, 12, 6, UNIT_NONE, SCALING_NONE),
-    Control::new(c"Logic Operation", 0, 3, 1, UNIT_ENUM, SCALING_NONE),
-    Control::new(c"Tone Cutoff", 160, 8500, 3300, UNIT_HZ, SCALING_NONE),
-];
-const GRAIN_SIZE_MAX_MS: i16 = 100;
-const GRAIN_CLOUD: [Control; 10] = [
-    tune(c"Tail Tune", 1100),
-    decay(790),
-    depth(18),
-    time(123),
-    Control::new(
-        c"Grain Size",
-        5,
-        GRAIN_SIZE_MAX_MS,
-        5,
-        UNIT_MS,
-        SCALING_NONE,
-    ),
-    Control::new(c"Grain Rate", 18, 220, 170, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Density Envelope", -30, 30, 13, UNIT_NONE, SCALING_10),
-    Control::new(c"Pitch Spread", 0, 240, 60, UNIT_SEMITONES, SCALING_10),
-    percent(c"Timing Jitter", 83),
-    drive(100),
-];
-const HARD_SYNC: [Control; 8] = [
-    tune(c"Tail Tune", 950),
-    decay(725),
-    depth(36),
-    time(160),
-    Control::new(c"Sync Bend", 0, 120, 17, UNIT_NONE, SCALING_10),
-    Control::new(c"Sync Decay", 5, 500, 100, UNIT_MS, SCALING_NONE),
-    Control::new(c"Tail Ratio", 100, 600, 220, UNIT_NONE, SCALING_100),
-    drive(150),
-];
-const RESONATOR: [Control; 9] = [
-    tune(c"Tail Tune", 375),
-    decay(1000),
-    depth(24),
-    time(40),
-    Control::new(c"Tail Pitch Drift", 0, 60, 35, UNIT_SEMITONES, SCALING_10),
-    percent(c"Excitation", 50),
-    Control::new(c"Exciter Width", 20, 300, 200, UNIT_MS, SCALING_100),
-    Control::new(c"Tone Cutoff", 180, 8000, 5500, UNIT_HZ, SCALING_NONE),
-    drive(150),
-];
-const TWO_OPERATOR_FM: [Control; 9] = [
-    tune(c"Tail Tune", 870),
-    decay(926),
-    depth(42),
-    time(32),
-    Control::new(c"FM Amount", 0, 900, 162, UNIT_NONE, SCALING_100),
-    Control::new(c"Modulator Ratio", 50, 1600, 1008, UNIT_NONE, SCALING_100),
-    Control::new(c"FM Decay", 2, 400, 307, UNIT_MS, SCALING_NONE),
-    Control::new(
-        c"Modulator Sweep",
-        -24,
-        36,
-        -23,
+        c"Sweep Depth",
+        0,
+        12,
+        initial,
         UNIT_SEMITONES,
         SCALING_NONE,
+        1,
+    )
+}
+const fn sweep_time(initial: i16) -> Control {
+    ms(c"Sweep Time", 1, 85, initial)
+}
+const fn wire_tone(initial: i16) -> Control {
+    hz(c"Wire Brightness", 800, 7800, initial, 10)
+}
+const fn wire_decay(initial: i16) -> Control {
+    ms(c"Wire Decay", 20, 500, initial)
+}
+const WIRE_DELAY: Control = Control::new(c"Wire Delay", 0, 240, 30, UNIT_MS, SCALING_10, 1);
+
+const BODY_HOLD: Control = ms(c"Body Hold", 0, 40, 0);
+const WIRE_ATTACK: Control = Control::new(c"Wire Attack", 1, 350, 7, UNIT_MS, SCALING_10, 1);
+const PITCH_SWEEP: [Control; 10] = [
+    head(195),
+    decay(110),
+    depth(5),
+    sweep_time(18),
+    Control::new(c"Sweep Curve", -100, 100, 0, UNIT_PERCENT, SCALING_NONE, 1),
+    percent(c"Click Level", 0),
+    hz(c"Click Tone", 1100, 10000, 5500, 10),
+    Control::new(c"Click Decay", 10, 450, 60, UNIT_MS, SCALING_10, 1),
+    drive(10),
+    BODY_HOLD,
+];
+const RESONATOR: [Control; 10] = [
+    head(205),
+    decay(155),
+    depth(3),
+    sweep_time(12),
+    Control::new(c"Tail Pitch Drift", 0, 60, 6, UNIT_SEMITONES, SCALING_10, 1),
+    percent(c"Excitation", 65),
+    Control::new(c"Exciter Width", 20, 150, 50, UNIT_MS, SCALING_100, 5),
+    hz(c"Tone Cutoff", 180, 8000, 2800, 10),
+    drive(10),
+    BODY_HOLD,
+];
+const MODAL: [Control; 7] = [
+    head(185),
+    decay(155),
+    percent(c"Upper Modes", 62),
+    percent(c"Damping", 48),
+    percent(c"Strike Position", 50),
+    drive(10),
+    BODY_HOLD,
+];
+const WIRES: [Control; 5] = [
+    wire_tone(3400),
+    wire_decay(260),
+    WIRE_DELAY,
+    drive(0),
+    WIRE_ATTACK,
+];
+const SWEEP_WIRES: [Control; 7] = [
+    wire_tone(3200),
+    wire_decay(250),
+    WIRE_DELAY,
+    Control::new(c"Filter Q", 50, 250, 95, UNIT_NONE, SCALING_100, 5),
+    percent(c"Grain", 84),
+    drive(0),
+    WIRE_ATTACK,
+];
+const RIM: [Control; 10] = [
+    hz(c"Rim Pitch", 400, 3000, 979, 1),
+    ms(c"Rim Decay", 8, 130, 16),
+    hz(c"Click Brightness", 2600, 14000, 5900, 10),
+    ms(c"Click Decay", 3, 60, 37),
+    drive(0),
+    percent(c"Rim Contour", 100),
+    Control::new(c"Pitch Bend", 0, 150, 100, UNIT_PERCENT, SCALING_NONE, 1),
+    Control::new(c"Snap Level", 0, 150, 100, UNIT_PERCENT, SCALING_NONE, 1),
+    percent(c"Click Focus", 100),
+    Control::new(c"Click Level", 0, 150, 100, UNIT_PERCENT, SCALING_NONE, 1),
+];
+const TWO_STAGE: [Control; 5] = [
+    head(174),
+    hz(c"Strike Pitch", 280, 900, 485, 1),
+    Control::new(c"Handoff Time", 10, 300, 107, UNIT_MS, SCALING_10, 1),
+    Control::new(c"Body Hold", 0, 400, 167, UNIT_MS, SCALING_10, 1),
+    Control::new(c"Body Length", 25, 260, 100, UNIT_PERCENT, SCALING_NONE, 1),
+];
+const RESONANT_WIRES: [Control; 7] = [
+    Control::new(c"Wire Delay", 0, 600, 186, UNIT_MS, SCALING_10, 1),
+    Control::new(c"Wire Rise", 10, 800, 311, UNIT_MS, SCALING_10, 1),
+    Control::new(c"Wire Length", 25, 200, 100, UNIT_PERCENT, SCALING_NONE, 1),
+    Control::new(
+        c"Wire Brightness",
+        0,
+        200,
+        100,
+        UNIT_PERCENT,
+        SCALING_NONE,
+        1,
     ),
-    drive(65),
+    hz(c"Tail Ring Pitch", 1000, 3000, 1674, 1),
+    percent(c"Tail Ring Level", 100),
+    Control::new(c"Noise Seed", 0, 99, 0, UNIT_NONE, SCALING_NONE, 1),
 ];
-const NOISE_SWEEP: [Control; 8] = [
-    tune(c"Tail Center", 941),
-    decay(483),
-    depth(46),
-    time(125),
-    Control::new(c"Filter Q", 5, 120, 87, UNIT_NONE, SCALING_10),
-    Control::new(c"Q Sweep", -30, 30, -25, UNIT_NONE, SCALING_10),
-    percent(c"Grain", 79),
-    drive(150),
-];
-const RING_MOD: [Control; 9] = [
-    tune(c"Tail Tune", 500),
-    decay(750),
-    depth(10),
-    time(93),
-    Control::new(c"Lower Osc Ratio", 50, 900, 485, UNIT_NONE, SCALING_100),
-    percent(c"Clang Level", 90),
-    Control::new(c"Clang Decay", 2, 600, 425, UNIT_MS, SCALING_NONE),
-    Control::new(c"Clang Pitch Env", -24, 24, 3, UNIT_SEMITONES, SCALING_NONE),
-    drive(180),
-];
-const WAVEFOLD: [Control; 9] = [
-    tune(c"Tail Tune", 960),
-    decay(730),
-    depth(24),
-    time(135),
-    Control::new(c"Fold Amount", 0, 100, 80, UNIT_NONE, SCALING_10),
-    Control::new(c"Fold Decay", 2, 650, 493, UNIT_MS, SCALING_NONE),
-    Control::new(c"Fold Bias", -80, 80, 78, UNIT_PERCENT, SCALING_NONE),
-    percent(c"Clean Sub Blend", 15),
-    drive(105),
-];
-const DELAY_DRUM: [Control; 7] = [
-    tune(c"Tail Tune", 700),
-    decay(970),
-    Control::new(c"Loop Cutoff", 250, 8500, 5200, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Strike Mix", 0, 200, 53, UNIT_PERCENT, SCALING_NONE),
-    Control::new(c"Strike Width", 5, 200, 91, UNIT_MS, SCALING_10),
-    Control::new(c"Strike Tone", 200, 8500, 3000, UNIT_HZ, SCALING_NONE),
-    drive(125),
-];
-const SPECTRAL_PULSE: [Control; 7] = [
-    tune(c"Tail Tune", 1040),
-    Control::new(c"Body Decay", 70, 850, 735, UNIT_MS, SCALING_NONE),
-    percent(c"Snap Level", 100),
-    Control::new(c"Snap Center", 180, 3800, 1549, UNIT_HZ, SCALING_NONE),
-    Control::new(c"Snap Bandwidth", 5, 100, 50, UNIT_PERCENT, SCALING_NONE),
-    Control::new(c"Dispersion", 0, 200, 191, UNIT_MS, SCALING_10),
-    drive(120),
-];
+
 const UNUSED: Definition = definition(c"Unused", 0, 0, 0, UNIT_NONE, SCALING_NONE);
-const LEVEL: Control = percent(c"Level", 100);
-const RANDOMIZE: Definition = definition(c"Randomize", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE);
 
 #[derive(Clone, Copy, PartialEq)]
 struct LayerPatch {
@@ -450,7 +333,6 @@ struct Job {
     rate: u32,
     gain: f32,
     drive: f32,
-    cutoff: i16,
     output_buffers: u8,
     layer_count: u8,
 }
@@ -460,7 +342,6 @@ impl Job {
         rate: 0,
         gain: 0.0,
         drive: 0.0,
-        cutoff: 0,
         output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
         layer_count: 0,
     };
@@ -472,7 +353,6 @@ impl Job {
                 rate: 0,
                 gain: 0.0,
                 drive: 0.0,
-                cutoff: 0,
                 output_buffers: DEFAULT_OUTPUT_BUFFERS as u8,
                 layer_count: 0,
             },
@@ -486,13 +366,11 @@ impl Job {
 #[derive(Clone, Copy)]
 struct RenderWork {
     job: Job,
-    grains: render::GrainWork,
     plan: Option<render::RenderPlan>,
     pending: bool,
     // The worker alone uses these keys and the per-layer DRAM slots.
     cached_layers: [render::CachedLayer; MAX_LAYERS],
     length: Option<usize>,
-    timing: profile::RenderTiming,
     scope: Scope,
 }
 
@@ -518,26 +396,29 @@ impl RenderWork {
         let status = buffers
             .with(slot as usize, |samples| {
                 let plan = self.plan.as_mut()?;
-                let mut render = |tile: &mut [f32]| {
-                    plan.advance(
-                        &self.job,
-                        &mut self.cached_layers,
-                        buffers,
-                        samples,
-                        tile,
-                        tables,
-                        &mut self.timing,
-                        &mut self.scope,
-                        start,
-                    )
-                };
-                let layers = usize::from(self.job.layer_count);
-                if layers >= MIN_TILED_LAYERS {
-                    let tile_slot = layer_slot(usize::from(self.job.output_buffers), layers);
-                    buffers.with(tile_slot, render).flatten()
-                } else {
-                    render(&mut [])
-                }
+                let tile_slot = layer_slot(
+                    usize::from(self.job.output_buffers),
+                    usize::from(self.job.layer_count),
+                );
+                buffers
+                    .with(tile_slot, |tile| {
+                        buffers
+                            .with(tile_slot + 1, |punch_tile| {
+                                plan.advance(
+                                    &self.job,
+                                    &mut self.cached_layers,
+                                    buffers,
+                                    samples,
+                                    tile,
+                                    punch_tile,
+                                    tables,
+                                    &mut self.scope,
+                                    start,
+                                )
+                            })
+                            .flatten()
+                    })
+                    .flatten()
             })
             .flatten();
         self.pending = matches!(status, Some(render::RenderStatus::Pending));
@@ -545,9 +426,6 @@ impl RenderWork {
             Some(render::RenderStatus::Complete(length)) => self.length = Some(length),
             None => {
                 self.length = None;
-                for layer in &mut self.cached_layers {
-                    layer.discard_prepared_grains();
-                }
             }
             Some(render::RenderStatus::Pending) => {}
         }
@@ -576,25 +454,22 @@ struct State {
     buffer_usage: playback::BufferUsage,
     player: Player,
     scope: Scope,
-    #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
-    meter: profile::Meter,
 }
 
-struct KickLab;
-static TABLE_DRAM: SharedStaticDram<KickLab> = SharedStaticDram::new();
+struct SnareLab;
+static TABLE_DRAM: SharedStaticDram<SnareLab> = SharedStaticDram::new();
 const MIX_TILE_FRAMES: usize = 512;
-const MIN_TILED_LAYERS: usize = 3;
-type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + 2 * MAX_LAYERS + 1 }>;
+type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + MAX_LAYERS + 2 }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
 
 fn layer_slot(output_buffers: usize, layer: usize) -> usize {
-    output_buffers + 2 * layer
+    output_buffers + layer
 }
 
 fn layer_count(specs: &[i32]) -> Option<usize> {
     let count = usize::try_from(*specs.first()?).ok()?;
-    (1..=MAX_LAYERS).contains(&count).then_some(count)
+    (MIN_LAYERS..=MAX_LAYERS).contains(&count).then_some(count)
 }
 
 fn output_buffer_count(specs: &[i32]) -> Option<usize> {
@@ -608,22 +483,37 @@ fn model_index(layer: usize) -> usize {
     GLOBALS + LAYER_FIELDS * layer
 }
 
-fn layer_page_indices(layer: usize) -> [u8; LAYER_FIELDS] {
-    let base = model_index(layer);
-    core::array::from_fn(|slot| (base + slot) as u8)
+// Reserve the legacy blocks at their original addresses. The tenth control
+// lives in a fixed bank so neither old mappings nor respecification move it.
+fn extra_control_index(layer: usize) -> usize {
+    model_index(MAX_LAYERS) + layer
 }
 
-fn cutoff_hz(value: i16) -> i16 {
-    if value >= CUTOFF_OFF {
-        return 0;
+fn control_index(layer: usize, slot: usize) -> usize {
+    if slot < LEGACY_CONTROLS {
+        model_index(layer) + LAYER_FIRST_CONTROL + slot
+    } else {
+        extra_control_index(layer)
     }
-    // 101 logarithmic steps from 40 Hz to 20 kHz, followed by Off.
-    let exponent = value.max(0) as f32 * (8.965_784 / 100.0);
-    (40.0 * distingnt_api::api::math::exp2(exponent) + 0.5) as i16
+}
+
+fn layer_page_indices(layer: usize) -> [u8; MAX_PAGE_FIELDS] {
+    let base = model_index(layer);
+    core::array::from_fn(|slot| {
+        if slot < LAYER_FIELDS {
+            (base + slot) as u8
+        } else {
+            extra_control_index(layer) as u8
+        }
+    })
 }
 
 fn parameter_layer(parameter: i32, layers: usize) -> Option<(usize, usize)> {
-    let offset = usize::try_from(parameter).ok()?.checked_sub(GLOBALS)?;
+    let parameter = usize::try_from(parameter).ok()?;
+    if let Some(layer) = parameter.checked_sub(extra_control_index(0)) {
+        return (layer < layers).then_some((layer, LAYER_FIELDS));
+    }
+    let offset = parameter.checked_sub(GLOBALS)?;
     let layer = offset / LAYER_FIELDS;
     (layer < layers).then_some((layer, offset % LAYER_FIELDS))
 }
@@ -640,19 +530,21 @@ fn update_model_controls(context: &mut Callback<'_, Audio>, layer: usize, restor
     *previous = model;
     let controls = model.controls();
     for slot in 0..CONTROLS {
-        let index = base + LAYER_FIRST_CONTROL + slot;
+        let index = control_index(layer, slot);
         let control = controls.get(slot).copied();
         let def = control.and_then(Control::definition).unwrap_or(UNUSED);
         // Read saved controls before the host can clamp them to the new definition.
         let value = control.map_or(0, |control| {
             if restoring {
                 let [min, max] = control.range;
-                context
-                    .read_parameters()
-                    .value(index)
-                    .unwrap_or(0)
-                    .max(min)
-                    .min(max)
+                let stored = context.read_parameters().value(index).unwrap_or(i16::MIN);
+                let legacy_wire_attack = (model == Model::Wires && slot == 4)
+                    || (model == Model::SweepWires && slot == 6);
+                if stored == i16::MIN || (legacy_wire_attack && stored == 0) {
+                    control.initial
+                } else {
+                    stored.max(min).min(max)
+                }
             } else {
                 control.initial
             }
@@ -695,22 +587,19 @@ fn restore_model_controls(context: &mut Callback<'_, Audio>) {
     state.dirty = true;
 }
 
-fn random_value(seed: &mut u32, min: i16, max: i16) -> i16 {
-    *seed ^= *seed << 13;
-    *seed ^= *seed >> 17;
-    *seed ^= *seed << 5;
-    let width = (i32::from(max) - i32::from(min) + 1) as u32;
-    let offset = ((u64::from(*seed) * u64::from(width)) >> 32) as i32;
-    (i32::from(min) + offset) as i16
-}
-
-fn randomize_model_controls(context: &mut Callback<'_, Audio>, base: usize, model: Model) {
+fn randomize_model_controls(context: &mut Callback<'_, Audio>, layer: usize, model: Model) {
     for (index, control) in model.controls().iter().enumerate() {
         let [min, max] = control.range;
-        let value = random_value(&mut context.state_mut().random_seed, min, max);
-        context
-            .parameters()
-            .set(base + LAYER_FIRST_CONTROL + index, value);
+        // A continuous uniform draw, blended 60/40 toward the web preset, then quantized.
+        let fraction =
+            random_value(&mut context.state_mut().random_seed, 0, i16::MAX) as f32 / 32768.0;
+        let value = 0.6 * f32::from(control.initial)
+            + 0.4 * (f32::from(min) + fraction * f32::from(max - min));
+        let steps = ((value - f32::from(min)) / f32::from(control.step) + 0.5) as i16;
+        context.parameters().set(
+            control_index(layer, index),
+            (min + steps * control.step).min(max),
+        );
     }
 }
 
@@ -728,7 +617,7 @@ fn randomize_layer(context: &mut Callback<'_, Audio>, layer: usize) {
     };
     context.state_mut().randomizing |= request;
     if model != Model::Off {
-        randomize_model_controls(context, base, model);
+        randomize_model_controls(context, layer, model);
         context.state_mut().dirty = true;
     }
     // Keep the same-layer guard set until the host's reset notification returns.
@@ -745,21 +634,29 @@ fn randomize_layers(context: &mut Callback<'_, Audio>) {
     }
     context.state_mut().randomizing |= request;
     let layers = context.state().layers;
-    let mut next_active = 0;
-    let mut off_start = layers;
-    for _ in 0..layers {
-        let model_value = random_value(
-            &mut context.state_mut().random_seed,
-            0,
-            (MODEL_NAMES.len() - 1) as i16,
-        );
-        let layer = if model_value == 0 {
-            off_start -= 1;
-            off_start
-        } else {
-            let layer = next_active;
-            next_active += 1;
-            layer
+    let seed = &mut context.state_mut().random_seed;
+    let body = [
+        Model::PitchSweep,
+        Model::Resonator,
+        Model::Modal,
+        Model::TwoStage,
+    ]
+    .get(random_value(seed, 0, 3) as usize)
+    .copied()
+    .unwrap_or(Model::Modal) as i16;
+    let wires = [Model::Wires, Model::SweepWires, Model::ResonantWires]
+        .get(random_value(seed, 0, 2) as usize)
+        .copied()
+        .unwrap_or(Model::Wires) as i16;
+    let wire_level = random_value(seed, 55, 85);
+    let rim = layers >= 3 && random_value(seed, 0, 1) != 0;
+    let rim_level = if rim { random_value(seed, 15, 45) } else { 100 };
+    for layer in 0..layers {
+        let (model_value, level) = match layer {
+            0 => (body, 100),
+            1 => (wires, wire_level),
+            2 if rim => (Model::Rim as i16, rim_level),
+            _ => (Model::Off as i16, 100),
         };
         let base = model_index(layer);
         if context.read_parameters().value(base) != Some(model_value) {
@@ -767,8 +664,6 @@ fn randomize_layers(context: &mut Callback<'_, Audio>) {
             // Refresh definitions even when the host defers its notification.
             update_model_controls(context, layer, false);
         }
-        let [min, max] = LEVEL.range;
-        let level = random_value(&mut context.state_mut().random_seed, min, max);
         context.parameters().set(base + LAYER_LEVEL, level);
         for offset in [LAYER_SOLO, LAYER_MUTE] {
             let parameter = base + offset;
@@ -777,7 +672,7 @@ fn randomize_layers(context: &mut Callback<'_, Audio>) {
             }
         }
         if let Some(&model) = context.state().models.get(layer) {
-            randomize_model_controls(context, base, model);
+            randomize_model_controls(context, layer, model);
         }
     }
     context.state_mut().dirty = true;
@@ -807,14 +702,7 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
         randomize_layer(context, layer);
         return;
     }
-    if !(CUTOFF as i32..model_index(layers) as i32).contains(&parameter) {
-        return;
-    }
-    #[cfg(feature = "profiling-no-click-rebuild")]
-    if parameter == (model_index(0) + LAYER_FIRST_CONTROL + 6) as i32
-        && context.state().models[0] == Model::PitchSweep
-        && context.state().player.has_waveform()
-    {
+    if layer_field.is_none() && parameter != MASTER_DRIVE as i32 && parameter != GAIN as i32 {
         return;
     }
     if let Some((layer, 0)) = layer_field {
@@ -823,29 +711,15 @@ fn handle_parameter_change(context: &mut Callback<'_, Audio>, parameter: i32) {
     context.state_mut().dirty = true;
 }
 
-fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
+fn process_render(context: &mut Callback<'_, Audio>) {
     if let Some(slot) = context.state().in_flight {
         let resume = context.with_shared_state(|state, work| {
             if work.pending {
                 return true;
             }
-            #[cfg(feature = "profiling")]
-            state.meter.record_render(work.timing);
             if let Some(length) = work.length {
-                #[cfg(feature = "profiling-hold-playback")]
-                let publish = !state.player.has_waveform();
-                #[cfg(not(feature = "profiling-hold-playback"))]
-                let publish = true;
-                if publish {
-                    #[cfg(feature = "profiling")]
-                    let start = cpu_cycle_count();
-                    state.player.publish(slot, length);
-                    state.scope = work.scope;
-                    #[cfg(feature = "profiling")]
-                    state
-                        .meter
-                        .record(profile::PUBLISH, cpu_cycle_count().wrapping_sub(start));
-                }
+                state.player.publish(slot, length);
+                state.scope = work.scope;
             } else {
                 state.dirty = true;
             }
@@ -863,8 +737,6 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
         return;
     }
     if context.state().in_flight.is_some() {
-        #[cfg(feature = "profiling")]
-        context.state_mut().meter.wait_for_worker(_frames);
         return;
     }
     let state = context.state_mut();
@@ -873,13 +745,9 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
             state.waiting_for_buffer = true;
             state.buffer_usage.record_wait();
         }
-        #[cfg(feature = "profiling")]
-        state.meter.wait_for_buffer(_frames);
         return;
     };
     state.waiting_for_buffer = false;
-    #[cfg(feature = "profiling")]
-    let submit_started = cpu_cycle_count();
     let mut job = Job {
         rate: state.rate,
         output_buffers: state.output_buffers,
@@ -889,7 +757,6 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     let parameters = context.read_parameters();
     job.gain = parameters.scaled(GAIN).unwrap_or(0.0);
     job.drive = parameters.scaled(MASTER_DRIVE).unwrap_or(0.0);
-    job.cutoff = cutoff_hz(parameters.value(CUTOFF).unwrap_or(CUTOFF_OFF));
     for (layer, (snapshot, &model)) in job
         .layers
         .iter_mut()
@@ -914,7 +781,7 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
             .enumerate()
         {
             let value = parameters
-                .value(base + LAYER_FIRST_CONTROL + index)
+                .value(control_index(layer, index))
                 .unwrap_or(control.initial);
             *decoded = control.decode(value);
         }
@@ -922,10 +789,9 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
     if context
         .with_shared_resources(|work| {
             work.job = job;
-            work.grains = render::GrainWork::EMPTY;
             work.plan = None;
             work.pending = false;
-            work.timing = profile::NO_RENDER_TIMING;
+            work.length = None;
         })
         .is_ok()
         && context.submit_audio_worker(slot as u32).is_ok()
@@ -933,34 +799,17 @@ fn process_render(context: &mut Callback<'_, Audio>, _frames: usize) {
         context.state_mut().in_flight = Some(slot);
         context.state_mut().dirty = false;
     }
-    #[cfg(feature = "profiling")]
-    context.state_mut().meter.record(
-        profile::SUBMIT,
-        cpu_cycle_count().wrapping_sub(submit_started),
-    );
 }
 
-fn write_text(output: &mut [c_char], text: &[u8]) -> i32 {
-    let length = text.len();
-    let Some(output) = output.get_mut(..=length) else {
-        return 0;
-    };
-    for (destination, &byte) in output.iter_mut().zip(text) {
-        *destination = byte as c_char;
-    }
-    output[length] = 0;
-    length as i32
-}
-
-impl Plugin for KickLab {
+impl Plugin for SnareLab {
     type State = State;
     type Region = ();
     type StateMemory = Sram;
     type ExtraRegions = Resources;
 
-    const GUID: u32 = multichar(b'A', b'T', b'k', b'l');
-    const NAME: &'static CStr = c"KickLab";
-    const DESCRIPTION: &'static CStr = c"Layered kick drum prototype";
+    const GUID: u32 = multichar(b'A', b'T', b's', b'l');
+    const NAME: &'static CStr = c"SnareLab";
+    const DESCRIPTION: &'static CStr = c"Layered snare drum";
     const TAGS: u32 = TAG_INSTRUMENT;
     const PARAMETER_TEXT: bool = true;
     const AUDIO_WORKER_STACK_SIZE: u32 = 2048;
@@ -971,9 +820,9 @@ impl Plugin for KickLab {
     const SPECIFICATIONS: &'static [Specification] = &[
         Specification {
             name: c"Max Layers",
-            min: 1,
+            min: MIN_LAYERS as i32,
             max: MAX_LAYERS as i32,
-            default: 1,
+            default: 3,
             kind: TYPE_GENERIC,
         },
         Specification {
@@ -989,9 +838,9 @@ impl Plugin for KickLab {
         let layers = layer_count(specs)?;
         output_buffer_count(specs)?;
         Some(Configuration {
-            parameters: model_index(layers),
+            parameters: extra_control_index(layers),
             pages: layers + 1,
-            page_indices: model_index(layers),
+            page_indices: GLOBALS + MAX_PAGE_FIELDS * layers,
             regions: 0,
         })
     }
@@ -1006,9 +855,7 @@ impl Plugin for KickLab {
 
     fn dram_buffer_count(specs: &[i32]) -> usize {
         match (output_buffer_count(specs), layer_count(specs)) {
-            (Some(output_buffers), Some(layers)) => {
-                layer_slot(output_buffers, layers) + usize::from(layers >= MIN_TILED_LAYERS)
-            }
+            (Some(output_buffers), Some(layers)) => layer_slot(output_buffers, layers) + 2,
             _ => 0,
         }
     }
@@ -1017,16 +864,10 @@ impl Plugin for KickLab {
         let Some(output_buffers) = output_buffer_count(specs) else {
             return 0;
         };
-        if layer_count(specs).is_some_and(|layers| {
-            layers >= MIN_TILED_LAYERS && slot == layer_slot(output_buffers, layers)
-        }) {
+        if layer_count(specs).is_some_and(|layers| slot >= layer_slot(output_buffers, layers)) {
             return MIX_TILE_FRAMES;
         }
-        if slot >= output_buffers && (slot - output_buffers) % 2 == 1 {
-            render::layer_cache_frames(rate)
-        } else {
-            Self::dram_buffer_len(specs, rate)
-        }
+        Self::dram_buffer_len(specs, rate)
     }
 
     fn initialize_state(
@@ -1049,7 +890,6 @@ impl Plugin for KickLab {
                 output_buffers: output_buffer_count(specs)? as u8,
                 random_seed: distingnt_api::api::cpu_cycle_count() | 1,
                 in_flight: None,
-                meter: profile::Meter::EMPTY,
             },
             arrays {
                 models: |_| Model::Off
@@ -1075,10 +915,8 @@ impl Plugin for KickLab {
             destination,
             RenderWork {
                 length: None,
-                grains: render::GrainWork::EMPTY,
                 plan: None,
                 pending: false,
-                timing: profile::NO_RENDER_TIMING,
             },
             arrays {
                 cached_layers: |_| render::CachedLayer::EMPTY
@@ -1097,7 +935,7 @@ impl Plugin for KickLab {
                 c"Trigger",
                 0,
                 LAST_BUS as i16,
-                1,
+                2,
                 UNIT_CV_INPUT,
                 SCALING_NONE,
             ),
@@ -1105,57 +943,54 @@ impl Plugin for KickLab {
                 c"Output",
                 0,
                 LAST_BUS as i16,
-                13,
+                14,
                 UNIT_AUDIO_OUTPUT,
                 SCALING_NONE,
             ),
             definition(c"Output Mode", 0, 1, 1, UNIT_OUTPUT_MODE, SCALING_NONE),
-            definition(
-                c"Low-pass",
-                0,
-                CUTOFF_OFF,
-                CUTOFF_OFF,
-                UNIT_HAS_STRINGS,
-                SCALING_NONE,
-            ),
             definition(c"Master Drive", 0, 240, 0, UNIT_DB, SCALING_10),
-            definition(c"Master Gain", -360, 120, 0, UNIT_DB, SCALING_10),
+            definition(c"Master Gain", -360, 120, -1, UNIT_DB, SCALING_10),
             definition(c"Randomize Layers", 0, 1, 0, UNIT_CONFIRM, SCALING_NONE),
         ];
         for (index, item) in globals.into_iter().enumerate() {
             metadata.set_parameter(index, item)?;
         }
         let indices: [u8; GLOBALS] = core::array::from_fn(|index| index as u8);
-        metadata.add_page(c"KickLab", 0, &indices)?;
+        metadata.add_page(c"SnareLab", 0, &indices)?;
         let layers = layer_count(specs)?;
-        for (layer, names) in LAYER_PAGE_NAMES.iter().enumerate().take(layers) {
+        for (layer, names) in LAYER_PAGE_NAMES.iter().enumerate() {
             let base = model_index(layer);
-            let default_model = if layer == 0 { 1 } else { 0 };
-            let model = Model::from_value(default_model);
+            let model = match layer {
+                0 => Model::TwoStage,
+                1 => Model::ResonantWires,
+                2 if layers >= 3 => Model::Rim,
+                _ => Model::Off,
+            };
             metadata.set_parameter(
                 base,
                 definition(
                     c"Model",
                     0,
                     (MODEL_NAMES.len() - 1) as i16,
-                    default_model,
+                    model as i16,
                     UNIT_CONFIRM,
                     SCALING_NONE,
                 ),
             )?;
-            metadata.set_parameter(base + LAYER_RANDOMIZE, RANDOMIZE)?;
-            metadata.set_parameter(base + LAYER_LEVEL, LEVEL.definition()?)?;
-            for (offset, name) in [(LAYER_SOLO, c"Solo"), (LAYER_MUTE, c"Mute")] {
-                let toggle =
-                    Definition::new(name, 0, 1, 0, UNIT_ENUM, SCALING_NONE, Some(OFF_ON.table()))?;
-                metadata.set_parameter(base + offset, toggle)?;
-            }
+            add_layer_controls(metadata, base)?;
             let controls = model.controls();
-            for slot in 0..CONTROLS {
-                let initial = controls.get(slot).map_or(0, |control| control.initial);
-                // Start with bounds that admit the stored raw values of any model.
+            let slots = if layer < layers {
+                CONTROLS
+            } else {
+                LEGACY_CONTROLS
+            };
+            for slot in 0..slots {
+                let initial = controls.get(slot).map_or(
+                    if slot == LEGACY_CONTROLS { i16::MIN } else { 0 },
+                    |control| control.initial,
+                );
                 metadata.set_parameter(
-                    base + LAYER_FIRST_CONTROL + slot,
+                    control_index(layer, slot),
                     definition(
                         c"Loading",
                         i16::MIN,
@@ -1166,8 +1001,10 @@ impl Plugin for KickLab {
                     ),
                 )?;
             }
-            let indices = layer_page_indices(layer);
-            metadata.add_named_page(names[model as usize], 1, &indices)?;
+            if layer < layers {
+                let indices = layer_page_indices(layer);
+                metadata.add_named_page(names[model as usize], 1, &indices)?;
+            }
         }
         Some(())
     }
@@ -1182,19 +1019,6 @@ impl Plugin for KickLab {
         if parameter == RANDOMIZE_LAYERS as i32 || matches!(layer_field, Some((_, LAYER_RANDOMIZE)))
         {
             return write_text(output, if value == 0 { b"Ready" } else { b"Randomize?" });
-        }
-        if parameter == CUTOFF as i32 {
-            let hz = cutoff_hz(value as i16);
-            if hz == 0 {
-                return write_text(output, b"Off");
-            }
-            if let Some(length) =
-                distingnt_api::api::text::format_integer_chars(output, i32::from(hz))
-            {
-                return output.get_mut(length..).map_or(length as i32, |suffix| {
-                    length as i32 + write_text(suffix, b" Hz")
-                });
-            }
         }
         if matches!(layer_field, Some((_, 0))) {
             if let Some(name) = MODEL_NAMES.get(value as usize) {
@@ -1213,17 +1037,7 @@ impl Plugin for KickLab {
     }
 
     fn parameter_changed(context: &mut Callback<'_, Audio>, parameter: i32) {
-        #[cfg(feature = "profiling")]
-        let start = cpu_cycle_count();
         handle_parameter_change(context, parameter);
-        #[cfg(feature = "profiling")]
-        {
-            let elapsed = cpu_cycle_count().wrapping_sub(start);
-            context
-                .state_mut()
-                .meter
-                .record(profile::PARAMETER_CHANGED, elapsed);
-        }
     }
 
     fn calculate_static_requirements() -> StaticRequirements {
@@ -1245,25 +1059,9 @@ impl Plugin for KickLab {
     ) {
         let start = cpu_cycle_count();
         if work.plan.is_none() {
-            work.pending = work.grains.advance(
-                &work.job,
-                &mut work.cached_layers,
-                buffers,
-                &mut work.timing,
-                start,
-            );
-            if !work.pending {
-                work.prepare_plan();
-            }
+            work.prepare_plan();
         }
-        if work.plan.is_some() {
-            work.advance_render(slot, buffers, memory, start);
-        }
-        #[cfg(feature = "profiling")]
-        {
-            let elapsed = cpu_cycle_count().wrapping_sub(start);
-            work.timing.total = Some(work.timing.total.unwrap_or(0).saturating_add(elapsed));
-        }
+        work.advance_render(slot, buffers, memory, start);
     }
     }
 
@@ -1273,16 +1071,13 @@ impl Plugin for KickLab {
             canvas,
             state.buffer_usage.peak(),
             state.buffer_usage.waits(),
+            c"750 ms",
         );
         false
     }
 
     fn step(context: &mut Callback<'_, Audio>, buses: &mut [f32], frames: usize) {
-        #[cfg(feature = "profiling")]
-        let start = cpu_cycle_count();
-        process_render(context, frames);
-        #[cfg(feature = "profiling")]
-        let scheduled = cpu_cycle_count();
+        process_render(context);
         let parameters = context.read_parameters();
         let trigger = parameters.value(TRIGGER).and_then(bus_index);
         let output = parameters.value(OUTPUT).and_then(bus_index);
@@ -1309,44 +1104,10 @@ impl Plugin for KickLab {
         state
             .buffer_usage
             .observe(occupied.count_ones() as usize, frames, state.rate);
-        #[cfg(feature = "profiling")]
-        {
-            let elapsed = cpu_cycle_count().wrapping_sub(start);
-            // Read the bus after all KickLab voices have been summed. In Add
-            // mode it can also contain earlier algorithms' contributions.
-            let peak = output
-                .and_then(|index| buses.get(index * frames..(index + 1) * frames))
-                .map(|samples| {
-                    samples
-                        .iter()
-                        .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
-                });
-            let state = context.state_mut();
-            state.meter.record(profile::STEP, elapsed);
-            state
-                .meter
-                .record(profile::SCHEDULE, scheduled.wrapping_sub(start));
-            state
-                .meter
-                .record_playback(start, diagnostics, peak, replace);
-            state.meter.record_callback_entry(start);
-            state.meter.advance(frames, state.rate);
-            if let Some(packet) = state.meter.packet(state.rate) {
-                let send_started = cpu_cycle_count();
-                context.send_midi_sysex(DESTINATION_USB, packet.as_bytes());
-                let send_elapsed = cpu_cycle_count().wrapping_sub(send_started);
-                context
-                    .state_mut()
-                    .meter
-                    .record(profile::TELEMETRY_SEND, send_elapsed);
-            }
-            let exit = cpu_cycle_count();
-            context.state_mut().meter.record_callback_exit(start, exit);
-        }
     }
 }
 
-distingnt_api::export_plugin!(KickLab);
+distingnt_api::export_plugin!(SnareLab);
 
 #[cfg(test)]
 mod tests;

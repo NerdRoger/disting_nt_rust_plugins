@@ -4,7 +4,7 @@ mod extra_models;
 #[path = "spectral.rs"]
 mod spectral;
 
-use core::f32::consts::{LOG2_E, PI, TAU};
+use core::f32::consts::{LOG2_E, TAU};
 use distingnt_api::api::cpu_cycle_count;
 use distingnt_api::api::math::exp2;
 
@@ -14,6 +14,16 @@ use crate::{
     layer_slot, Job, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
     MIN_TILED_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
+
+use wave_math::{positive_pow, sine, wrap, DampedMode};
+
+#[path = "../../layered-drums/wave_math.rs"]
+mod wave_math;
+
+use drum_mix::{db_gain, mix_pair, mix_single, mix_tile, MasterDrive, MixInput};
+
+#[path = "../../layered-drums/mix.rs"]
+mod drum_mix;
 
 const RELEASE_FADE_MS: usize = 5;
 
@@ -81,13 +91,6 @@ impl CachedLayer {
     pub fn discard_prepared_grains(&mut self) {
         self.prepared_grains = false;
     }
-}
-
-#[derive(Clone, Copy)]
-struct MixInput {
-    slot: usize,
-    end: usize,
-    level: f32,
 }
 
 #[path = "render_plan.rs"]
@@ -164,105 +167,12 @@ fn render_cached_layer(
         Some(())
     })?
 }
-
-fn mix_pair(
-    buffers: &WaveBuffers,
-    mix: &mut [f32],
-    start: usize,
-    a: MixInput,
-    b: MixInput,
-) -> Option<()> {
-    buffers.with(a.slot, |a_wave| {
-        buffers.with(b.slot, |b_wave| {
-            let a_end = a.end.saturating_sub(start).min(mix.len());
-            let b_end = b.end.saturating_sub(start).min(mix.len());
-            let a_wave = a_wave.get(start.min(a.end)..start.min(a.end) + a_end)?;
-            let b_wave = b_wave.get(start.min(b.end)..start.min(b.end) + b_end)?;
-            let shared = a_end.min(b_end);
-            let (both, tail) = mix.split_at_mut_checked(shared)?;
-            // Accumulate the first layer before the second to preserve rounding.
-            for ((mixed, &a_sample), &b_sample) in both.iter_mut().zip(a_wave).zip(b_wave) {
-                *mixed = (0.0 + a_sample * a.level) + b_sample * b.level;
-            }
-            let (longer, level) = if a_end > b_end { (a_wave, a.level) } else { (b_wave, b.level) };
-            mix_single(tail, longer.get(shared..)?, 0, level)
-        })?
-    })?
-}
-
-fn mix_single(mix: &mut [f32], wave: &[f32], length: usize, level: f32) -> Option<()> {
-    let overlap = length.min(mix.len());
-    let (old, new) = mix.split_at_mut_checked(overlap)?;
-    let (wave_old, wave_new) = wave.split_at_checked(overlap)?;
-    for (mixed, &sample) in old.iter_mut().zip(wave_old) {
-        *mixed += sample * level;
-    }
-    for (mixed, &sample) in new.iter_mut().zip(wave_new) {
-        *mixed = 0.0 + sample * level;
-    }
-    Some(())
-}
-
-fn mix_tile(
-    buffers: &WaveBuffers,
-    dest: &mut [f32],
-    tile: &mut [f32],
-    start: usize,
-    inputs: &[Option<MixInput>; MAX_LAYERS],
-) -> Option<()> {
-    // Each layer covers a prefix of the tile. Only overlap is accumulated.
-    let mut written = 0;
-    for input in inputs.iter().flatten() {
-        let frames = input.end.saturating_sub(start).min(dest.len());
-        if frames != 0 {
-            let sum = tile.get_mut(..frames)?;
-            buffers.with(input.slot, |wave| {
-                mix_single(sum, wave.get(start..start + frames)?, written, input.level)
-            })??;
-            written = written.max(frames);
-        }
-    }
-    dest.copy_from_slice(tile.get(..dest.len())?);
-    Some(())
-
-}
 }
 
 // The call boundary preserves the disjoint borrows for this small copy.
 #[inline(never)]
 fn store_patch(destination: &mut LayerPatch, source: &LayerPatch) {
     *destination = *source;
-}
-
-struct MasterDrive {
-    boost: f32,
-    ceiling: f32,
-    gain: f32,
-}
-
-impl MasterDrive {
-    fn new(boost: f32, undriven_peak: f32, gain: f32) -> Self {
-        let ceiling = undriven_peak.max(1.0);
-        // Boost and clipping are monotonic in magnitude, so the undriven
-        // peak also determines the driven peak and the final safety trim.
-        let driven_peak = (undriven_peak * boost).min(ceiling) * gain;
-        let gain = if driven_peak > 1.0 {
-            gain * driven_peak.recip()
-        } else {
-            gain
-        };
-        Self {
-            boost,
-            ceiling,
-            gain,
-        }
-    }
-
-    fn apply(&self, samples: &mut [f32]) {
-        for sample in samples {
-            *sample = (*sample * self.boost).max(-self.ceiling).min(self.ceiling) * self.gain;
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -306,50 +216,12 @@ impl Lowpass {
     }
 }
 
-fn db_gain(db: f32) -> f32 {
-    exp2(db * (core::f32::consts::LOG2_10 / 20.0))
-}
-
 fn decay_rate(milliseconds: f32, rate: u32) -> f32 {
     -2.0 * core::f32::consts::LOG2_10 * 1000.0 / (milliseconds * rate as f32)
 }
 
 fn filter_coefficient(hz: f32, rate: u32) -> f32 {
     1.0 - exp2(-TAU * LOG2_E * hz / rate as f32)
-}
-
-fn wrap(turns: f32) -> f32 {
-    turns - turns as u32 as f32
-}
-
-#[inline(never)]
-fn sine(turns: f32) -> f32 {
-    // Reduce to +/-pi/2 before evaluating the odd polynomial.
-    let angle = (4.0 * (wrap(turns + 0.25) - 0.5).abs() - 1.0) * (-PI * 0.5);
-    let squared = angle * angle;
-    angle
-        * (1.0
-            + squared
-                * (-1.0 / 6.0
-                    + squared * (1.0 / 120.0 + squared * (-1.0 / 5040.0 + squared / 362880.0))))
-}
-
-fn positive_pow(value: f32, power: f32) -> f32 {
-    if value == 0.0 {
-        return 0.0;
-    }
-    // Decompose into a power of two and a mantissa in [1, 2).
-    let bits = value.to_bits();
-    let exponent = (bits >> 23) as i32 - 127;
-    let mantissa = f32::from_bits((bits & 0x7f_ffff) | 0x3f80_0000);
-    let x = (mantissa - 1.0) / (mantissa + 1.0);
-    let squared = x * x;
-    let log = 2.0
-        * x
-        * (1.0
-            + squared
-                * (1.0 / 3.0 + squared * (1.0 / 5.0 + squared * (1.0 / 7.0 + squared / 9.0))));
-    exp2((exponent as f32 + LOG2_E * log) * power)
 }
 
 struct NoiseBand {
@@ -777,46 +649,6 @@ fn modal_modes(layer: &LayerPatch, rate: u32) -> [(f32, f32, f32); 5] {
             level * (1.0 + position * edge),
         )
     })
-}
-
-struct DampedMode {
-    phase_step: f32,
-    log2_step: f32,
-    level: f32,
-    sin_step: f32,
-    cos_step: f32,
-    sin: f32,
-    cos: f32,
-}
-
-impl DampedMode {
-    fn new((phase_step, log2_step, level): (f32, f32, f32)) -> Self {
-        let ratio = exp2(log2_step);
-        let half_sine = sine(phase_step * 0.5);
-        Self {
-            phase_step,
-            log2_step,
-            level,
-            sin_step: sine(phase_step) * ratio,
-            cos_step: (1.0 - 2.0 * half_sine * half_sine) * ratio,
-            sin: 0.0,
-            cos: level,
-        }
-    }
-
-    fn anchor(&mut self, frame: usize) {
-        let phase = self.phase_step * frame as f32;
-        let amplitude = self.level * exp2(self.log2_step * frame as f32);
-        self.sin = sine(phase) * amplitude;
-        self.cos = sine(phase + 0.25) * amplitude;
-    }
-
-    fn next(&mut self) -> f32 {
-        let sample = self.sin;
-        self.sin = sample * self.cos_step + self.cos * self.sin_step;
-        self.cos = self.cos * self.cos_step - sample * self.sin_step;
-        sample
-    }
 }
 
 const MODAL_ANCHOR: usize = 256;
