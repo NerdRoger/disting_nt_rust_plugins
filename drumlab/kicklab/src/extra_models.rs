@@ -1,5 +1,5 @@
 use super::{
-    decay_rate, exp2, filter_coefficient, lookup, next_noise_bits, positive_pow, render_layer,
+    decay_rate, exp2, filter_coefficient, lookup, positive_pow, render_layer, signed_noise,
     sine, DecayEnvelope, LayerPatch, LayerShape, Lookup, NoiseBand, NOISE_SEED,
 };
 
@@ -186,7 +186,7 @@ pub(super) fn noise_sweep(
         } else {
             steady
         };
-        let noise = next_noise_bits(&mut seed) as f32 / 2_147_483_648.0 - 1.0;
+        let noise = signed_noise(&mut seed);
         let band = (band_state + coefficients.g * (noise - low_state)) * coefficients.response;
         let low = low_state + coefficients.g * band;
         band_state = 2.0 * band - band_state;

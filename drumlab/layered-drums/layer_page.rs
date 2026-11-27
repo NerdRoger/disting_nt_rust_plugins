@@ -97,3 +97,13 @@ pub(crate) fn write_text(output: &mut [c_char], text: &[u8]) -> i32 {
     output[length] = 0;
     length as i32
 }
+
+pub(crate) fn write_model_name(output: &mut [c_char], models: &[&CStr], value: i32) -> i32 {
+    models
+        .get(value as usize)
+        .map_or(0, |name| write_text(output, name.to_bytes()))
+}
+
+pub(crate) fn write_randomize_label(output: &mut [c_char], value: i32) -> i32 {
+    write_text(output, if value == 0 { b"Ready" } else { b"Randomize?" })
+}

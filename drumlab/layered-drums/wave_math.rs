@@ -1,5 +1,9 @@
-use core::f32::consts::{LOG2_E, PI};
+use core::f32::consts::{LOG2_E, PI, TAU};
 use distingnt_api::api::math::exp2;
+
+pub(crate) fn one_pole_coefficient(hz: f32, rate: u32) -> f32 {
+    1.0 - exp2(-TAU * LOG2_E * hz / rate as f32)
+}
 
 pub(crate) fn wrap(turns: f32) -> f32 {
     turns - turns as u32 as f32

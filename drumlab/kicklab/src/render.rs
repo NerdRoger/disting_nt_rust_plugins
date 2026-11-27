@@ -10,12 +10,13 @@ use distingnt_api::api::math::exp2;
 
 use crate::lookup::{self, Lookup};
 use crate::profile::{GrainTiming, RenderTiming};
+use crate::random::{next_bits as next_noise_bits, signed_noise};
 use crate::{
     layer_slot, Job, Layer, LayerPatch, Model, WaveBuffers, GRAIN_SIZE_MAX_MS, MAX_LAYERS,
     MIN_TILED_LAYERS, PITCH_CLICK_MAX_DECAY_TENTHS_MS,
 };
 
-use wave_math::{positive_pow, sine, wrap, DampedMode};
+use wave_math::{one_pole_coefficient as filter_coefficient, positive_pow, sine, wrap, DampedMode};
 
 #[path = "../../layered-drums/wave_math.rs"]
 mod wave_math;
@@ -220,10 +221,6 @@ fn decay_rate(milliseconds: f32, rate: u32) -> f32 {
     -2.0 * core::f32::consts::LOG2_10 * 1000.0 / (milliseconds * rate as f32)
 }
 
-fn filter_coefficient(hz: f32, rate: u32) -> f32 {
-    1.0 - exp2(-TAU * LOG2_E * hz / rate as f32)
-}
-
 struct NoiseBand {
     seed: u32,
     low: f32,
@@ -233,13 +230,6 @@ struct NoiseBand {
 }
 
 const NOISE_SEED: u32 = 0x56d62e11;
-
-fn next_noise_bits(seed: &mut u32) -> u32 {
-    *seed ^= *seed << 13;
-    *seed ^= *seed >> 17;
-    *seed ^= *seed << 5;
-    *seed
-}
 
 impl NoiseBand {
     fn new(low: f32, high: f32, rate: u32) -> Self {
@@ -253,7 +243,7 @@ impl NoiseBand {
     }
 
     fn next(&mut self) -> f32 {
-        let sample = next_noise_bits(&mut self.seed) as f32 / 2147483648.0 - 1.0;
+        let sample = signed_noise(&mut self.seed);
         self.low += self.low_coefficient * (sample - self.low);
         self.high += self.high_coefficient * (sample - self.high);
         2.0 * (self.high - self.low)

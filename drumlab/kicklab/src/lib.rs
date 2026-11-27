@@ -48,8 +48,9 @@ use distingnt_api::{
     *,
 };
 use layer_page::{
-    add_layer_controls, definition, page_name_storage, page_names, write_text, PageNameBytes,
-    LAYER_FIRST_CONTROL, LAYER_LEVEL, LAYER_MUTE, LAYER_RANDOMIZE, LAYER_SOLO,
+    add_layer_controls, definition, page_name_storage, page_names, write_model_name,
+    write_randomize_label, write_text, PageNameBytes, LAYER_FIRST_CONTROL, LAYER_LEVEL,
+    LAYER_MUTE, LAYER_RANDOMIZE, LAYER_SOLO,
 };
 use layer_page::LAYER_LEVEL_RANGE;
 use playback::Player;
@@ -1070,7 +1071,7 @@ impl Plugin for KickLab {
         let layer_field = parameter_layer(parameter, context.state().layers);
         if parameter == RANDOMIZE_LAYERS as i32 || matches!(layer_field, Some((_, LAYER_RANDOMIZE)))
         {
-            return write_text(output, if value == 0 { b"Ready" } else { b"Randomize?" });
+            return write_randomize_label(output, value);
         }
         if parameter == CUTOFF as i32 {
             let hz = cutoff_hz(value as i16);
@@ -1086,9 +1087,7 @@ impl Plugin for KickLab {
             }
         }
         if matches!(layer_field, Some((_, 0))) {
-            if let Some(name) = MODEL_NAMES.get(value as usize) {
-                return write_text(output, name.to_bytes());
-            }
+            return write_model_name(output, &MODEL_NAMES, value);
         }
         0
     }

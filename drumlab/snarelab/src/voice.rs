@@ -1,16 +1,17 @@
-use core::f32::consts::{LOG2_10, LOG2_E, TAU};
+use core::f32::consts::LOG2_10;
 
 use distingnt_api::api::math::exp2;
 
 use super::{
     mix::db_gain,
     punch::{ResonantWires, Rim, TwoStageBody},
-    wave_math::{positive_pow, sine, wrap, DampedMode},
+    wave_math::{one_pole_coefficient as pole, positive_pow, sine, wrap, DampedMode},
 };
 use crate::{
     lookup::{self, Lookup},
     LayerPatch, Model, CONTROLS,
 };
+pub(super) use crate::random::signed_noise as noise;
 
 fn decay_exponent(ms: f32, rate: u32) -> f32 {
     (-2000.0 * LOG2_10) / (ms * rate as f32)
@@ -28,17 +29,6 @@ pub(super) fn advance(value: &mut f32, step: f32) -> f32 {
     let old = *value;
     *value *= step;
     old
-}
-
-pub(super) fn noise(seed: &mut u32) -> f32 {
-    *seed ^= *seed << 13;
-    *seed ^= *seed >> 17;
-    *seed ^= *seed << 5;
-    *seed as f32 / 2147483648.0 - 1.0
-}
-
-fn pole(hz: f32, rate: u32) -> f32 {
-    1.0 - exp2(-TAU * LOG2_E * hz / rate as f32)
 }
 
 #[derive(Clone, Copy)]
