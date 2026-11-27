@@ -7,11 +7,11 @@ use super::{
     punch::{ResonantWires, Rim, TwoStageBody},
     wave_math::{one_pole_coefficient as pole, positive_pow, sine, wrap, DampedMode},
 };
+pub(super) use crate::random::signed_noise as noise;
 use crate::{
     lookup::{self, Lookup},
     LayerPatch, Model, CONTROLS,
 };
-pub(super) use crate::random::signed_noise as noise;
 
 fn decay_exponent(ms: f32, rate: u32) -> f32 {
     (-2000.0 * LOG2_10) / (ms * rate as f32)

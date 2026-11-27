@@ -8,10 +8,8 @@ in `NerdRoger/disting_nt_plugins`. Production plugins depend only on the safe AP
 - `window-comparator`: safe Rust Window Comparator plugin.
 - `wavesmith`: live segmented oscillator with 2–32 curved sections and an always-visible help footer; see [user guide](wavesmith/README.md) and [developer notes](wavesmith/Developer.md).
 - [`drumlab`](drumlab) groups the drum plugins and their shared code.
-  - [`kicklab`](drumlab/kicklab) has 1–8 layers (default 1) and Pitch Sweep, Modal Drum, Bit Logic, Grain Cloud,
-    Hard Sync, Resonator, Two Op. FM, Noise Sweep, Ring Mod, Wavefold, Delay Drum,
-    and Spect. Pulse.
-  - [`snarelab`](drumlab/snarelab) has 2–5 layers (default 3), three body models, two wire models, and Rim Shot. Randomize Layers picks a body, wires, and an optional rim.
+  - [`kicklab`](drumlab/kicklab/README.md) is a kick drum with 1–8 layers (default 1) and twelve synthesis models.
+  - [`snarelab`](drumlab/snarelab/README.md) is a snare drum with 2–5 layers (default 3), four body models, three wire models, and Rim Shot.
   - [`layered-drums`](drumlab/layered-drums) contains the shared playback, scope, and DSP code.
 - `monosynth`: Rust port of [Expert Sleepers' C++ monosynth example](https://github.com/expertsleepersltd/distingNT_API/blob/main/examples/monosynth.cpp), created as a Rust learning experiment.
 - `distingNT_API`: independent upstream Git submodule, pinned to `1780254aebc3c73b96c351a7b12c325d1f983402`.
@@ -38,8 +36,8 @@ cargo fmt --all -- --check
 
 Build outputs are `plugins/wavesmith.o`, `plugins/rust-window-comparator.o`,
 `plugins/rusttest.o` (the monosynth), `plugins/kicklab.o`, and `plugins/snarelab.o`. Cargo intermediates
-live in ignored `target/`. KickLab requires API-v15-capable firmware for background
-rendering. The other plugins require API-v14-capable firmware.
+live in ignored `target/`. KickLab and SnareLab require API-v15-capable firmware for
+background rendering. The other plugins require API-v14-capable firmware.
 
 ## Building with wslc from Windows
 
@@ -72,12 +70,14 @@ Builds follow the same plugin-specific tag convention as the C++ repository:
 | Window Comparator | `window-comparator/v*` | `window-comparator/v0.1.0` |
 | Monosynth | `monosynth/v*` | `monosynth/v0.1.0` |
 | Wavesmith | `wavesmith/v*` | `wavesmith/v0.1.0` |
+| KickLab | `kicklab/v*` | `kicklab/v0.1.0` |
+| SnareLab | `snarelab/v*` | `snarelab/v0.1.0` |
 
 Push the desired version tag to GitHub to build that plugin. Ordinary branch
 pushes and pull requests do not trigger builds. Each plugin's workflow also
 supports manual runs from the Actions tab.
 
-All three entry workflows call `.github/workflows/rust-plugins.yml`, which checks out
+All plugin workflows call `.github/workflows/rust-plugins.yml`, which checks out
 the pinned API submodule, builds the devcontainer with a shared GitHub Container
 Registry (GHCR) layer cache, checks formatting, builds the selected plugin and
 runs the test suite. All plugins and version tags use the same cache; the first

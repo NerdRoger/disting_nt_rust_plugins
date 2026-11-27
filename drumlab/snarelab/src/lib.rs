@@ -36,8 +36,8 @@ use distingnt_api::{
 };
 use layer_page::{
     add_layer_controls, definition, page_name_storage, page_names, write_model_name,
-    write_randomize_label, write_text, PageNameBytes, LAYER_FIRST_CONTROL, LAYER_LEVEL,
-    LAYER_MUTE, LAYER_RANDOMIZE, LAYER_SOLO,
+    write_randomize_label, write_text, PageNameBytes, LAYER_FIRST_CONTROL, LAYER_LEVEL, LAYER_MUTE,
+    LAYER_RANDOMIZE, LAYER_SOLO,
 };
 use playback::Player;
 use random::random_value;
@@ -45,7 +45,8 @@ use scope::Scope;
 
 const MIN_LAYERS: usize = 2;
 const MAX_LAYERS: usize = 5;
-const OUTPUT_BUFFERS_SPECIFICATION: Specification = playback::output_buffers_specification(2, 10, 6);
+const OUTPUT_BUFFERS_SPECIFICATION: Specification =
+    playback::output_buffers_specification(2, 10, 6);
 const DEFAULT_OUTPUT_BUFFERS: usize = OUTPUT_BUFFERS_SPECIFICATION.default as usize;
 const MAX_OUTPUT_BUFFERS: usize = OUTPUT_BUFFERS_SPECIFICATION.max as usize;
 const TRIGGER: usize = 0;
@@ -1057,9 +1058,7 @@ impl Plugin for SnareLab {
         );
         let state = context.state_mut();
         state.player = player;
-        state
-            .buffer_usage
-            .observe(used, frames, state.rate);
+        state.buffer_usage.observe(used, frames, state.rate);
     }
 }
 

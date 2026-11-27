@@ -1,0 +1,19 @@
+name: KickLab Build
+
+on:
+  push:
+    tags:
+      - 'kicklab/v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/rust-plugins.yml
+    with:
+      plugin_name: KickLab
+      artifact_file: kicklab.o
+      artifact_base_name: kicklab

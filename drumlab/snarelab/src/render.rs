@@ -14,7 +14,9 @@ use self::{
     punch::{body_duration, rim_duration, shape_punch, wires_duration},
     voice::Voice,
 };
-use crate::{layer_slot, lookup::Lookup, Job, Layer, LayerPatch, Model, Scope, WaveBuffers, MAX_LAYERS};
+use crate::{
+    layer_slot, lookup::Lookup, Job, Layer, LayerPatch, Model, Scope, WaveBuffers, MAX_LAYERS,
+};
 
 const MAX_MS: u32 = 750;
 const TAPER_MS: u32 = 650;

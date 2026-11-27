@@ -1,0 +1,19 @@
+name: SnareLab Build
+
+on:
+  push:
+    tags:
+      - 'snarelab/v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/rust-plugins.yml
+    with:
+      plugin_name: SnareLab
+      artifact_file: snarelab.o
+      artifact_base_name: snarelab

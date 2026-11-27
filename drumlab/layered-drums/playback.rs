@@ -5,7 +5,11 @@ use distingnt_api::{
 
 use crate::WaveBuffers;
 
-pub(crate) const fn output_buffers_specification(min: i32, max: i32, default: i32) -> Specification {
+pub(crate) const fn output_buffers_specification(
+    min: i32,
+    max: i32,
+    default: i32,
+) -> Specification {
     assert!(min > 0 && min <= default && default <= max);
     // The player tracks one bit per output slot.
     assert!(max <= u16::BITS as i32);

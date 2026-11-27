@@ -1,6 +1,6 @@
 use super::{
-    decay_rate, exp2, filter_coefficient, lookup, positive_pow, render_layer, signed_noise,
-    sine, DecayEnvelope, LayerPatch, LayerShape, Lookup, NoiseBand, NOISE_SEED,
+    decay_rate, exp2, filter_coefficient, lookup, positive_pow, render_layer, signed_noise, sine,
+    DecayEnvelope, LayerPatch, LayerShape, Lookup, NoiseBand, NOISE_SEED,
 };
 
 fn rotation(step: f32) -> (f32, f32) {

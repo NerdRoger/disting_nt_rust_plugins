@@ -1,8 +1,8 @@
 use super::drum_mix::TailTaper;
 use super::{
     cpu_cycle_count, db_gain, layer_frames, layer_slot, mix_pair, mix_single, mix_tile,
-    render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput,
-    RenderTiming, WaveBuffers, MAX_LAYERS, MIN_TILED_LAYERS,
+    render_cached_layer, CachedLayer, Job, Lookup, Lowpass, MasterDrive, MixInput, RenderTiming,
+    WaveBuffers, MAX_LAYERS, MIN_TILED_LAYERS,
 };
 use crate::{Layer, Scope};
 
