@@ -1,6 +1,28 @@
-use distingnt_api::api::plugin::RegionInitializer;
+use distingnt_api::{
+    api::plugin::{RegionInitializer, Specification},
+    TYPE_GENERIC,
+};
 
-use crate::{WaveBuffers, MAX_OUTPUT_BUFFERS};
+use crate::WaveBuffers;
+
+pub(crate) const fn output_buffers_specification(min: i32, max: i32, default: i32) -> Specification {
+    assert!(min > 0 && min <= default && default <= max);
+    // The player tracks one bit per output slot.
+    assert!(max <= u16::BITS as i32);
+    Specification {
+        name: c"Output Buffers",
+        min,
+        max,
+        default,
+        kind: TYPE_GENERIC,
+    }
+}
+
+pub(crate) fn output_buffer_count(specification: &Specification, count: i32) -> Option<usize> {
+    (specification.min..=specification.max)
+        .contains(&count)
+        .then_some(count as usize)
+}
 
 const VOICES: usize = 8;
 pub const OUTPUT_VOLTS: f32 = 5.0;
@@ -10,34 +32,37 @@ const WAIT_BUCKETS_PER_SECOND: u32 = 20;
 const WAIT_BUCKETS: usize = (BUFFER_WINDOW_SECONDS * WAIT_BUCKETS_PER_SECOND + 1) as usize;
 
 #[derive(Clone, Copy)]
-pub struct BufferUsage {
+pub struct BufferUsage<const OCCUPANCY_COUNTS: usize> {
     frame: u64,
-    expires_at: [u64; MAX_OUTPUT_BUFFERS + 1],
+    expires_at: [u64; OCCUPANCY_COUNTS],
     wait_buckets: [u16; WAIT_BUCKETS],
     wait_bucket: usize,
     wait_bucket_frames: u32,
     waits: i32,
+    waiting_for_buffer: bool,
 }
 
-impl BufferUsage {
+impl<const OCCUPANCY_COUNTS: usize> BufferUsage<OCCUPANCY_COUNTS> {
     #[cfg(test)]
     pub const EMPTY: Self = Self {
         frame: 0,
-        expires_at: [0; MAX_OUTPUT_BUFFERS + 1],
+        expires_at: [0; OCCUPANCY_COUNTS],
         wait_buckets: [0; WAIT_BUCKETS],
         wait_bucket: 0,
         wait_bucket_frames: 0,
         waits: 0,
+        waiting_for_buffer: false,
     };
 
     pub fn initialize(destination: &mut RegionInitializer<'_, Self>) {
         distingnt_api::initialize_region!(
             destination,
-            BufferUsage {
+            Self {
                 frame: 0,
                 wait_bucket: 0,
                 wait_bucket_frames: 0,
                 waits: 0,
+                waiting_for_buffer: false,
             },
             arrays {
                 expires_at: |_| 0,
@@ -64,7 +89,16 @@ impl BufferUsage {
         }
     }
 
-    pub fn record_wait(&mut self) {
+    pub fn next_render_slot(&mut self, player: &Player, output_buffers: usize) -> Option<usize> {
+        let slot = player.free_buffer(output_buffers);
+        if slot.is_none() && !self.waiting_for_buffer {
+            self.record_wait();
+        }
+        self.waiting_for_buffer = slot.is_none();
+        slot
+    }
+
+    fn record_wait(&mut self) {
         if let Some(bucket) = self.wait_buckets.get_mut(self.wait_bucket) {
             *bucket += 1;
             self.waits += 1;
@@ -167,12 +201,21 @@ impl Player {
         self.current.active()
     }
 
-    pub fn free_buffer(&self, output_buffers: usize) -> Option<usize> {
+    fn free_buffer(&self, output_buffers: usize) -> Option<usize> {
         let slot = (!self.occupied_buffers()).trailing_zeros() as usize;
         (slot < output_buffers).then_some(slot)
     }
 
-    pub fn occupied_buffers(&self) -> u16 {
+    // Sample before playback, which can release slots while mixing the block.
+    pub fn used_buffers(&self, in_flight: Option<usize>) -> usize {
+        let mut slots = self.occupied_buffers();
+        if let Some(slot) = in_flight {
+            slots |= 1 << slot;
+        }
+        slots.count_ones() as usize
+    }
+
+    fn occupied_buffers(&self) -> u16 {
         let mut slots = 0;
         for hit in self.voices.iter().chain([&self.current, &self.fading]) {
             if hit.active() {
@@ -310,11 +353,28 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DEFAULT_OUTPUT_BUFFERS;
+
+    const TEST_POOL_SIZE: usize = 6;
+
+    #[test]
+    fn smaller_plugin_can_choose_its_own_buffer_limits_and_default() {
+        const SPECIFICATION: Specification = output_buffers_specification(2, 5, 3);
+        assert_eq!(
+            output_buffer_count(&SPECIFICATION, SPECIFICATION.default),
+            Some(3)
+        );
+        assert_eq!(output_buffer_count(&SPECIFICATION, 5), Some(5));
+        assert_eq!(output_buffer_count(&SPECIFICATION, 1), None);
+        assert_eq!(output_buffer_count(&SPECIFICATION, 6), None);
+
+        let mut usage = BufferUsage::<{ SPECIFICATION.max as usize + 1 }>::EMPTY;
+        usage.observe(5, 1, 100);
+        assert_eq!(usage.peak(), 5);
+    }
 
     #[test]
     fn buffer_usage_keeps_lower_peaks_after_a_higher_one_expires() {
-        let mut usage = BufferUsage::EMPTY;
+        let mut usage = BufferUsage::<{ TEST_POOL_SIZE + 1 }>::EMPTY;
         assert_eq!(usage.peak(), 0);
         usage.observe(4, 12, 100);
         usage.observe(2, 499, 100);
@@ -327,7 +387,7 @@ mod tests {
 
     #[test]
     fn buffer_waits_expire_independently_after_five_seconds() {
-        let mut usage = BufferUsage::EMPTY;
+        let mut usage = BufferUsage::<{ TEST_POOL_SIZE + 1 }>::EMPTY;
         usage.record_wait();
         usage.observe(2, 17, 100);
         usage.record_wait();
@@ -353,23 +413,26 @@ mod tests {
         };
         player.publish(0, 100);
         player.trigger();
-        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(1));
+        assert_eq!(player.free_buffer(TEST_POOL_SIZE), Some(1));
         player.publish(1, 200);
         player.trigger();
         player.trigger();
-        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(2));
+        assert_eq!(player.free_buffer(TEST_POOL_SIZE), Some(2));
+        assert_eq!(player.used_buffers(None), 2);
+        assert_eq!(player.used_buffers(Some(1)), 2);
+        assert_eq!(player.used_buffers(Some(2)), 3);
         player.publish(2, 300);
-        for next in 3..DEFAULT_OUTPUT_BUFFERS {
+        for next in 3..TEST_POOL_SIZE {
             player.trigger();
-            assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(next));
+            assert_eq!(player.free_buffer(TEST_POOL_SIZE), Some(next));
             player.publish(next, 300);
         }
-        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), None);
+        assert_eq!(player.free_buffer(TEST_POOL_SIZE), None);
         assert_eq!(player.voices[0].slot, 0);
         assert_eq!(player.voices[1].slot, 1);
         assert_eq!(player.voices[2].slot, 1);
         player.voices[0].position = 100;
-        assert_eq!(player.free_buffer(DEFAULT_OUTPUT_BUFFERS), Some(0));
+        assert_eq!(player.free_buffer(TEST_POOL_SIZE), Some(0));
     }
 
     #[test]
@@ -418,6 +481,6 @@ mod tests {
         };
 
         assert_eq!(run(3), (1080, 22));
-        assert_eq!(run(DEFAULT_OUTPUT_BUFFERS), (0, 0));
+        assert_eq!(run(TEST_POOL_SIZE), (0, 0));
     }
 }

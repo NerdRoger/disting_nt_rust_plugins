@@ -44,9 +44,9 @@ use scope::Scope;
 
 const MIN_LAYERS: usize = 2;
 const MAX_LAYERS: usize = 5;
-const MIN_OUTPUT_BUFFERS: usize = 2;
-const DEFAULT_OUTPUT_BUFFERS: usize = 6;
-const MAX_OUTPUT_BUFFERS: usize = 10;
+const OUTPUT_BUFFERS_SPECIFICATION: Specification = playback::output_buffers_specification(2, 10, 6);
+const DEFAULT_OUTPUT_BUFFERS: usize = OUTPUT_BUFFERS_SPECIFICATION.default as usize;
+const MAX_OUTPUT_BUFFERS: usize = OUTPUT_BUFFERS_SPECIFICATION.max as usize;
 const TRIGGER: usize = 0;
 const OUTPUT: usize = 1;
 const OUTPUT_MODE: usize = 2;
@@ -420,12 +420,11 @@ struct State {
     rate: u32,
     parameter_setup: ParameterSetup,
     dirty: bool,
-    waiting_for_buffer: bool,
     randomizing: u16, // One bit per layer, followed by the global action.
     output_buffers: u8,
     random_seed: u32,
     in_flight: Option<usize>,
-    buffer_usage: playback::BufferUsage,
+    buffer_usage: BufferUsage,
     player: Player,
     scope: Scope,
 }
@@ -433,6 +432,7 @@ struct State {
 struct SnareLab;
 static TABLE_DRAM: SharedStaticDram<SnareLab> = SharedStaticDram::new();
 const MIX_TILE_FRAMES: usize = 512;
+type BufferUsage = playback::BufferUsage<{ MAX_OUTPUT_BUFFERS + 1 }>;
 type WaveBuffers = DramBuffers<f32, { MAX_OUTPUT_BUFFERS + MAX_LAYERS + 2 }>;
 type Resources = SharedResources<RenderWork, (), WaveBuffers>;
 type Callback<'a, Mode> = Context<'a, State, (), Mode, Sram, Resources>;
@@ -447,10 +447,7 @@ fn layer_count(specs: &[i32]) -> Option<usize> {
 }
 
 fn output_buffer_count(specs: &[i32]) -> Option<usize> {
-    let count = usize::try_from(*specs.get(1)?).ok()?;
-    (MIN_OUTPUT_BUFFERS..=MAX_OUTPUT_BUFFERS)
-        .contains(&count)
-        .then_some(count)
+    playback::output_buffer_count(&OUTPUT_BUFFERS_SPECIFICATION, *specs.get(1)?)
 }
 
 fn model_index(layer: usize) -> usize {
@@ -714,14 +711,12 @@ fn process_render(context: &mut Callback<'_, Audio>) {
         return;
     }
     let state = context.state_mut();
-    let Some(slot) = state.player.free_buffer(usize::from(state.output_buffers)) else {
-        if !state.waiting_for_buffer {
-            state.waiting_for_buffer = true;
-            state.buffer_usage.record_wait();
-        }
+    let Some(slot) = state
+        .buffer_usage
+        .next_render_slot(&state.player, usize::from(state.output_buffers))
+    else {
         return;
     };
-    state.waiting_for_buffer = false;
     let mut job = Job {
         rate: state.rate,
         output_buffers: state.output_buffers,
@@ -799,13 +794,7 @@ impl Plugin for SnareLab {
             default: 3,
             kind: TYPE_GENERIC,
         },
-        Specification {
-            name: c"Output Buffers",
-            min: MIN_OUTPUT_BUFFERS as i32,
-            max: MAX_OUTPUT_BUFFERS as i32,
-            default: DEFAULT_OUTPUT_BUFFERS as i32,
-            kind: TYPE_GENERIC,
-        },
+        OUTPUT_BUFFERS_SPECIFICATION,
     ];
 
     fn configuration(specs: &[i32]) -> Option<Configuration> {
@@ -859,7 +848,6 @@ impl Plugin for SnareLab {
                 rate: rate,
                 parameter_setup: ParameterSetup::New,
                 dirty: true,
-                waiting_for_buffer: false,
                 randomizing: 0,
                 output_buffers: output_buffer_count(specs)? as u8,
                 random_seed: distingnt_api::api::cpu_cycle_count() | 1,
@@ -871,7 +859,7 @@ impl Plugin for SnareLab {
             regions {
                 player: |player| Player::initialize(player, rate),
                 scope: Scope::initialize,
-                buffer_usage: playback::BufferUsage::initialize
+                buffer_usage: BufferUsage::initialize
             }
         );
         Some(())
@@ -1057,10 +1045,7 @@ impl Plugin for SnareLab {
         let output = parameters.value(OUTPUT).and_then(bus_index);
         let replace = parameters.value(OUTPUT_MODE) == Some(1);
         let mut player = context.state().player;
-        let mut occupied = player.occupied_buffers();
-        if let Some(slot) = context.state().in_flight {
-            occupied |= 1 << slot;
-        }
+        let used = player.used_buffers(context.state().in_flight);
         let mut diagnostics = playback::PlaybackDiagnostics::default();
         player.play(
             context.dram_buffers(),
@@ -1073,11 +1058,9 @@ impl Plugin for SnareLab {
         );
         let state = context.state_mut();
         state.player = player;
-        // A trigger only reuses the published waveform. Playback can release
-        // slots within this block, so measure occupancy before playing it.
         state
             .buffer_usage
-            .observe(occupied.count_ones() as usize, frames, state.rate);
+            .observe(used, frames, state.rate);
     }
 }
 

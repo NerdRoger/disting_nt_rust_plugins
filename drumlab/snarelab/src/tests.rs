@@ -346,7 +346,7 @@ fn model_picker_groups_bodies_then_wires_then_rim_shot() {
 fn metadata_keeps_layer_ordinals_across_specifications_and_restores_models() {
     let mut reference = Vec::new();
     for layers in MIN_LAYERS..=MAX_LAYERS {
-        for buffers in [MIN_OUTPUT_BUFFERS, MAX_OUTPUT_BUFFERS] {
+        for buffers in [OUTPUT_BUFFERS_SPECIFICATION.min as usize, MAX_OUTPUT_BUFFERS] {
             let mut host = Host::with_specs([layers as i32, buffers as i32]);
             let second = model_index(1);
             assert_eq!(&host.values[..GLOBALS], &[2, 14, 1, 0, -1, 0]);

@@ -355,7 +355,7 @@ fn output_buffer_specification_sets_pool_size_without_changing_parameter_pages()
 
     let mut reference_pages = None;
     for count in [
-        MIN_OUTPUT_BUFFERS,
+        OUTPUT_BUFFERS_SPECIFICATION.min as usize,
         DEFAULT_OUTPUT_BUFFERS,
         MAX_OUTPUT_BUFFERS,
     ] {
